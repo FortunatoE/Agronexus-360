@@ -154,15 +154,20 @@ export default function Home() {
         const rows = rowsFrom(workbook, header);
         return [key, { rows, summary: { fileName: file.name, rows: rows.length, sheets: workbook.SheetNames } }] as const;
       }));
+      const payload = new FormData();
+      sourceConfig.forEach(({ key }) => payload.append(`file-${key}`, uploads[key] as File));
+      const response = await fetch("/api/imports", { method: "POST", body: payload });
+      const central = await response.json() as { versionId?: string; error?: string };
+      if (!response.ok) throw new Error(central.error || "Falha na importação central.");
       const nextData = { ...emptyDatasets };
       const nextImports: Record<string, ImportSummary> = {};
       results.forEach(([key, value]) => { nextData[key] = value.rows; nextImports[key] = value.summary; });
       setDatasets(nextData);
       setImports(nextImports);
-      setMessage("Importação local concluída. Os módulos abaixo já estão usando os dados lidos nesta sessão.");
+      setMessage(`Versão ${central.versionId?.slice(0, 8)} validada e armazenada. Os visuais já usam esta carga na sessão.`);
       setActive("Visão geral");
-    } catch {
-      setMessage("Não foi possível ler um dos arquivos. Confirme o formato Excel e os cabeçalhos esperados.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Não foi possível ler ou armazenar um dos arquivos. Confirme o formato Excel e os cabeçalhos esperados.");
     } finally { setImporting(false); }
   }
 
