@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import * as XLSX from "xlsx";
 import { getDb } from "@/db";
-import { importFiles, importVersions } from "@/db/schema";
+import { importFiles, importVersions, operationalRecords } from "@/db/schema";
+import { normalizeOperationalRow } from "@/lib/operational-normalization";
 
 const sources = [
   { key: "planejamento", header: 0 },
@@ -37,13 +38,14 @@ export async function POST(request: Request) {
   });
 
   try {
-    const summaries: Array<{ source: string; fileName: string; rows: number; sheets: string[] }> = [];
+    const summaries: Array<{ source: string; fileName: string; rows: number; validRows: number; excludedRows: number; sheets: string[] }> = [];
     for (const { source, file } of files) {
       const uploaded = file as File;
       const bytes = new Uint8Array(await uploaded.arrayBuffer());
       const workbook = XLSX.read(bytes, { type: "array" });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(sheet, { range: source.header, defval: "" }).length;
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { range: source.header, defval: "" });
+      const normalized = rows.map((row, index) => ({ ...normalizeOperationalRow(source.key, row, index + source.header + 2), versionId }));
       const objectKey = `imports/${versionId}/${source.key}/${safeFileName(uploaded.name)}`;
 
       await env.BUCKET.put(objectKey, bytes, {
@@ -56,10 +58,14 @@ export async function POST(request: Request) {
         source: source.key,
         originalName: uploaded.name,
         objectKey,
-        rowCount: rows,
+        rowCount: rows.length,
         status: "stored",
       });
-      summaries.push({ source: source.key, fileName: uploaded.name, rows, sheets: workbook.SheetNames });
+      for (let index = 0; index < normalized.length; index += 100) {
+        await db.batch(normalized.slice(index, index + 100).map((record) => db.insert(operationalRecords).values(record)));
+      }
+      const excludedRows = normalized.filter((record) => record.isExcluded).length;
+      summaries.push({ source: source.key, fileName: uploaded.name, rows: rows.length, validRows: rows.length - excludedRows, excludedRows, sheets: workbook.SheetNames });
     }
 
     await db.update(importVersions).set({ status: "validated", validationSummary: JSON.stringify({ files: summaries }) }).where(eq(importVersions.id, versionId));
