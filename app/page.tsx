@@ -34,6 +34,15 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 }).format(value);
 }
 
+function dateFromPlan(value: unknown) {
+  const [day, month, year] = String(value ?? "").split("/").map(Number);
+  return day && month && year ? new Date(year, month - 1, day) : null;
+}
+
+function dateKey(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
 function rowsFrom(workbook: XLSX.WorkBook, header: number) {
   const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json<Row>(firstSheet, { range: header, defval: "" });
@@ -66,15 +75,43 @@ export default function Home() {
   const [premises, setPremises] = useState<Premises>(initialPremises);
   const [tasks, setTasks] = useState<string[]>([]);
   const [taskText, setTaskText] = useState("");
+  const [evaluationDate, setEvaluationDate] = useState(() => new Date().toISOString().slice(0, 10));
 
   const metrics = useMemo(() => {
-    const plannedItems = datasets.planejamento.filter((row) => String(row["Classificacão"]) === "Produto");
+    const plannedItems = datasets.planejamento.filter((row) => String(row["Classificacão"]).trim().toUpperCase() === "PRODUTO");
+    const plantingActivities = datasets.planejamento.filter((row) => String(row["Classificacão"]).trim().toUpperCase() === "ATIVIDADE" && String(row.Atividade).trim().toUpperCase() === "PLANTIO SEM ADUBO");
+    const plannedArea = plantingActivities.reduce((total, row) => total + numberFrom(row["Área executar (HA)"]), 0);
     const validExecution = datasets.execucao.filter((row) => String(row.Status).trim() !== premises.excludedStatus && String(row.UM).toUpperCase() === "HA");
     const executedArea = validExecution.reduce((total, row) => total + numberFrom(row["Área Executada"]), 0);
     const excluded = datasets.execucao.filter((row) => String(row.Status).trim() === premises.excludedStatus).length;
     const materials = new Set(datasets.consumo.map((row) => String(row.Material)).filter(Boolean)).size;
-    return { plannedItems, validExecution, executedArea, excluded, materials };
+    return { plannedItems, plantingActivities, plannedArea, validExecution, executedArea, excluded, materials };
   }, [datasets, premises.excludedStatus]);
+
+  const calendar = useMemo(() => {
+    const selected = new Date(`${evaluationDate}T12:00:00`);
+    const year = selected.getFullYear();
+    const month = selected.getMonth();
+    const first = new Date(year, month, 1);
+    const start = new Date(year, month, 1 - first.getDay());
+    const events = new Map<string, Row[]>();
+    metrics.plannedItems.forEach((row) => {
+      const date = dateFromPlan(row.DT_Aplicacao);
+      if (!date) return;
+      const key = dateKey(date);
+      events.set(key, [...(events.get(key) ?? []), row]);
+    });
+    const days = Array.from({ length: 42 }, (_, index) => {
+      const date = new Date(start); date.setDate(start.getDate() + index);
+      return { date, events: events.get(dateKey(date)) ?? [] };
+    });
+    const from = new Date(selected); const until = new Date(selected); until.setDate(until.getDate() + 30);
+    const next = [...events.entries()].flatMap(([key, rows]) => {
+      const date = new Date(`${key}T12:00:00`);
+      return date >= from && date <= until ? rows.map((row) => ({ date, row })) : [];
+    }).sort((a, b) => a.date.getTime() - b.date.getTime()).slice(0, 12);
+    return { selected, days, next, monthLabel: selected.toLocaleDateString("pt-BR", { month: "long", year: "numeric" }) };
+  }, [evaluationDate, metrics.plannedItems]);
 
   const volumeRows = useMemo(() => {
     const grouped = new Map<string, { name: string; unit: string; consumed: number }>();
@@ -120,10 +157,9 @@ export default function Home() {
 
   let content: React.ReactNode;
   if (active === "Visão geral") {
-    content = <><section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{[["Itens planejados", metrics.plannedItems.length, "linhas de produto"], ["Área registrada", formatNumber(metrics.executedArea), "ha em ordens válidas"], ["Materiais CN52", metrics.materials, "materiais com consumo"], ["EXCL removidos", metrics.excluded, "registros fora da execução"]].map(([title, value, detail]) => <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" key={String(title)}><p className="text-sm font-medium text-slate-600">{title}</p><p className="mt-6 text-3xl font-semibold tracking-tight text-slate-900">{value}</p><p className="mt-3 border-t border-slate-100 pt-3 text-xs text-slate-500">{detail}</p></article>)}</section><section className="mt-7 grid gap-6 xl:grid-cols-[1fr_360px]"><article className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Importação da sessão</h2><p className="mt-1 text-xs text-slate-500">Fontes atualmente alimentando os visuais</p>{Object.keys(imports).length ? <DataTable headers={["Fonte", "Arquivo", "Linhas", "Abas"]} rows={sourceConfig.map(({ key, title }) => [title, imports[key]?.fileName ?? "—", String(imports[key]?.rows ?? "—"), imports[key]?.sheets.join(", ") ?? "—"])} /> : <EmptyState title="Aguardando importação" text="Abra Importações e selecione os cinco arquivos Excel para alimentar os módulos." />}</article><article className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Próximas ações</h2><div className="mt-5 space-y-3">{["Revisar calendarização", "Conferir execução válida", "Verificar principais consumos"].map((action) => <button className="flex w-full items-center justify-between rounded-xl border border-slate-200 px-4 py-3 text-left text-sm font-medium text-slate-700 hover:border-emerald-300" key={action} onClick={() => setActive(action.includes("calendar") ? "Calendarização" : action.includes("execução") ? "Execução" : "Volumes")} type="button">{action}<span className="text-emerald-700">→</span></button>)}</div></article></section></>;
+    content = <><section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">{[["Área planejada", formatNumber(metrics.plannedArea), "ha · Plantio sem adubo"], ["Área registrada", formatNumber(metrics.executedArea), "ha em ordens válidas"], ["Materiais CN52", metrics.materials, "materiais com consumo"], ["EXCL removidos", metrics.excluded, "registros fora da execução"]].map(([title, value, detail]) => <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" key={String(title)}><p className="text-sm font-medium text-slate-600">{title}</p><p className="mt-6 text-3xl font-semibold tracking-tight text-slate-900">{value}</p><p className="mt-3 border-t border-slate-100 pt-3 text-xs text-slate-500">{detail}</p></article>)}</section><section className="mt-7 grid gap-6 xl:grid-cols-[1fr_360px]"><article className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Importação da sessão</h2><p className="mt-1 text-xs text-slate-500">Fontes atualmente alimentando os visuais</p>{Object.keys(imports).length ? <DataTable headers={["Fonte", "Arquivo", "Linhas", "Abas"]} rows={sourceConfig.map(({ key, title }) => [title, imports[key]?.fileName ?? "—", String(imports[key]?.rows ?? "—"), imports[key]?.sheets.join(", ") ?? "—"])} /> : <EmptyState title="Aguardando importação" text="Abra Importações e selecione os cinco arquivos Excel para alimentar os módulos." />}</article><article className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Próximas ações</h2><div className="mt-5 space-y-3">{["Revisar calendarização", "Conferir execução válida", "Verificar principais consumos"].map((action) => <button className="flex w-full items-center justify-between rounded-xl border border-slate-200 px-4 py-3 text-left text-sm font-medium text-slate-700 hover:border-emerald-300" key={action} onClick={() => setActive(action.includes("calendar") ? "Calendarização" : action.includes("execução") ? "Execução" : "Volumes")} type="button">{action}<span className="text-emerald-700">→</span></button>)}</div></article></section></>;
   } else if (active === "Calendarização") {
-    const rows = metrics.plannedItems.slice(0, 20).map((row) => [String(row.DT_Aplicacao || ""), String(row.Nucleo || ""), String(row.Fazenda || ""), String(row.Talhao || ""), String(row.Produto || ""), String(row["Área executar (HA)"] || "")]);
-    content = rows.length ? <DataTable headers={["Data prevista", "Núcleo", "Fazenda", "Talhão", "Material", "Área (ha)"]} rows={rows} /> : <EmptyState title="Sem eventos planejados" text="Importe o arquivo de planejamento para visualizar aplicações por data." />;
+    content = metrics.plannedItems.length ? <section className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_340px]"><article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><div className="flex flex-col justify-between gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-center"><div><h2 className="font-semibold capitalize">{calendar.monthLabel}</h2><p className="mt-1 text-xs text-slate-500">Calendário de aplicações previstas</p></div><label className="text-xs font-semibold text-slate-600">Data de avaliação<input className="ml-2 rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-normal" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label></div><div className="mt-4 grid grid-cols-7 gap-1 text-center text-[11px] font-semibold uppercase tracking-wide text-slate-400">{["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"].map((day) => <div className="py-2" key={day}>{day}</div>)}</div><div className="grid grid-cols-7 gap-1">{calendar.days.map(({ date, events }) => { const selected = dateKey(date) === evaluationDate; const currentMonth = date.getMonth() === calendar.selected.getMonth(); return <button className={`min-h-[84px] rounded-xl border p-2 text-left transition ${selected ? "border-emerald-600 bg-emerald-50" : currentMonth ? "border-slate-100 bg-white hover:border-emerald-200" : "border-transparent bg-slate-50 text-slate-300"}`} key={date.toISOString()} onClick={() => setEvaluationDate(dateKey(date))} type="button"><p className="text-xs font-semibold">{date.getDate()}</p>{events.slice(0, 2).map((event, index) => <p className="mt-1 truncate rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-800" key={index}>{String(event.Produto || event.Atividade || "Evento")}</p>)}{events.length > 2 ? <p className="mt-1 text-[10px] text-emerald-700">+{events.length - 2} eventos</p> : null}</button>; })}</div></article><aside className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"><h2 className="font-semibold">Próximas pendências</h2><p className="mt-1 text-xs text-slate-500">Janela de 30 dias a partir da avaliação</p><div className="mt-5 space-y-3">{calendar.next.length ? calendar.next.map(({ date, row }, index) => <div className="rounded-xl border border-slate-100 p-3" key={`${date}-${index}`}><p className="text-xs font-bold text-emerald-700">{date.toLocaleDateString("pt-BR")}</p><p className="mt-1 text-sm font-semibold text-slate-800">{String(row.Produto || row.Atividade || "Evento planejado")}</p><p className="mt-1 text-xs text-slate-500">{String(row.Fazenda || "")} · {String(row.Talhao || "")}</p></div>) : <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">Não há eventos planejados na janela selecionada.</p>}</div></aside></section> : <EmptyState title="Sem eventos planejados" text="Importe o arquivo de planejamento para visualizar aplicações por data." />;
   } else if (active === "Execução") {
     const rows = metrics.validExecution.slice(0, 20).map((row) => [String(row.Ordem || ""), String(row.Fazenda || ""), String(row.Talhão || ""), String(row["Data Exec. OS"] || ""), String(row.Status || ""), String(row["Área Executada"] || ""), String(row.UM || "")]);
     content = rows.length ? <DataTable headers={["Ordem", "Fazenda", "Talhão", "Início", "Status", "Executado", "UM"]} rows={rows} /> : <EmptyState title="Sem execução válida" text="A ZPS007 será exibida aqui após remover registros EXCL." />;
