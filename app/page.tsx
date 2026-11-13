@@ -156,16 +156,29 @@ export default function Home() {
       }));
       const payload = new FormData();
       sourceConfig.forEach(({ key }) => payload.append(`file-${key}`, uploads[key] as File));
-      const response = await fetch("/api/imports", { method: "POST", body: payload });
-      const central = await response.json() as { versionId?: string; error?: string };
-      if (!response.ok) throw new Error(central.error || "Falha na importação central.");
       const nextData = { ...emptyDatasets };
       const nextImports: Record<string, ImportSummary> = {};
       results.forEach(([key, value]) => { nextData[key] = value.rows; nextImports[key] = value.summary; });
       setDatasets(nextData);
       setImports(nextImports);
-      setMessage(`Versão ${central.versionId?.slice(0, 8)} validada e armazenada. Os visuais já usam esta carga na sessão.`);
       setActive("Visão geral");
+
+      const response = await fetch("/api/imports", { method: "POST", body: payload, credentials: "include", headers: { Accept: "application/json" } });
+      const responseText = await response.text();
+      let central: { versionId?: string; error?: string } | null = null;
+      try { central = JSON.parse(responseText) as { versionId?: string; error?: string }; } catch { /* Private-site access errors may be returned as HTML. */ }
+      if (!response.ok) {
+        const reason = response.status === 401
+          ? "A sessão da plataforma não foi aceita pelo armazenamento central. Os dados foram carregados nesta sessão; recarregue a página e tente novamente para persistir a versão."
+          : central?.error || `O armazenamento central respondeu com erro ${response.status}. Os dados foram carregados nesta sessão.`;
+        setMessage(reason);
+        return;
+      }
+      if (!central) {
+        setMessage("Os dados foram carregados nesta sessão, mas a confirmação central não retornou um formato válido. Tente novamente após recarregar a página.");
+        return;
+      }
+      setMessage(`Versão ${central.versionId?.slice(0, 8)} validada e armazenada. Os visuais já usam esta carga na sessão.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível ler ou armazenar um dos arquivos. Confirme o formato Excel e os cabeçalhos esperados.");
     } finally { setImporting(false); }
