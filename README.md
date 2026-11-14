@@ -52,6 +52,14 @@ npm run dev
 
 Use `npm run start` para testar o Worker já compilado localmente. O build deve concluir sem erros antes de qualquer publicação.
 
+Para validar a versão publicada na Vercel, execute:
+
+```powershell
+npm run build:vercel
+```
+
+Esse alvo gera uma SPA em `dist-vercel/`. Ele preserva o runtime Vinext/Cloudflare utilizado pela hospedagem original e evita que a Vercel tente interpretar o projeto como um build Next.js convencional.
+
 ## Estrutura relevante
 
 - `app/page.tsx` — interface e cálculos operacionais da sessão.
@@ -62,4 +70,9 @@ Use `npm run start` para testar o Worker já compilado localmente. O build deve 
 
 ## Publicação
 
-O projeto é hospedado como Site privado. O fluxo de publicação deve empacotar a versão compilada, enviar o commit ao repositório remoto e salvar a versão no ambiente de hospedagem.
+O projeto possui dois alvos independentes:
+
+- **Sites/Cloudflare:** `npm run build`, com Worker, D1 e R2 para a persistência central.
+- **Vercel:** `npm run build:vercel`, configurado em `vercel.json` como aplicação estática.
+
+Na Vercel, os cinco arquivos são validados e usados diretamente na sessão do navegador, alimentando todos os visuais sem depender de uma API Cloudflare. A persistência compartilhada e versionada entre usuários continua sendo uma etapa posterior, que exige conectar uma base e armazenamento compatíveis com a Vercel.
