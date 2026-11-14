@@ -36,7 +36,11 @@ export function readMaterialDimension(rows: Record<string, unknown>[]) {
       aggregateMaterial: String(row["Material agregado"] ?? material).trim(),
     };
     result.set(normalizeMaterial(material), value);
-    result.set(normalizeMaterial(value.aggregateMaterial), value);
+    // A dimensão pode conter diversas apresentações para o mesmo material
+    // agregado. A apresentação física sempre tem precedência; o agregado é
+    // apenas um atalho de consulta e não pode substituir um vínculo já lido.
+    const aggregateKey = normalizeMaterial(value.aggregateMaterial);
+    if (!result.has(aggregateKey)) result.set(aggregateKey, value);
   }
   return result;
 }
