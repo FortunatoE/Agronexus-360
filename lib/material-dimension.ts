@@ -6,6 +6,15 @@ export type MaterialDimension = {
   aggregateMaterial: string;
 };
 
+export type DimensionBundle = {
+  materials: Record<string, MaterialDimension>;
+  centerToNucleus: Record<string, string>;
+  cultureToCycle: Record<string, string>;
+  conversions: Record<string, number>;
+};
+
+export const emptyDimensionBundle: DimensionBundle = { materials: {}, centerToNucleus: {}, cultureToCycle: {}, conversions: {} };
+
 export function normalizeMaterial(value: unknown) {
   return String(value ?? "")
     .normalize("NFD")
