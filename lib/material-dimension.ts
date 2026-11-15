@@ -4,6 +4,8 @@ export type MaterialDimension = {
   merchandiseGroup: string;
   subgroup: string;
   aggregateMaterial: string;
+  target: string;
+  standardDose: number;
 };
 
 export type DimensionBundle = {
@@ -23,17 +25,35 @@ export function normalizeMaterial(value: unknown) {
     .replace(/[^A-Z0-9]/g, "");
 }
 
+function dimensionValue(row: Record<string, unknown>, ...aliases: string[]) {
+  for (const alias of aliases) {
+    const candidate = normalizeMaterial(alias);
+    const key = Object.keys(row).find((header) => normalizeMaterial(header) === candidate);
+    const value = key ? row[key] : undefined;
+    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
+  }
+  return "";
+}
+
+function dimensionNumber(value: string) {
+  const normalized = value.includes(",") ? value.replace(/\./g, "").replace(",", ".") : value;
+  const parsed = Number(normalized.replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export function readMaterialDimension(rows: Record<string, unknown>[]) {
   const result = new Map<string, MaterialDimension>();
   for (const row of rows) {
-    const material = String(row.Material ?? "").trim();
+    const material = dimensionValue(row, "Material");
     if (!material) continue;
     const value: MaterialDimension = {
       material,
-      principleActive: String(row["Princípio Ativo"] ?? row["Principio Ativo"] ?? "Não informado").trim(),
-      merchandiseGroup: String(row["Grupo de mercadorias"] ?? row.Grupo ?? "Sem grupo").trim(),
-      subgroup: String(row.Subgrupo ?? row.Sub_Grupo ?? "Sem subgrupo").trim(),
-      aggregateMaterial: String(row["Material agregado"] ?? material).trim(),
+      principleActive: dimensionValue(row, "Princípio Ativo", "Principio Ativo") || "Não informado",
+      merchandiseGroup: dimensionValue(row, "Grupo de mercadorias", "Grupo") || "Sem grupo",
+      subgroup: dimensionValue(row, "Subgrupo", "Sub_Grupo") || "Sem subgrupo",
+      aggregateMaterial: dimensionValue(row, "Material agregado") || material,
+      target: dimensionValue(row, "Alvo"),
+      standardDose: dimensionNumber(dimensionValue(row, "Dose padrão", "Dose padrao")),
     };
     result.set(normalizeMaterial(material), value);
     // A dimensão pode conter diversas apresentações para o mesmo material

@@ -183,6 +183,16 @@ export function nucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToN
     || "Sem núcleo";
 }
 
+/** Applies the depot overrides used in the MB52 Power Query only to stock data. */
+export function stockNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
+  const center = headerKey(readText(row, "Cen.", "Centro", "CEN"));
+  const depot = headerKey(readText(row, "Dep.", "Depósito", "Deposito", "DEP"));
+  if (center === "FBJ2" && depot === "TR01") return "NC-BBJ";
+  if (center === "FBJ2" && depot === "UTS1") return "NC-STM";
+  if (!depot) return "BRAVO";
+  return nucleusFor(row, bundle, farmToNucleus);
+}
+
 export function productFor(row: OperationalRow, source: ProductSource, bundle: DimensionBundle): ResolvedProduct {
   const code = readText(row, "Material", "Código material", "Codigo material", "MAT");
   const described = readText(row, ...productFields[source]);
@@ -208,16 +218,38 @@ export function productFor(row: OperationalRow, source: ProductSource, bundle: D
 export function stockLocationFor(row: OperationalRow, nucleus: string) {
   const center = readText(row, "Cen.", "Centro", "CEN");
   const depot = readText(row, "Dep.", "Depósito", "Deposito", "DEP");
+  const operator = readText(row, "Nome Est.Esp.", "Nome Est Esp", "Armazém", "Armazem");
+  const city = readText(row, "Local Est.Esp.", "Local Est Esp", "Cidade");
   const isWarehouse = headerKey(center) === "0714" || !depot;
   const type: StockLocationType = isWarehouse ? "Armazém" : "Fazenda";
+  const cityName = city.split("-")[0]?.trim() || city;
+  const storageName = headerKey(operator).includes("BRAVO")
+    ? ["BRAVO", cityName].filter(Boolean).join(" ")
+    : [operator, city].filter(Boolean).join(" — ");
   const place = isWarehouse
-    ? `Armazém — ${center || "sem centro"}${depot ? ` / ${depot}` : " / sem depósito"}`
+    ? `Armazém — ${storageName || center || "sem centro"}${storageName ? "" : depot ? ` / ${depot}` : " / sem depósito"}`
     : `Fazenda — ${nucleus} / ${depot}`;
   return { depot, type, place };
 }
 
 export function quantityFor(row: OperationalRow, source: ProductSource) {
   return readNumber(row, ...quantityFields[source]);
+}
+
+/**
+ * Expresses a physical material in the unit of its material agregado. The
+ * Premissas sheet stores conversions as `material padrão|apresentação física`.
+ * This is the same division used by the legacy MB52 Power Query.
+ */
+export function standardAmount(amount: number, product: ResolvedProduct, bundle: DimensionBundle) {
+  const conversion = bundle.conversions[`${normalizeMaterial(product.canonicalName)}|${normalizeMaterial(product.rawName)}`] || 1;
+  return conversion > 0 ? amount / conversion : amount;
+}
+
+export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {
+  const adjusted = readText(row, "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
+  if (adjusted) return numberFrom(adjusted);
+  return standardAmount(quantityFor(row, source), product, bundle);
 }
 
 export function buildReconciliation({
@@ -268,17 +300,18 @@ export function buildReconciliation({
     const product = productFor(row, "planning", bundle);
     if (product.rawName === "Sem descrição") return;
     const target = ensure(product, nucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
-    const conversion = bundle.conversions[`${normalizeMaterial(product.rawName)}|${normalizeMaterial(product.canonicalName)}`] || 1;
-    target.planned += quantityFor(row, "planning") * conversion;
+    target.planned += standardQuantity(row, "planning", product, bundle);
     target.plannedMaterials.add(product.rawName);
   });
 
   stockRows.forEach((row) => {
     const product = productFor(row, "stock", bundle);
     if (product.rawName === "Sem descrição") return;
-    const nucleus = nucleusFor(row, bundle, farmToNucleus);
-    const target = ensure(product, nucleusFor(row, bundle, farmToNucleus));
-    const amount = quantityFor(row, "stock");
+    const amount = standardQuantity(row, "stock", product, bundle);
+    // Saldos zerados não descrevem disponibilidade em fazenda ou armazém.
+    if (amount === 0) return;
+    const nucleus = stockNucleusFor(row, bundle, farmToNucleus);
+    const target = ensure(product, nucleus);
     const location = stockLocationFor(row, nucleus);
     if (location.type === "Fazenda") target.farmBalance += amount;
     else target.warehouseBalance += amount;
@@ -291,7 +324,7 @@ export function buildReconciliation({
     if (product.rawName === "Sem descrição") return;
     const nucleus = nucleusFor(row, bundle, farmToNucleus);
     const target = ensure(product, nucleus);
-    const amount = quantityFor(row, "transit");
+    const amount = standardQuantity(row, "transit", product, bundle);
     target.transit += amount;
     target.stockMaterials.add(product.rawName);
     target.locations.push({ amount, location: `Trânsito — ${nucleus}`, material: product.rawName, type: "Trânsito" });
@@ -301,7 +334,7 @@ export function buildReconciliation({
     const product = productFor(row, "consumption", bundle);
     if (product.rawName === "Sem descrição") return;
     const target = ensure(product, nucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
-    target.applied += quantityFor(row, "consumption");
+    target.applied += standardQuantity(row, "consumption", product, bundle);
     target.plannedMaterials.add(product.rawName);
   });
 
@@ -309,7 +342,7 @@ export function buildReconciliation({
     const product = productFor(row, "pending", bundle);
     if (product.rawName === "Sem descrição") return;
     const target = ensure(product, nucleusFor(row, bundle, farmToNucleus));
-    target.pendingOrder += quantityFor(row, "pending");
+    target.pendingOrder += standardQuantity(row, "pending", product, bundle);
     target.plannedMaterials.add(product.rawName);
   });
 
