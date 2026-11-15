@@ -9,7 +9,8 @@ Plataforma de planejamento agrícola para conciliar planejamento, execução SAP
 | Planejamento | Datas previstas, doses, áreas, produtos e WBS |
 | ZPS007 | Execução e áreas registradas; registros `EXCL` não compõem a execução válida |
 | CN52 | Consumo/aplicado |
-| ZMM_BATCH | Estoque por lote, centro, depósito e armazém/cidade; substitui a MB52 |
+| ZMM_BATCH | Fonte prioritária de estoque por lote, centro, depósito e armazém/cidade |
+| MB52 | Complemento de estoque: somente materiais físicos que não aparecem na ZMM_BATCH |
 | MB5T | Materiais em trânsito |
 | Pedidos pendentes | Centro solicitante, descrição do produto e saldo ainda a fornecer |
 | Dimensões.xlsx | Referências de princípio ativo, materiais, centros, culturas e conversões |
@@ -22,7 +23,9 @@ O elemento WBS segue o padrão:
 
 O índice de divisão do talhão é `A=1`, `B=2`, `C=3`, `D=4` e `E=5`.
 
-No Planejamento, o núcleo é ajustado pelo prefixo do talhão: `TL` → `NC-TP`, `FM` → `NC-STM` e `BM` → `NC-BBJ`. Nos demais casos, `NC-VER` é normalizado para `NC-AGV`. Essa regra é exclusiva do Planejamento e também atualiza a relação Fazenda → Núcleo usada para conciliar consumo e execução pelo WBS.
+No Planejamento, o núcleo é ajustado pelo prefixo do talhão: `TL` → `NC-TP`, `FM` → `NC-STM` e `BM` → `NC-BBJ`. Nos demais casos, `NC-VER` é normalizado para `NC-AGV`. Essa regra também atualiza a relação Fazenda → Núcleo usada para conciliar consumo e execução pelo WBS.
+
+No CN52, o centro e o talhão são extraídos do Elemento PEP. Para o centro compartilhado `FBJ2`, `FM` pertence a `NC-STM` e `BM` a `NC-BBJ`; talhões iniciados por `TL` pertencem a `NC-TP`. Os demais registros mantêm o núcleo derivado pela dimensão de centro.
 
 As ligações não dependem do código SAP. A chave operacional é a hierarquia de
 nomes `Princípio ativo → Material agregado (padrão) → Material físico`,
@@ -42,15 +45,15 @@ Na ZMM_BATCH, o núcleo do estoque é conciliado pela mesma lógica usada no con
 
 Estoque de **fazenda** é o que possui depósito preenchido e centro diferente de `0714`. Estoque de **armazém** é o que pertence ao centro `0714` ou não possui depósito. A ZMM_BATCH preserva ainda o nome e a cidade do armazém, como **BRAVO Sorriso** e **BRAVO Cuiabá**. Linhas com saldo zero são desconsideradas na classificação fazenda/armazém e não geram disponibilidade artificial. O armazém é um pool compartilhado por material agregado: não é duplicado entre núcleos no provisionamento.
 
-Na guia Acompanhamento, esse pool é exibido separadamente como núcleo **ARMAZÉM**. A expansão apresenta primeiro o material físico e, abaixo, cada localização formada por `Nome Est.Esp. - Local Est.Esp.` da ZMM_BATCH. Linhas de lotes do mesmo material e da mesma localização são consolidadas em uma única linha operacional. Assim, o saldo central não se mistura ao saldo da fazenda.
+Na guia Acompanhamento, esse pool é exibido separadamente como núcleo **ARMAZÉM**. A expansão apresenta primeiro o material físico e, abaixo, cada localização formada por `Nome Est.Esp. - Local Est.Esp.` da ZMM_BATCH. Linhas de lotes do mesmo material e da mesma localização são consolidadas em uma única linha operacional. A MB52 complementa apenas materiais ausentes na BATCH. Assim, o saldo central não se mistura ao saldo da fazenda nem é duplicado entre fontes.
 
 ## Visões operacionais
 
 - **Visão geral:** execução por subgrupo, separada entre Safra e Safrinha, e macro por cultura.
 - **Calendarização:** provisionamento por janela de avaliação, com detalhamento de saldo por fazenda, armazém e trânsito e exportação Excel (Resumo e Detalhes).
-- **Acompanhamento:** inicia em **Safra**; os filtros recalculam planejamento e consumo antes da consolidação. Exibe planejamento, saldo, trânsito, aplicado e volume solicitado por princípio ativo, material padrão e núcleo, com expansão por material físico e localização. O indicador **A entregar** segue `(Saldo + Aplicado + Trânsito) − Qtd. planejada`: verde quando positivo, vermelho quando negativo e preto quando zero.
+- **Acompanhamento:** inicia em **Safra**; os filtros recalculam planejamento e consumo antes da consolidação. Exibe planejamento, saldo, trânsito, aplicado e volume solicitado por princípio ativo, material padrão e núcleo, com expansão por material físico e localização. Inclui filtro de núcleo e exportação Excel do recorte exibido. O indicador **A entregar** segue `(Saldo + Aplicado + Trânsito) − Qtd. planejada`: verde quando positivo, vermelho quando negativo e preto quando zero.
 - **Execução:** percentual já realizado, volumes planejado e executado, dose executada versus planejada e impacto de volume causado pela diferença de dose. A leitura é segmentada por ciclo, cultura, grupo, subgrupo, núcleo e material.
-- **Importações:** seleção das cinco fontes operacionais e da dimensão opcional.
+- **Importações:** seleção das seis fontes operacionais e da dimensão opcional.
 - **Premissas:** tolerâncias, janelas, status excluído, mapeamentos editáveis e importação de pedidos pendentes (`Centro`, `Descrição Material`, `Saldo Forn`).
 
 ## Desenvolvimento
@@ -88,4 +91,4 @@ O projeto possui dois alvos independentes:
 - **Sites/Cloudflare:** `npm run build`, com Worker, D1 e R2 para a persistência central.
 - **Vercel:** `npm run build:vercel`, configurado em `vercel.json` como aplicação estática.
 
-Na Vercel, os cinco arquivos são validados e usados diretamente na sessão do navegador, alimentando todos os visuais sem depender de uma API Cloudflare. A persistência compartilhada e versionada entre usuários continua sendo uma etapa posterior, que exige conectar uma base e armazenamento compatíveis com a Vercel.
+Na Vercel, os seis arquivos são validados e usados diretamente na sessão do navegador, alimentando todos os visuais sem depender de uma API Cloudflare. Valores numéricos nativos do Excel preservam seus decimais; textos formatados em padrão brasileiro também são interpretados corretamente. A persistência compartilhada e versionada entre usuários continua sendo uma etapa posterior, que exige conectar uma base e armazenamento compatíveis com a Vercel.

@@ -7,11 +7,11 @@ import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@
 import {
   buildFarmToNucleus,
   buildReconciliation,
+  consumptionNucleusFor,
   cultureFor,
   cycleFor,
   headerKey,
   numberFrom,
-  nucleusFor,
   planningNucleusFor,
   productFor,
   readNumber,
@@ -29,19 +29,20 @@ import {
 } from "lucide-react";
 
 type Row = OperationalRow;
-type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "transito";
+type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito";
 type Datasets = Record<SourceKey, Row[]>;
 type ImportSummary = { fileName: string; rows: number; sheets: string[] };
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
 
-const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], transito: [] };
+const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [] };
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
 const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header: number }> = [
   { key: "planejamento", title: "Planejamento", hint: "PLANEJAMENTO.xlsx", header: 0 },
   { key: "execucao", title: "Execução SAP", hint: "ZPS007.xlsx", header: 1 },
   { key: "consumo", title: "Consumo SAP", hint: "CN52.xlsx", header: 3 },
   { key: "estoque", title: "Estoque por lote", hint: "ZMM_BATCH.xlsx", header: 0 },
+  { key: "estoqueMb52", title: "Estoque complementar", hint: "MB52.xlsx — somente materiais ausentes na BATCH", header: 1 },
   { key: "transito", title: "Materiais em trânsito", hint: "MB5T.xlsx", header: 1 },
 ];
 const nav = [
@@ -103,7 +104,7 @@ function stockHeaderRow(sheet: XLSX.WorkSheet) {
 }
 function rowsFrom(workbook: XLSX.WorkBook, source: (typeof sourceConfig)[number]) {
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const header = source.key === "estoque" ? stockHeaderRow(sheet) : source.header;
+  const header = source.key === "estoque" || source.key === "estoqueMb52" ? stockHeaderRow(sheet) : source.header;
   return XLSX.utils.sheet_to_json<Row>(sheet, { range: header, defval: "" });
 }
 function statusExcluded(row: Row, status: string) {
@@ -204,8 +205,11 @@ type AnalysisFiltersProps = {
   onCultureChange: (value: string) => void;
   onCycleChange: (value: string) => void;
   onGroupChange: (value: string) => void;
+  onNucleusChange?: (value: string) => void;
   onQueryChange: (value: string) => void;
   onSubgroupChange: (value: string) => void;
+  nuclei?: string[];
+  nucleusFilter?: string;
   query: string;
   subgroupFilter: string;
   subgroups: string[];
@@ -213,10 +217,10 @@ type AnalysisFiltersProps = {
 
 function AnalysisFilters({
   cultures, cultureFilter, cycleFilter, cycles, groupFilter, groups,
-  onCultureChange, onCycleChange, onGroupChange, onQueryChange, onSubgroupChange,
-  query, subgroupFilter, subgroups,
+  onCultureChange, onCycleChange, onGroupChange, onNucleusChange, onQueryChange, onSubgroupChange,
+  nuclei, nucleusFilter, query, subgroupFilter, subgroups,
 }: AnalysisFiltersProps) {
-  return <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-5">
+  return <div className={cn("grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2", nuclei ? "xl:grid-cols-6" : "xl:grid-cols-5")}>
     <label className="grid gap-1 text-xs font-semibold text-slate-600">Ciclo
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onCycleChange(event.target.value)} value={cycleFilter}>
         {cycles.map((item) => <option key={item}>{item}</option>)}
@@ -237,6 +241,11 @@ function AnalysisFilters({
         {cultures.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label>
+    {nuclei && nucleusFilter !== undefined && onNucleusChange ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Núcleo
+      <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onNucleusChange(event.target.value)} value={nucleusFilter}>
+        {nuclei.map((item) => <option key={item}>{item}</option>)}
+      </select>
+    </label> : null}
     <label className="grid gap-1 text-xs font-semibold text-slate-600">Buscar
       <span className="relative"><Search className="absolute left-2 top-2.5 h-4 w-4 text-slate-400" /><input className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-2 text-sm font-normal" onChange={(event) => onQueryChange(event.target.value)} placeholder="Produto ou princípio ativo" value={query} /></span>
     </label>
@@ -316,6 +325,16 @@ function allocateCentralWarehouse(rows: DemandRow[], stockRows: ReconciliationRo
   return { allocations, totalAvailable };
 }
 
+function consolidateLocations(locations: ReconciliationRow["locations"]) {
+  const consolidated = new Map<string, ReconciliationRow["locations"][number]>();
+  locations.forEach((location) => {
+    const key = [location.type, location.material, location.location].join("\u0000");
+    const current = consolidated.get(key);
+    consolidated.set(key, current ? { ...current, amount: current.amount + location.amount } : { ...location });
+  });
+  return [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location) || left.type.localeCompare(right.type));
+}
+
 function StockDetails({ row }: { row: MonitoringRow }) {
   const groups = new Map<string, { balance: number; locations: ReconciliationRow["locations"]; transit: number }>();
   row.locations.forEach((location) => {
@@ -333,15 +352,9 @@ function StockDetails({ row }: { row: MonitoringRow }) {
       </thead>
       <tbody className="divide-y divide-emerald-50">
         {materials.flatMap(([material, detail]) => {
-          // A ZMM_BATCH possui uma linha por lote. A visão operacional deve somar
-          // os lotes quando material, tipo de saldo e localização são os mesmos.
-          const consolidated = new Map<string, ReconciliationRow["locations"][number]>();
-          detail.locations.forEach((location) => {
-            const key = [location.type, location.material, location.location].join("\u0000");
-            const current = consolidated.get(key);
-            consolidated.set(key, current ? { ...current, amount: current.amount + location.amount } : { ...location });
-          });
-          const locations = [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location) || left.type.localeCompare(right.type));
+          // A ZMM_BATCH possui uma linha por lote. A visão operacional soma os
+          // lotes quando material, tipo de saldo e localização são os mesmos.
+          const locations = consolidateLocations(detail.locations);
           return [
             <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material</td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
             ...locations.map((location) => <tr key={["location", material, location.type, location.location].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : formatNumber(location.amount)}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
@@ -374,6 +387,7 @@ export default function Home() {
   const [groupFilter, setGroupFilter] = useState("Todos");
   const [subgroupFilter, setSubgroupFilter] = useState("Todos");
   const [cultureFilter, setCultureFilter] = useState("Todos");
+  const [nucleusFilter, setNucleusFilter] = useState("Todos");
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [task, setTask] = useState("");
@@ -393,13 +407,20 @@ export default function Home() {
   const dimensions = useMemo(() => mergePremises(bundle, dimensionPremises), [bundle, dimensionPremises]);
   const plans = useMemo(() => datasets.planejamento.filter((row) => planningProduct(row, premises.excludedStatus)), [datasets.planejamento, premises.excludedStatus]);
   const farmToNucleus = useMemo(() => buildFarmToNucleus([...plans, ...datasets.execucao], dimensions, plans), [plans, datasets.execucao, dimensions]);
+  const stockRows = useMemo(() => {
+    // A BATCH é a fonte prioritária. A MB52 completa somente apresentações
+    // físicas que não aparecem nela, evitando duplicar o mesmo saldo.
+    const batchMaterials = new Set(datasets.estoque.map((row) => normalizeMaterial(productFor(row, "stock", dimensions).rawName)));
+    const mb52Fallback = datasets.estoqueMb52.filter((row) => !batchMaterials.has(normalizeMaterial(productFor(row, "stock", dimensions).rawName)));
+    return [...datasets.estoque, ...mb52Fallback];
+  }, [datasets.estoque, datasets.estoqueMb52, dimensions]);
   const ledger = useMemo(() => buildReconciliation({
-    bundle: dimensions, planningRows: plans, stockRows: datasets.estoque, transitRows: datasets.transito,
+    bundle: dimensions, planningRows: plans, stockRows, transitRows: datasets.transito,
     consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
-  }), [dimensions, plans, datasets.estoque, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
+  }), [dimensions, plans, stockRows, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
 
   const materialResolution = useMemo(() => {
-    const input: Array<[Row[], "stock" | "transit" | "consumption"]> = [[datasets.estoque, "stock"], [datasets.transito, "transit"], [datasets.consumo, "consumption"]];
+    const input: Array<[Row[], "stock" | "transit" | "consumption"]> = [[stockRows, "stock"], [datasets.transito, "transit"], [datasets.consumo, "consumption"]];
     let described = 0;
     let resolved = 0;
     input.forEach(([rows, source]) => rows.forEach((row) => {
@@ -409,7 +430,7 @@ export default function Home() {
       if (product.resolvedByDimension) resolved += 1;
     }));
     return { described, resolved };
-  }, [datasets.estoque, datasets.transito, datasets.consumo, dimensions]);
+  }, [stockRows, datasets.transito, datasets.consumo, dimensions]);
 
   const groupedProgress = useMemo(() => {
     type ProgressRow = { group: string; subgroup: string; planned: number; applied: number };
@@ -458,13 +479,13 @@ export default function Home() {
     return buildReconciliation({
       bundle: dimensions,
       planningRows: plans.filter((row) => matchesScope(row, "planning")),
-      stockRows: datasets.estoque,
+      stockRows,
       transitRows: datasets.transito,
       consumptionRows: datasets.consumo.filter((row) => matchesScope(row, "consumption")),
       pendingRows: pendingOrders,
       farmToNucleus,
     });
-  }, [cycleFilter, cultureFilter, datasets.consumo, datasets.estoque, datasets.transito, dimensions, farmToNucleus, groupFilter, pendingOrders, plans, subgroupFilter]);
+  }, [cycleFilter, cultureFilter, datasets.consumo, stockRows, datasets.transito, dimensions, farmToNucleus, groupFilter, pendingOrders, plans, subgroupFilter]);
 
   const warehouseMonitoringRows = useMemo(() => {
     const context = new Map<string, { cultures: Set<string>; cycles: Set<string> }>();
@@ -510,6 +531,11 @@ export default function Home() {
     return [...values.values()].map((row) => ({ ...row, available: row.warehouseBalance, stockMaterials: row.stockMaterials.sort() }));
   }, [monitoringLedger]);
 
+  const monitoringNuclei = useMemo(() => ["Todos", ...[...new Set([
+    ...monitoringLedger.map((row) => row.nucleus),
+    ...warehouseMonitoringRows.map((row) => row.nucleus),
+  ])].sort()], [monitoringLedger, warehouseMonitoringRows]);
+
   const executionRows = useMemo(() => {
     const search = normalizeMaterial(query);
     const farmRows: MonitoringRow[] = monitoringLedger.map((row) => {
@@ -530,11 +556,12 @@ export default function Home() {
         && (groupFilter === "Todos" || row.merchandiseGroup === groupFilter)
         && (subgroupFilter === "Todos" || row.subgroup === subgroupFilter)
         && (cultureFilter === "Todos" || row.cultures.includes(cultureFilter))
+        && (nucleusFilter === "Todos" || row.nucleus === nucleusFilter)
         && (!search || line.includes(search));
     }).sort((left, right) => left.active.localeCompare(right.active)
       || left.standardMaterial.localeCompare(right.standardMaterial)
       || left.nucleus.localeCompare(right.nucleus));
-  }, [cycleFilter, cultureFilter, groupFilter, monitoringLedger, query, subgroupFilter, warehouseMonitoringRows]);
+  }, [cycleFilter, cultureFilter, groupFilter, monitoringLedger, nucleusFilter, query, subgroupFilter, warehouseMonitoringRows]);
 
   const executedAreaByTask = useMemo(() => {
     const values = new Map<string, number>();
@@ -597,7 +624,7 @@ export default function Home() {
         || (groupFilter !== "Todos" && product.merchandiseGroup !== groupFilter)
         || (subgroupFilter !== "Todos" && product.subgroup !== subgroupFilter)
         || (cultureFilter !== "Todos" && cultureFor(row) !== cultureFilter)) return;
-      const nucleus = nucleusFor(row, dimensions, farmToNucleus);
+      const nucleus = consumptionNucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.appliedVolume += standardQuantity(row, "consumption", product, dimensions);
       item.current.neededVolume += standardAmount(readNumber(row, "Qtd.necess.", "Qtd necess.", "Quantidade necessária", "Quantidade necessaria"), product, dimensions);
@@ -663,7 +690,7 @@ export default function Home() {
     const scheduled = dated.filter((item) => item.date);
     const windowPlans = scheduled.length ? scheduled.filter((item) => item.date! >= start && item.date! <= finish).map((item) => item.row) : plans;
     const windowLedger = buildReconciliation({
-      bundle: dimensions, planningRows: windowPlans, stockRows: datasets.estoque, transitRows: datasets.transito,
+      bundle: dimensions, planningRows: windowPlans, stockRows, transitRows: datasets.transito,
       consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
     });
     const demands: DemandRow[] = windowLedger.filter((row) => row.planned > 0).map((row) => ({
@@ -685,7 +712,7 @@ export default function Home() {
       transit: rows.reduce((sum, row) => sum + row.transit, 0),
       warehouse: allocation.totalAvailable,
     };
-  }, [evaluationDate, provisionUntil, plans, dimensions, datasets.estoque, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
+  }, [evaluationDate, provisionUntil, plans, dimensions, stockRows, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
 
   const consolidatedSupply = useMemo(() => {
     const demands: DemandRow[] = ledger.filter((row) => row.planned > 0).map((row) => ({
@@ -765,6 +792,37 @@ export default function Home() {
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
     XLSX.writeFile(workbook, "provisionamento_" + evaluationDate + "_" + provisionUntil + ".xlsx", { bookType: "xlsx" });
   }
+  function exportMonitoring() {
+    const summary = executionRows.map((row) => ({
+      "Princípio ativo": row.active,
+      Ciclo: row.cycles.join(", "),
+      Cultura: row.cultures.join(", "),
+      Núcleo: row.nucleus,
+      Grupo: row.merchandiseGroup,
+      Subgrupo: row.subgroup,
+      "Material padrão": row.standardMaterial,
+      "Material em estoque": row.stockMaterials.join(", "),
+      "Qtd. planejada": row.planned,
+      Saldo: row.farmBalance + row.warehouseBalance,
+      Trânsito: row.transit,
+      Aplicado: row.applied,
+      "A entregar": amountToDeliver(row),
+      "Volume solicitado": row.pendingOrder,
+    }));
+    const details = executionRows.flatMap((row) => consolidateLocations(row.locations).map((location) => ({
+      "Princípio ativo": row.active,
+      Núcleo: row.nucleus,
+      "Material padrão": row.standardMaterial,
+      Material: location.material,
+      Tipo: location.type,
+      Localização: location.location,
+      "Saldo / trânsito": location.amount,
+    })));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summary), "Acompanhamento");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
+    XLSX.writeFile(workbook, "acompanhamento_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
+  }
 
   const totalPlanned = ledger.reduce((sum, row) => sum + row.planned, 0);
   const totalApplied = ledger.reduce((sum, row) => sum + row.applied, 0);
@@ -784,7 +842,7 @@ export default function Home() {
       <div className="grid gap-5 xl:grid-cols-2">{groupedProgress.map((group) => <div className="rounded-2xl border border-slate-200 bg-white p-5" key={group.cycle}><div className="mb-4 flex items-center justify-between"><div><h2 className="font-semibold">Execução por subgrupo — {group.cycle}</h2><p className="mt-1 text-xs text-slate-500">Planejado x aplicado, separado por grupo e subgrupo.</p></div><BarChart3 className="h-5 w-5 text-emerald-700" /></div><div className="space-y-4">{group.rows.length ? group.rows.map((row) => <div key={row.group + "|" + row.subgroup}><div className="mb-1.5 flex items-end justify-between gap-3"><p className="text-sm font-medium">{row.subgroup} <span className="text-xs font-normal text-slate-500">{row.group}</span></p><p className="text-xs font-semibold text-slate-700">{percent(row.applied, row.planned).toFixed(1)}%</p></div><Progress value={percent(row.applied, row.planned)} /><p className="mt-1 text-xs text-slate-500">{formatNumber(row.applied)} aplicado de {formatNumber(row.planned)} planejado</p></div>) : <p className="py-8 text-center text-sm text-slate-500">Sem linhas conciliadas para este ciclo.</p>}</div></div>)}</div>
       <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4"><h2 className="font-semibold">Macro por cultura</h2><p className="mt-1 text-xs text-slate-500">Área executada registrada no ZPS007, por safra e safrinha.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{macroCrop.map((crop) => <div className="rounded-xl bg-slate-50 p-4" key={crop.code}><p className="text-xs font-semibold text-emerald-700">{crop.cycle}</p><p className="mt-1 font-semibold">{crop.name}</p><p className="mt-3 text-lg font-bold">{formatNumber(crop.applied)}</p><p className="text-xs text-slate-500">área executada registrada</p></div>)}</div></div>
       {materialResolution.described > materialResolution.resolved ? <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><p><strong>Conciliação incompleta:</strong> {materialResolution.described - materialResolution.resolved} descrições não estão nas dimensões. Elas são identificadas, mas nunca viram uma chave pelo código SAP.</p></div> : null}
-    </section> : <Empty title="Comece pela importação" description="Carregue Planejamento, CN52, ZMM_BATCH e MB5T. Depois envie Dimensões para conciliar materiais pelo nome." />;
+    </section> : <Empty title="Comece pela importação" description="Carregue Planejamento, CN52, ZMM_BATCH, MB52 e MB5T. Depois envie Dimensões para conciliar materiais pelo nome." />;
   } else if (active === "Calendarização") {
     content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-end justify-between gap-4"><div><h2 className="font-semibold">Calendarização e provisionamento</h2><p className="mt-1 max-w-2xl text-sm text-slate-500">A janela compara demanda planejada, saldo por núcleo, trânsito e apoio do armazém para o mesmo material.</p></div><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={!plans.length} onClick={() => setShowProvision(true)} type="button"><CalendarDays className="h-4 w-4" />Rodar provisionamento</button></div><div className="mt-6 grid gap-3 sm:grid-cols-3"><Card label="Data de avaliação" value={new Intl.DateTimeFormat("pt-BR").format(new Date(evaluationDate + "T00:00:00"))} note="Valor inicial editável" /><Card label="Horizonte padrão" value={premises.horizon} note="dias definidos nas premissas" /><Card label="Materiais com falta" value={consolidatedSupply.failures.length} note="após rateio do armazém" tone="amber" /></div></section>;
   } else if (active === "Acompanhamento") {
@@ -803,12 +861,16 @@ export default function Home() {
         onCultureChange={setCultureFilter}
         onCycleChange={setCycleFilter}
         onGroupChange={setGroupFilter}
+        onNucleusChange={setNucleusFilter}
         onQueryChange={setQuery}
         onSubgroupChange={setSubgroupFilter}
+        nuclei={monitoringNuclei}
+        nucleusFilter={nucleusFilter}
         query={query}
         subgroupFilter={subgroupFilter}
         subgroups={filters.subgroups}
       />
+      <div className="flex justify-end"><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={exportMonitoring} type="button"><Download className="h-4 w-4" />Exportar Excel</button></div>
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
         <table className="w-full min-w-[1300px] text-left text-sm">
           <thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
@@ -836,7 +898,7 @@ export default function Home() {
           </tbody>
         </table>
       </div>
-    </section> : <Empty title="Sem acompanhamento conciliado" description="Importe planejamento, consumo, estoque por lote e trânsito para ativar esta visão." />;
+    </section> : <Empty title="Sem acompanhamento conciliado" description="Importe planejamento, consumo, estoque por lote, MB52 complementar e trânsito para ativar esta visão." />;
   } else if (active === "Execução") {
     content = executionPerformance.length ? <section className="space-y-5">
       <div>

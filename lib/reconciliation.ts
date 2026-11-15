@@ -97,7 +97,7 @@ export function headerKey(value: unknown) {
     .replace(/[^A-Z0-9]/g, "");
 }
 
-export function readText(row: OperationalRow, ...aliases: string[]) {
+export function readValue(row: OperationalRow, ...aliases: string[]) {
   for (const alias of aliases) {
     const candidate = headerKey(alias);
     const header = Object.keys(row).find((key) => {
@@ -105,8 +105,14 @@ export function readText(row: OperationalRow, ...aliases: string[]) {
       return current === candidate || (candidate.length > 7 && current.startsWith(candidate));
     });
     const value = header ? row[header] : undefined;
-    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
+    if (value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) return value;
   }
+  return undefined;
+}
+
+export function readText(row: OperationalRow, ...aliases: string[]) {
+  const value = readValue(row, ...aliases);
+  if (value !== undefined) return String(value).trim();
   return "";
 }
 
@@ -124,7 +130,7 @@ export function numberFrom(value: unknown) {
 }
 
 export function readNumber(row: OperationalRow, ...aliases: string[]) {
-  return numberFrom(readText(row, ...aliases));
+  return numberFrom(readValue(row, ...aliases));
 }
 
 function wbsFrom(row: OperationalRow) {
@@ -133,6 +139,24 @@ function wbsFrom(row: OperationalRow) {
 
 function wbsSegment(row: OperationalRow, position: number) {
   return wbsFrom(row).split(".").map((segment) => segment.trim()).filter(Boolean)[position] ?? "";
+}
+
+function centerFor(row: OperationalRow) {
+  const direct = readText(row, "Cen.", "Centro", "CEN");
+  if (direct) return direct;
+  const wbs = wbsFrom(row);
+  // No CN52, o centro ocupa as posições 5 a 8 do Elemento PEP, por exemplo
+  // CR1.FBJ2.2627-BM01-5. O segmento do WBS mantém a leitura compatível.
+  return wbsSegment(row, 1) || (wbs.length >= 8 ? wbs.slice(4, 8) : "");
+}
+
+function talhaoFor(row: OperationalRow) {
+  const direct = readText(row, "Talhao", "Talhão");
+  if (direct) return headerKey(direct);
+  const wbs = wbsFrom(row);
+  const fromHyphen = wbs.split("-").map((segment) => segment.trim()).filter(Boolean)[1] ?? "";
+  const fromWbsPattern = wbsSegment(row, 3);
+  return headerKey(fromHyphen || fromWbsPattern);
 }
 
 function titleCycle(value: string) {
@@ -162,7 +186,7 @@ export function buildFarmToNucleus(rows: OperationalRow[], bundle: DimensionBund
     const nucleus = readText(row, "Nucleo", "Núcleo");
     const farm = wbsSegment(row, 1);
     if (nucleus && farm) result[normalizeMaterial(farm)] = nucleus;
-    const center = readText(row, "Cen.", "Centro", "CEN");
+    const center = centerFor(row);
     if (nucleus && center) result[normalizeMaterial(center)] = nucleus;
   });
   Object.entries(bundle.centerToNucleus).forEach(([center, nucleus]) => {
@@ -181,7 +205,7 @@ export function buildFarmToNucleus(rows: OperationalRow[], bundle: DimensionBund
 export function nucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
   const direct = readText(row, "Nucleo", "Núcleo");
   if (direct) return direct;
-  const center = readText(row, "Cen.", "Centro", "CEN");
+  const center = centerFor(row);
   const farm = wbsSegment(row, 1);
   return bundle.centerToNucleus[normalizeMaterial(center)]
     || farmToNucleus[normalizeMaterial(center)]
@@ -192,16 +216,26 @@ export function nucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToN
 
 /** Applies the Talhão-based nucleus rule only to planning rows. */
 export function planningNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
-  const talhao = headerKey(readText(row, "Talhao", "Talhão"));
+  const talhao = talhaoFor(row);
   if (talhao.startsWith("TL")) return "NC-TP";
   if (talhao.startsWith("FM")) return "NC-STM";
   if (talhao.startsWith("BM")) return "NC-BBJ";
   return nucleusFor(row, bundle, farmToNucleus).replace(/NC-VER/g, "NC-AGV");
 }
 
+/** Applies the CN52 nucleus rules from the operational Power Query. */
+export function consumptionNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
+  const center = headerKey(centerFor(row));
+  const talhao = talhaoFor(row);
+  if (center === "FBJ2" && talhao.startsWith("FM")) return "NC-STM";
+  if (center === "FBJ2" && talhao.startsWith("BM")) return "NC-BBJ";
+  if (talhao.startsWith("TL")) return "NC-TP";
+  return nucleusFor(row, bundle, farmToNucleus);
+}
+
 /** Applies the depot overrides used in the MB52 Power Query only to stock data. */
 export function stockNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
-  const center = headerKey(readText(row, "Cen.", "Centro", "CEN"));
+  const center = headerKey(centerFor(row));
   const depot = headerKey(readText(row, "Dep.", "Depósito", "Deposito", "DEP"));
   // Regra operacional: todo estoque registrado no centro FVR1 atende ao NC-TP.
   if (center === "FVR1") return "NC-TP";
@@ -234,7 +268,7 @@ export function productFor(row: OperationalRow, source: ProductSource, bundle: D
 }
 
 export function stockLocationFor(row: OperationalRow, nucleus: string) {
-  const center = readText(row, "Cen.", "Centro", "CEN");
+  const center = centerFor(row);
   const depot = readText(row, "Dep.", "Depósito", "Deposito", "DEP");
   const operator = readText(row, "Nome Est.Esp.", "Nome Est Esp", "Armazém", "Armazem");
   const city = readText(row, "Local Est.Esp.", "Local Est Esp", "Cidade");
@@ -262,8 +296,8 @@ export function standardAmount(amount: number, product: ResolvedProduct, bundle:
 }
 
 export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {
-  const adjusted = readText(row, "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
-  if (adjusted) return numberFrom(adjusted);
+  const adjusted = readValue(row, "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
+  if (adjusted !== undefined && String(adjusted).trim()) return numberFrom(adjusted);
   return standardAmount(quantityFor(row, source), product, bundle);
 }
 
@@ -348,7 +382,7 @@ export function buildReconciliation({
   consumptionRows.forEach((row) => {
     const product = productFor(row, "consumption", bundle);
     if (product.rawName === "Sem descrição") return;
-    const target = ensure(product, nucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
+    const target = ensure(product, consumptionNucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
     target.applied += standardQuantity(row, "consumption", product, bundle);
     target.plannedMaterials.add(product.rawName);
   });
