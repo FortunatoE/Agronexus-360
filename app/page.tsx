@@ -255,6 +255,18 @@ function AnalysisFilters({
 type DemandRow = ReconciliationRow & { demand: number; local: number };
 type WarehouseAllocation = { allocated: number; locations: ReconciliationRow["locations"] };
 type MonitoringRow = ReconciliationRow & { isWarehouseView?: boolean };
+type MonitoringGroup = {
+  active: string;
+  rows: MonitoringRow[];
+  totals: {
+    applied: number;
+    balance: number;
+    pendingOrder: number;
+    planned: number;
+    toDeliver: number;
+    transit: number;
+  };
+};
 type PerformanceAccumulator = {
   active: string;
   appliedArea: number;
@@ -563,6 +575,28 @@ export default function Home() {
       || left.nucleus.localeCompare(right.nucleus));
   }, [cycleFilter, cultureFilter, groupFilter, monitoringLedger, nucleusFilter, query, subgroupFilter, warehouseMonitoringRows]);
 
+  const monitoringGroups = useMemo<MonitoringGroup[]>(() => {
+    const groups = new Map<string, MonitoringRow[]>();
+    executionRows.forEach((row) => {
+      const active = row.active || "Princípio ativo não informado";
+      const rows = groups.get(active) || [];
+      rows.push(row);
+      groups.set(active, rows);
+    });
+    return [...groups.entries()].map(([active, rows]) => ({
+      active,
+      rows,
+      totals: rows.reduce((totals, row) => ({
+        applied: totals.applied + row.applied,
+        balance: totals.balance + row.farmBalance + row.warehouseBalance,
+        pendingOrder: totals.pendingOrder + row.pendingOrder,
+        planned: totals.planned + row.planned,
+        toDeliver: totals.toDeliver + amountToDeliver(row),
+        transit: totals.transit + row.transit,
+      }), { applied: 0, balance: 0, pendingOrder: 0, planned: 0, toDeliver: 0, transit: 0 }),
+    }));
+  }, [executionRows]);
+
   const executedAreaByTask = useMemo(() => {
     const values = new Map<string, number>();
     datasets.execucao.forEach((row) => {
@@ -703,7 +737,16 @@ export default function Home() {
       const warehouse = allocation.allocations.get(row.id) || { allocated: 0, locations: [] };
       const balance = row.local + warehouse.allocated - row.demand;
       const status = row.demand <= row.local ? "Atende no núcleo" : balance >= 0 ? "Atende com armazém" : "Falta";
-      return { ...row, balance, status, warehouseSupport: warehouse.allocated, warehouseLocations: warehouse.locations };
+      // A BATCH possui uma linha por lote. A calendarização é operacional,
+      // então exibe uma única linha por material, tipo de saldo e localização.
+      return {
+        ...row,
+        balance,
+        locations: consolidateLocations(row.locations),
+        status,
+        warehouseLocations: consolidateLocations(warehouse.locations),
+        warehouseSupport: warehouse.allocated,
+      };
     }).sort((left, right) => left.balance - right.balance || right.demand - left.demand);
     return {
       dated: scheduled.length > 0, rows,
@@ -793,6 +836,15 @@ export default function Home() {
     XLSX.writeFile(workbook, "provisionamento_" + evaluationDate + "_" + provisionUntil + ".xlsx", { bookType: "xlsx" });
   }
   function exportMonitoring() {
+    const totalsByActive = monitoringGroups.map((group) => ({
+      "Princípio ativo": group.active,
+      "Qtd. planejada": group.totals.planned,
+      Saldo: group.totals.balance,
+      Trânsito: group.totals.transit,
+      Aplicado: group.totals.applied,
+      "A entregar": group.totals.toDeliver,
+      "Volume solicitado": group.totals.pendingOrder,
+    }));
     const summary = executionRows.map((row) => ({
       "Princípio ativo": row.active,
       Ciclo: row.cycles.join(", "),
@@ -820,6 +872,7 @@ export default function Home() {
     })));
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summary), "Acompanhamento");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(totalsByActive), "Totais por ativo");
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
     XLSX.writeFile(workbook, "acompanhamento_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
   }
@@ -877,22 +930,36 @@ export default function Home() {
             <tr>{["", "Princípio ativo", "Ciclo / cultura", "Núcleo", "Material padrão", "Material em estoque", "Qtd. planejada", "Saldo", "Trânsito", "Aplicado", "A entregar", "V. solicitado"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {executionRows.map((row) => <Fragment key={row.id}>
-              <tr>
-                <td className="px-3 py-3"><button aria-label="Expandir materiais" className="rounded border border-slate-200 p-1 text-slate-600" onClick={() => setExpanded(expanded === row.id ? null : row.id)} type="button"><ChevronDown className={cn("h-3.5 w-3.5", expanded === row.id && "rotate-180")} /></button></td>
-                <td className="px-3 py-3 font-medium">{row.active}</td>
-                <td className="px-3 py-3">{row.cycles.join(", ") || "—"}<br /><span className="text-xs text-slate-500">{row.cultures.join(", ") || "Sem cultura"}</span></td>
-                <td className={cn("px-3 py-3", row.isWarehouseView && "font-semibold text-emerald-800")}>{row.nucleus}</td>
-                <td className="px-3 py-3 font-medium">{row.standardMaterial}</td>
-                <td className="px-3 py-3">{row.stockMaterials.join(", ") || "—"}</td>
-                <td className="px-3 py-3">{formatNumber(row.planned)}</td>
-                <td className="px-3 py-3">{formatNumber(row.farmBalance + row.warehouseBalance)}</td>
-                <td className="px-3 py-3">{formatNumber(row.transit)}</td>
-                <td className="px-3 py-3">{formatNumber(row.applied)}</td>
-                <td className={cn("px-3 py-3 font-semibold", amountToDeliverColor(amountToDeliver(row)))}>{formatNumber(amountToDeliver(row))}</td>
-                <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
+            {monitoringGroups.map((group) => <Fragment key={group.active}>
+              <tr className="bg-emerald-50/70 text-emerald-950">
+                <td className="px-3 py-2.5 font-semibold" colSpan={12}>Princípio ativo: {group.active}</td>
               </tr>
-              {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}
+              {group.rows.map((row) => <Fragment key={row.id}>
+                <tr>
+                  <td className="px-3 py-3"><button aria-label="Expandir materiais" className="rounded border border-slate-200 p-1 text-slate-600" onClick={() => setExpanded(expanded === row.id ? null : row.id)} type="button"><ChevronDown className={cn("h-3.5 w-3.5", expanded === row.id && "rotate-180")} /></button></td>
+                  <td className="px-3 py-3 text-slate-400">—</td>
+                  <td className="px-3 py-3">{row.cycles.join(", ") || "—"}<br /><span className="text-xs text-slate-500">{row.cultures.join(", ") || "Sem cultura"}</span></td>
+                  <td className={cn("px-3 py-3", row.isWarehouseView && "font-semibold text-emerald-800")}>{row.nucleus}</td>
+                  <td className="px-3 py-3 font-medium">{row.standardMaterial}</td>
+                  <td className="px-3 py-3">{row.stockMaterials.join(", ") || "—"}</td>
+                  <td className="px-3 py-3">{formatNumber(row.planned)}</td>
+                  <td className="px-3 py-3">{formatNumber(row.farmBalance + row.warehouseBalance)}</td>
+                  <td className="px-3 py-3">{formatNumber(row.transit)}</td>
+                  <td className="px-3 py-3">{formatNumber(row.applied)}</td>
+                  <td className={cn("px-3 py-3 font-semibold", amountToDeliverColor(amountToDeliver(row)))}>{formatNumber(amountToDeliver(row))}</td>
+                  <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
+                </tr>
+                {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}
+              </Fragment>)}
+              <tr className="border-y border-emerald-200 bg-emerald-50/50 font-semibold text-slate-800">
+                <td className="px-3 py-3" colSpan={6}>Total — {group.active}</td>
+                <td className="px-3 py-3">{formatNumber(group.totals.planned)}</td>
+                <td className="px-3 py-3">{formatNumber(group.totals.balance)}</td>
+                <td className="px-3 py-3">{formatNumber(group.totals.transit)}</td>
+                <td className="px-3 py-3">{formatNumber(group.totals.applied)}</td>
+                <td className={cn("px-3 py-3", amountToDeliverColor(group.totals.toDeliver))}>{formatNumber(group.totals.toDeliver)}</td>
+                <td className="px-3 py-3 text-emerald-700">{formatNumber(group.totals.pendingOrder)}</td>
+              </tr>
             </Fragment>)}
             {!executionRows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={12}>Nenhum material atende aos filtros.</td></tr> : null}
           </tbody>
