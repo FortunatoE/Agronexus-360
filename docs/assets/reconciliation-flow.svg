@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="500" viewBox="0 0 1440 500" role="img" aria-labelledby="title description">
+  <title id="title">Fluxo de conciliação do AgroNexus 360</title>
+  <desc id="description">Fluxo que transforma uma linha de arquivo operacional em informação consolidada ou em uma exceção de conciliação.</desc>
+  <rect width="1440" height="500" rx="28" fill="#0f172a"/>
+  <text x="64" y="74" fill="#f8fafc" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700">Fluxo de conciliação e governança de dados</text>
+  <text x="64" y="108" fill="#94a3b8" font-family="Arial, Helvetica, sans-serif" font-size="17">Cada registro é traduzido em contexto operacional antes de compor saldo, demanda ou execução.</text>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <rect x="64" y="170" width="210" height="170" rx="18" fill="#1e293b" stroke="#475569"/><text x="90" y="220" fill="#a7f3d0" font-size="18" font-weight="700">Linha de origem</text><text x="90" y="258" fill="#e2e8f0" font-size="15">Excel / SAP</text><text x="90" y="286" fill="#e2e8f0" font-size="15">descrição + WBS</text>
+    <rect x="350" y="170" width="250" height="170" rx="18" fill="#064e3b"/><text x="378" y="220" fill="#d1fae5" font-size="18" font-weight="700">Normalização</text><text x="378" y="258" fill="#ecfdf5" font-size="15">remove acentos, caixa</text><text x="378" y="286" fill="#ecfdf5" font-size="15">e pontuação</text>
+    <rect x="676" y="170" width="250" height="170" rx="18" fill="#064e3b"/><text x="704" y="220" fill="#d1fae5" font-size="18" font-weight="700">Dimensões</text><text x="704" y="258" fill="#ecfdf5" font-size="15">ativo · grupo · padrão</text><text x="704" y="286" fill="#ecfdf5" font-size="15">centro · cultura · fator</text>
+    <rect x="1002" y="170" width="180" height="170" rx="18" fill="#047857"/><text x="1028" y="220" fill="#ecfdf5" font-size="18" font-weight="700">Consolida</text><text x="1028" y="258" fill="#ecfdf5" font-size="15">núcleo, saldo,</text><text x="1028" y="286" fill="#ecfdf5" font-size="15">demanda e dose</text>
+    <rect x="1218" y="170" width="158" height="170" rx="18" fill="#be123c"/><text x="1238" y="220" fill="#fff1f2" font-size="18" font-weight="700">Exceção</text><text x="1238" y="258" fill="#fff1f2" font-size="15">sem vínculo</text><text x="1238" y="286" fill="#fff1f2" font-size="15">ou sem núcleo</text>
+  </g>
+  <g stroke="#34d399" stroke-width="5" fill="none" stroke-linecap="round"><path d="M282 255h54"/><path d="M608 255h54"/><path d="M934 255h54"/><path d="M1190 255h20"/></g>
+  <g fill="#34d399"><path d="M336 245l18 10-18 10z"/><path d="M662 245l18 10-18 10z"/><path d="M988 245l18 10-18 10z"/></g>
+  <path d="M801 350v52h480" stroke="#fb7185" stroke-width="4" fill="none" stroke-dasharray="9 9"/><path d="M1271 392l18 10-18 10z" fill="#fb7185"/>
+  <text x="694" y="432" fill="#fda4af" font-family="Arial, Helvetica, sans-serif" font-size="15">Sem dimensão, descrição ou núcleo: o dado não é mascarado; vira item de correção rastreável.</text>
+</svg>

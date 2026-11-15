@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title description">
+  <title id="title">Arquitetura do AgroNexus 360</title>
+  <desc id="description">Diagrama da entrada de dados SAP e Excel, camada de conciliação e painéis operacionais do AgroNexus 360.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#f0fdf4"/><stop offset="1" stop-color="#ecfeff"/></linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#14532d" flood-opacity=".12"/></filter>
+  </defs>
+  <rect width="1440" height="760" fill="url(#background)" rx="28"/>
+  <text x="72" y="88" fill="#052e16" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="700">AgroNexus 360° · arquitetura operacional</text>
+  <text x="72" y="124" fill="#3f6212" font-family="Arial, Helvetica, sans-serif" font-size="19">Da exportação SAP à decisão de insumos por núcleo, cultura e material</text>
+
+  <g filter="url(#shadow)">
+    <rect x="72" y="188" width="270" height="420" rx="22" fill="#ffffff" stroke="#bbf7d0" stroke-width="2"/>
+    <rect x="400" y="188" width="340" height="420" rx="22" fill="#ffffff" stroke="#86efac" stroke-width="2"/>
+    <rect x="798" y="188" width="270" height="420" rx="22" fill="#ffffff" stroke="#6ee7b7" stroke-width="2"/>
+    <rect x="1126" y="188" width="242" height="420" rx="22" fill="#064e3b"/>
+  </g>
+
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="104" y="238" fill="#166534" font-size="23" font-weight="700">01 · Fontes</text>
+    <text x="104" y="278" fill="#334155" font-size="18">Planejamento</text><text x="104" y="308" fill="#334155" font-size="18">ZPS007 · CN52</text><text x="104" y="338" fill="#334155" font-size="18">ZMM_BATCH · MB52</text><text x="104" y="368" fill="#334155" font-size="18">MB5T · Pedidos</text><text x="104" y="398" fill="#334155" font-size="18">Dimensões.xlsx</text>
+    <rect x="104" y="450" width="205" height="100" rx="14" fill="#f0fdf4"/>
+    <text x="122" y="485" fill="#166534" font-size="16" font-weight="700">Arquivos versionados</text><text x="122" y="513" fill="#475569" font-size="14">data de modificação,</text><text x="122" y="536" fill="#475569" font-size="14">linhas e abas</text>
+
+    <text x="432" y="238" fill="#166534" font-size="23" font-weight="700">02 · Motor de conciliação</text>
+    <rect x="432" y="267" width="276" height="66" rx="14" fill="#ecfdf5"/><text x="452" y="307" fill="#065f46" font-size="16" font-weight="700">Nome normalizado ≠ código SAP</text>
+    <rect x="432" y="348" width="276" height="66" rx="14" fill="#ecfdf5"/><text x="452" y="388" fill="#065f46" font-size="16" font-weight="700">Material → agregado → ativo</text>
+    <rect x="432" y="429" width="276" height="66" rx="14" fill="#ecfdf5"/><text x="452" y="469" fill="#065f46" font-size="16" font-weight="700">Centro / WBS → núcleo</text>
+    <rect x="432" y="510" width="276" height="66" rx="14" fill="#ecfdf5"/><text x="452" y="550" fill="#065f46" font-size="16" font-weight="700">Conversão de apresentação</text>
+
+    <text x="830" y="238" fill="#166534" font-size="23" font-weight="700">03 · Dados confiáveis</text>
+    <text x="830" y="285" fill="#334155" font-size="17">• BATCH prioritária</text><text x="830" y="317" fill="#334155" font-size="17">• MB52 como fallback</text><text x="830" y="349" fill="#334155" font-size="17">• estoque por núcleo</text><text x="830" y="381" fill="#334155" font-size="17">• armazém rateado</text><text x="830" y="413" fill="#334155" font-size="17">• lotes consolidados</text>
+    <rect x="830" y="465" width="205" height="85" rx="14" fill="#fff7ed"/><text x="850" y="499" fill="#9a3412" font-size="16" font-weight="700">Relatório de exceções</text><text x="850" y="527" fill="#78716c" font-size="14">cadastro ou erro de origem</text>
+
+    <text x="1158" y="238" fill="#d1fae5" font-size="23" font-weight="700">04 · Decisão</text>
+    <text x="1158" y="285" fill="#ffffff" font-size="17">Visão geral</text><text x="1158" y="322" fill="#ffffff" font-size="17">Calendarização</text><text x="1158" y="359" fill="#ffffff" font-size="17">Acompanhamento</text><text x="1158" y="396" fill="#ffffff" font-size="17">Execução</text>
+    <rect x="1158" y="454" width="176" height="96" rx="14" fill="#10b981"/><text x="1178" y="490" fill="#ecfdf5" font-size="16" font-weight="700">Exportação</text><text x="1178" y="517" fill="#ecfdf5" font-size="14">Excel acionável</text>
+  </g>
+
+  <g stroke="#059669" stroke-width="5" fill="none" stroke-linecap="round"><path d="M350 398h36"/><path d="M748 398h36"/><path d="M1076 398h36"/></g>
+  <g fill="#059669"><path d="M386 388l18 10-18 10z"/><path d="M784 388l18 10-18 10z"/><path d="M1112 388l18 10-18 10z"/></g>
+  <text x="72" y="696" fill="#64748b" font-family="Arial, Helvetica, sans-serif" font-size="16">Aplicação pessoal de planejamento agrícola · decisões auditáveis, regras explícitas e experiência operacional.</text>
+</svg>
