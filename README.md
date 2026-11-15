@@ -50,11 +50,11 @@ Na guia Acompanhamento, esse pool é exibido separadamente como núcleo **ARMAZ�
 ## Visões operacionais
 
 - **Visão geral:** execução por subgrupo, separada entre Safra e Safrinha, e macro por cultura.
-- **Calendarização:** provisionamento por janela de avaliação, com detalhamento de saldo por fazenda, armazém e trânsito e exportação Excel (Resumo e Detalhes). Lotes do mesmo material, tipo de saldo e localização são somados antes de aparecer no detalhe.
+- **Calendarização:** provisionamento por janela de avaliação, com detalhamento de saldo por fazenda, armazém, trânsito e **volume solicitado** dos pedidos pendentes, além da exportação Excel (Resumo e Detalhes). Lotes do mesmo material, tipo de saldo e localização são somados antes de aparecer no detalhe.
 - **Acompanhamento:** inicia em **Safra**; os filtros recalculam planejamento e consumo antes da consolidação. As linhas são agrupadas por princípio ativo e cada grupo termina com os totais de planejado, saldo, trânsito, aplicado, a entregar e volume solicitado. Mantém o detalhe por material padrão e núcleo, com expansão por material físico e localização. Inclui filtro de núcleo e exportação Excel do recorte exibido, com uma aba adicional de totais por princípio ativo. O indicador **A entregar** segue `(Saldo + Aplicado + Trânsito) − Qtd. planejada`: verde quando positivo, vermelho quando negativo e preto quando zero.
 - **Execução:** percentual já realizado, volumes planejado e executado, dose executada versus planejada e impacto de volume causado pela diferença de dose. A leitura é segmentada por ciclo, cultura, grupo, subgrupo, núcleo e material.
-- **Importações:** seleção das seis fontes operacionais e da dimensão opcional.
-- **Premissas:** tolerâncias, janelas, status excluído, mapeamentos editáveis e importação de pedidos pendentes (`Centro`, `Descrição Material`, `Saldo Forn`).
+- **Importações:** seleção das sete fontes operacionais, Dimensões, data de modificação e de importação de cada arquivo, indicador de defasagem e relatório exportável dos dados não conciliados.
+- **Premissas:** tolerâncias, janelas, status excluído, mapeamentos editáveis e tabela consolidada de todas as dimensões e conversões aplicadas. Pedidos pendentes (`Centro`, `Descrição Material`, `Saldo Forn`) são importados na Central de importações.
 
 ## Desenvolvimento
 
@@ -77,7 +77,7 @@ Esse alvo gera uma SPA em `dist-vercel/`. Ele preserva o runtime Vinext/Cloudfla
 
 ## Estrutura relevante
 
-- `app/page.tsx` — interface, importações locais e cálculos operacionais da sessão.
+- `app/page.tsx` — interface, importações locais persistidas no navegador e cálculos operacionais.
 - `components/dimension-upload.tsx` — leitura de `Dimensões.xlsx`.
 - `lib/material-dimension.ts` — normalização e regras de dimensão.
 - `lib/reconciliation.ts` — resolução por nomes, regras de centro/núcleo da ZMM_BATCH e livro de conciliação de planejamento, saldo, trânsito, aplicado e pedidos.
@@ -91,4 +91,4 @@ O projeto possui dois alvos independentes:
 - **Sites/Cloudflare:** `npm run build`, com Worker, D1 e R2 para a persistência central.
 - **Vercel:** `npm run build:vercel`, configurado em `vercel.json` como aplicação estática.
 
-Na Vercel, os seis arquivos são validados e usados diretamente na sessão do navegador, alimentando todos os visuais sem depender de uma API Cloudflare. Valores numéricos nativos do Excel preservam seus decimais; textos formatados em padrão brasileiro também são interpretados corretamente. A persistência compartilhada e versionada entre usuários continua sendo uma etapa posterior, que exige conectar uma base e armazenamento compatíveis com a Vercel.
+Na Vercel, os sete arquivos e as dimensões são validados e armazenados no banco local do navegador, permanecendo disponíveis após fechar ou reabrir a aplicação no mesmo dispositivo e navegador. Valores numéricos nativos do Excel preservam seus decimais; textos formatados em padrão brasileiro também são interpretados corretamente. A persistência compartilhada e versionada entre usuários continua sendo uma etapa posterior, que exige conectar uma base e armazenamento compatíveis com a Vercel.

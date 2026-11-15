@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
 import * as XLSX from "xlsx";
 import { DimensionUpload } from "@/components/dimension-upload";
 import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
@@ -16,6 +16,8 @@ import {
   productFor,
   readNumber,
   readText,
+  nucleusFor,
+  stockNucleusFor,
   standardAmount,
   standardQuantity,
   type OperationalRow,
@@ -29,13 +31,26 @@ import {
 } from "lucide-react";
 
 type Row = OperationalRow;
-type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito";
+type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito" | "pedidos";
+type ImportKey = SourceKey | "dimensoes";
 type Datasets = Record<SourceKey, Row[]>;
-type ImportSummary = { fileName: string; rows: number; sheets: string[] };
+type ImportSummary = { fileName: string; fileModifiedAt: string; importedAt: string; rows: number; sheets: string[] };
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
+type PersistedWorkspace = {
+  bundle: DimensionBundle;
+  datasets: Datasets;
+  dimensionPremises: DimensionPremise[];
+  imports: Partial<Record<ImportKey, ImportSummary>>;
+  premises: Premises;
+  tasks: string[];
+};
+type ReconciliationIssue = { action: string; code: string; count: number; detail: string; material: string; source: string };
 
-const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [] };
+const workspaceDatabase = "agronexus-360";
+const workspaceStore = "workspace";
+const workspaceRecord = "current";
+const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [], pedidos: [] };
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
 const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header: number }> = [
   { key: "planejamento", title: "Planejamento", hint: "PLANEJAMENTO.xlsx", header: 0 },
@@ -44,6 +59,7 @@ const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header:
   { key: "estoque", title: "Estoque por lote", hint: "ZMM_BATCH.xlsx", header: 0 },
   { key: "estoqueMb52", title: "Estoque complementar", hint: "MB52.xlsx — somente materiais ausentes na BATCH", header: 1 },
   { key: "transito", title: "Materiais em trânsito", hint: "MB5T.xlsx", header: 1 },
+  { key: "pedidos", title: "Pedidos pendentes", hint: "PEDIDOS PENDENTES.xlsx", header: 0 },
 ];
 const nav = [
   ["Visão geral", LayoutDashboard], ["Calendarização", CalendarDays],
@@ -74,6 +90,52 @@ function rawPercent(value: number, total: number) { return total ? value * 100 /
 function percentageText(value: number, total: number) { return total > 0 ? rawPercent(value, total).toFixed(1) + "%" : "n.a."; }
 function signedNumber(value: number | null) { return value === null ? "n.a." : (value > 0 ? "+" : "") + formatNumber(value); }
 function dateKey(date: Date) { return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-"); }
+function formatDateTime(value?: string) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" }).format(date);
+}
+function elapsedLabel(value?: string, now = Date.now()) {
+  if (!value) return "Aguardando importação";
+  const hours = Math.max(0, Math.floor((now - new Date(value).getTime()) / 3_600_000));
+  const days = Math.floor(hours / 24);
+  return days ? `há ${days} dia${days === 1 ? "" : "s"} e ${hours % 24} hora${hours % 24 === 1 ? "" : "s"}` : `há ${hours} hora${hours === 1 ? "" : "s"}`;
+}
+function freshnessStatus(value?: string, now = Date.now()) {
+  if (!value) return { label: "Aguardando dados", tone: "slate" as const };
+  const hours = Math.max(0, (now - new Date(value).getTime()) / 3_600_000);
+  if (hours <= 12) return { label: "OK", tone: "emerald" as const };
+  if (hours <= 48) return { label: "Em atenção", tone: "amber" as const };
+  return { label: "Necessita atualizar", tone: "rose" as const };
+}
+
+function openWorkspaceDatabase() {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const request = window.indexedDB.open(workspaceDatabase, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(workspaceStore)) request.result.createObjectStore(workspaceStore);
+    };
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+  });
+}
+async function loadWorkspace() {
+  const database = await openWorkspaceDatabase();
+  return new Promise<PersistedWorkspace | null>((resolve, reject) => {
+    const request = database.transaction(workspaceStore, "readonly").objectStore(workspaceStore).get(workspaceRecord);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve((request.result as PersistedWorkspace | undefined) || null);
+  }).finally(() => database.close());
+}
+async function saveWorkspace(workspace: PersistedWorkspace) {
+  const database = await openWorkspaceDatabase();
+  return new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(workspaceStore, "readwrite");
+    transaction.objectStore(workspaceStore).put(workspace, workspaceRecord);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.oncomplete = () => resolve();
+  }).finally(() => database.close());
+}
 
 function dateFromPlan(value: unknown) {
   if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
@@ -103,6 +165,7 @@ function stockHeaderRow(sheet: XLSX.WorkSheet) {
   return index >= 0 ? index : 0;
 }
 function rowsFrom(workbook: XLSX.WorkBook, source: (typeof sourceConfig)[number]) {
+  if (source.key === "pedidos") return pendingRowsFrom(workbook);
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   const header = source.key === "estoque" || source.key === "estoqueMb52" ? stockHeaderRow(sheet) : source.header;
   return XLSX.utils.sheet_to_json<Row>(sheet, { range: header, defval: "" });
@@ -123,8 +186,7 @@ function pendingHeaderRow(sheet: XLSX.WorkSheet) {
       && (headers.includes(headerKey("Saldo Forn")) || headers.includes(headerKey("Qtd.pedido")));
   });
 }
-async function readPendingFile(file: File) {
-  const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+function pendingRowsFrom(workbook: XLSX.WorkBook) {
   for (const name of workbook.SheetNames) {
     const header = pendingHeaderRow(workbook.Sheets[name]);
     if (header < 0) continue;
@@ -191,8 +253,8 @@ function Table({ headers, rows, empty = "Nenhum dado no recorte." }: { headers: 
 function Empty({ title, description }: { title: string; description: string }) {
   return <div className="grid min-h-[240px] place-items-center rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center"><div><PackageSearch className="mx-auto h-7 w-7 text-emerald-700" /><h2 className="mt-3 font-semibold">{title}</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">{description}</p></div></div>;
 }
-function Navigation({ active, onSelect }: { active: string; onSelect: (value: string) => void }) {
-  return <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] border-r border-slate-200 bg-white px-4 py-5 lg:block"><div className="flex items-center gap-3 px-3 pb-7"><div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-700 text-white"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold">AgroNexus</p><p className="text-[10px] font-semibold uppercase tracking-[.15em] text-emerald-700">Planejamento 360°</p></div></div><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[.14em] text-slate-400">Gestão</p> : null}<button className={cn("flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium", active === label ? "bg-emerald-50 text-emerald-800" : "text-slate-600 hover:bg-slate-50")} onClick={() => onSelect(label)} type="button"><Icon className="h-4 w-4" />{label}</button></Fragment>)}</div><div className="absolute bottom-5 left-4 right-4 rounded-2xl bg-slate-900 p-4 text-white"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-semibold">Conciliação por nomes</p><p className="mt-1 text-[11px] leading-relaxed text-slate-300">Códigos SAP são somente diagnósticos; a chave operacional é o nome do material.</p></div></aside>;
+function Navigation({ active, lastUpdatedAt, onSelect }: { active: string; lastUpdatedAt?: string; onSelect: (value: string) => void }) {
+  return <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] border-r border-slate-200 bg-white px-4 py-5 lg:block"><div className="px-3 pb-7"><div className="flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-700 text-white"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold">AgroNexus</p><p className="text-[10px] font-semibold uppercase tracking-[.15em] text-emerald-700">Planejamento 360°</p></div></div><div className="mt-4 rounded-xl bg-slate-50 px-3 py-2"><p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Última atualização</p><p className="mt-0.5 text-xs font-semibold text-slate-700">{formatDateTime(lastUpdatedAt)}</p></div></div><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[.14em] text-slate-400">Gestão</p> : null}<button className={cn("flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium", active === label ? "bg-emerald-50 text-emerald-800" : "text-slate-600 hover:bg-slate-50")} onClick={() => onSelect(label)} type="button"><Icon className="h-4 w-4" />{label}</button></Fragment>)}</div><div className="absolute bottom-5 left-4 right-4 rounded-2xl bg-slate-900 p-4 text-white"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-semibold">Conciliação por nomes</p><p className="mt-1 text-[11px] leading-relaxed text-slate-300">Códigos SAP são somente diagnósticos; a chave operacional é o nome do material.</p></div></aside>;
 }
 
 type AnalysisFiltersProps = {
@@ -382,13 +444,10 @@ export default function Home() {
   const [active, setActive] = useState("Visão geral");
   const [datasets, setDatasets] = useState<Datasets>(emptyDatasets);
   const [uploads, setUploads] = useState<Partial<Record<SourceKey, File>>>({});
-  const [imports, setImports] = useState<Partial<Record<SourceKey, ImportSummary>>>({});
+  const [imports, setImports] = useState<Partial<Record<ImportKey, ImportSummary>>>({});
   const [message, setMessage] = useState("");
   const [importing, setImporting] = useState(false);
   const [bundle, setBundle] = useState<DimensionBundle>(emptyDimensionBundle);
-  const [pendingOrders, setPendingOrders] = useState<Row[]>([]);
-  const [pendingLabel, setPendingLabel] = useState("Pedidos pendentes (opcional)");
-  const [pendingError, setPendingError] = useState("");
   const [premises, setPremises] = useState<Premises>(initialPremises);
   const [dimensionPremises, setDimensionPremises] = useState<DimensionPremise[]>([]);
   const [draft, setDraft] = useState<DimensionPremise>({ domain: "Material", key: "", value: "" });
@@ -404,6 +463,9 @@ export default function Home() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [task, setTask] = useState("");
   const [tasks, setTasks] = useState<string[]>([]);
+  const [storageReady, setStorageReady] = useState(false);
+  const [persistenceError, setPersistenceError] = useState("");
+  const [clock, setClock] = useState(() => Date.now());
   const [evaluationDate, setEvaluationDate] = useState(() => dateKey(new Date()));
   const [provisionUntil, setProvisionUntil] = useState(() => {
     const end = new Date();
@@ -411,12 +473,44 @@ export default function Home() {
     return dateKey(end);
   });
 
+  useEffect(() => {
+    let active = true;
+    let readyTimer: number | undefined;
+    void loadWorkspace().then((workspace) => {
+      if (!active || !workspace) return;
+      setBundle(workspace.bundle || emptyDimensionBundle);
+      setDatasets({ ...emptyDatasets, ...(workspace.datasets || {}) });
+      setDimensionPremises(workspace.dimensionPremises || []);
+      setImports(workspace.imports || {});
+      setPremises({ ...initialPremises, ...(workspace.premises || {}) });
+      setTasks(workspace.tasks || []);
+    }).catch(() => {
+      if (active) setPersistenceError("Não foi possível recuperar os dados salvos neste navegador.");
+    }).finally(() => {
+      if (active) readyTimer = window.setTimeout(() => { if (active) setStorageReady(true); }, 0);
+    });
+    return () => { active = false; if (readyTimer) window.clearTimeout(readyTimer); };
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks }).catch(() => {
+      setPersistenceError("Não foi possível salvar esta carga neste navegador.");
+    });
+  }, [bundle, datasets, dimensionPremises, imports, premises, storageReady, tasks]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const toggleTheme = () => setDark((current) => {
     window.localStorage.setItem("agronexus-theme", current ? "light" : "dark");
     return !current;
   });
 
   const dimensions = useMemo(() => mergePremises(bundle, dimensionPremises), [bundle, dimensionPremises]);
+  const pendingOrders = datasets.pedidos;
   const plans = useMemo(() => datasets.planejamento.filter((row) => planningProduct(row, premises.excludedStatus)), [datasets.planejamento, premises.excludedStatus]);
   const farmToNucleus = useMemo(() => buildFarmToNucleus([...plans, ...datasets.execucao], dimensions, plans), [plans, datasets.execucao, dimensions]);
   const stockRows = useMemo(() => {
@@ -443,6 +537,69 @@ export default function Home() {
     }));
     return { described, resolved };
   }, [stockRows, datasets.transito, datasets.consumo, dimensions]);
+
+  const latestDataUpdate = useMemo(() => Object.values(imports)
+    .map((item) => item?.importedAt)
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0], [imports]);
+
+  const oldestSource = useMemo(() => Object.entries(imports)
+    .filter((entry): entry is [ImportKey, ImportSummary] => Boolean(entry[1]?.fileModifiedAt))
+    .sort(([, left], [, right]) => new Date(left.fileModifiedAt).getTime() - new Date(right.fileModifiedAt).getTime())[0], [imports]);
+  const dataFreshness = freshnessStatus(oldestSource?.[1].fileModifiedAt, clock);
+
+  const reconciliationIssues = useMemo<ReconciliationIssue[]>(() => {
+    const issues = new Map<string, ReconciliationIssue>();
+    const sources: Array<{ productSource: "planning" | "stock" | "transit" | "consumption" | "pending"; rows: Row[]; title: string }> = [
+      { productSource: "planning", rows: plans, title: "Planejamento" },
+      { productSource: "consumption", rows: datasets.consumo, title: "CN52" },
+      { productSource: "stock", rows: datasets.estoque, title: "ZMM_BATCH" },
+      { productSource: "stock", rows: datasets.estoqueMb52, title: "MB52" },
+      { productSource: "transit", rows: datasets.transito, title: "MB5T" },
+      { productSource: "pending", rows: pendingOrders, title: "Pedidos pendentes" },
+    ];
+    const add = (issue: Omit<ReconciliationIssue, "count">) => {
+      const key = [issue.source, issue.detail, issue.material, issue.code].join("\u0000");
+      const current = issues.get(key);
+      issues.set(key, current ? { ...current, count: current.count + 1 } : { ...issue, count: 1 });
+    };
+    sources.forEach(({ productSource, rows, title }) => rows.forEach((row) => {
+      const product = productFor(row, productSource, dimensions);
+      if (product.rawName === "Sem descrição") {
+        add({ source: title, material: "Sem descrição", code: product.code || "—", detail: "Descrição de material ausente", action: "Corrigir a descrição do material no arquivo de origem." });
+        return;
+      }
+      if (!product.resolvedByDimension) {
+        add({ source: title, material: product.rawName, code: product.code || "—", detail: "Sem vínculo nas dimensões", action: "Provável novo cadastro ou grafia divergente: incluir ou corrigir o material nas Dimensões." });
+      }
+      const nucleus = productSource === "planning" ? planningNucleusFor(row, dimensions, farmToNucleus)
+        : productSource === "consumption" ? consumptionNucleusFor(row, dimensions, farmToNucleus)
+          : productSource === "stock" ? stockNucleusFor(row, dimensions, farmToNucleus)
+            : nucleusFor(row, dimensions, farmToNucleus);
+      if (nucleus === "Sem núcleo") {
+        add({ source: title, material: product.rawName, code: product.code || "—", detail: "Núcleo não conciliado", action: "Cadastrar ou corrigir o vínculo Centro/Fazenda → Núcleo nas Dimensões." });
+      }
+    }));
+    return [...issues.values()].sort((left, right) => left.source.localeCompare(right.source) || left.material.localeCompare(right.material));
+  }, [datasets.consumo, datasets.estoque, datasets.estoqueMb52, datasets.transito, dimensions, farmToNucleus, pendingOrders, plans]);
+
+  const appliedPremiseRows = useMemo<ReactNode[][]>(() => {
+    const rows: ReactNode[][] = [
+      ["Regra operacional", "Tolerância de desvio", premises.tolerance + "%", "Aplicação"],
+      ["Regra operacional", "Amostra mínima", premises.sample, "Aplicação"],
+      ["Regra operacional", "Janelas de demanda", premises.horizon, "Aplicação"],
+      ["Regra operacional", "Status excluído", premises.excludedStatus, "Aplicação"],
+    ];
+    const materials = new Map<string, DimensionBundle["materials"][string]>();
+    Object.values(dimensions.materials).forEach((material) => materials.set(normalizeMaterial(material.material), material));
+    [...materials.values()].sort((left, right) => left.material.localeCompare(right.material)).forEach((material) => {
+      rows.push(["Material", material.material, `${material.aggregateMaterial} · ${material.principleActive} · ${material.merchandiseGroup} / ${material.subgroup}`, "Dimensões"]);
+    });
+    Object.entries(dimensions.centerToNucleus).sort(([left], [right]) => left.localeCompare(right)).forEach(([center, nucleus]) => rows.push(["Centro/Fazenda", center, nucleus, "Dimensões"]));
+    Object.entries(dimensions.cultureToCycle).sort(([left], [right]) => left.localeCompare(right)).forEach(([culture, cycle]) => rows.push(["Cultura", culture, cycle, "Dimensões"]));
+    Object.entries(dimensions.conversions).sort(([left], [right]) => left.localeCompare(right)).forEach(([pair, factor]) => rows.push(["Conversão", pair.replace("|", " → "), formatNumber(factor), "Dimensões"]));
+    return rows;
+  }, [dimensions, premises]);
 
   const groupedProgress = useMemo(() => {
     type ProgressRow = { group: string; subgroup: string; planned: number; applied: number };
@@ -752,6 +909,7 @@ export default function Home() {
       dated: scheduled.length > 0, rows,
       demand: rows.reduce((sum, row) => sum + row.demand, 0),
       farm: rows.reduce((sum, row) => sum + row.farmBalance, 0),
+      pendingOrder: rows.reduce((sum, row) => sum + row.pendingOrder, 0),
       transit: rows.reduce((sum, row) => sum + row.transit, 0),
       warehouse: allocation.totalAvailable,
     };
@@ -784,30 +942,27 @@ export default function Home() {
         const file = uploads[source.key]!;
         const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
         const rows = rowsFrom(workbook, source);
-        return { key: source.key, rows, summary: { fileName: file.name, rows: rows.length, sheets: workbook.SheetNames } };
+        return {
+          key: source.key,
+          rows,
+          summary: {
+            fileName: file.name,
+            fileModifiedAt: new Date(file.lastModified || Date.now()).toISOString(),
+            importedAt: new Date().toISOString(),
+            rows: rows.length,
+            sheets: workbook.SheetNames,
+          },
+        };
       }));
       setDatasets((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.rows])) }));
       setImports((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.summary])) }));
       setUploads({});
-      setMessage("Carga validada nesta sessão. Os visuais já usam as fontes importadas.");
+      setMessage("Carga validada e salva neste navegador. Os visuais já usam as fontes importadas.");
       setActive("Visão geral");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível ler um dos arquivos.");
     } finally {
       setImporting(false);
-    }
-  }
-  async function loadPending(file?: File) {
-    if (!file) return;
-    setPendingError("");
-    try {
-      const rows = await readPendingFile(file);
-      setPendingOrders(rows);
-      setPendingLabel(file.name + " — " + rows.length + " linhas válidas");
-    } catch (error) {
-      setPendingOrders([]);
-      setPendingLabel("Pedidos pendentes (opcional)");
-      setPendingError(error instanceof Error ? error.message : "Não foi possível ler os pedidos pendentes.");
     }
   }
   function addPremise() {
@@ -876,11 +1031,24 @@ export default function Home() {
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
     XLSX.writeFile(workbook, "acompanhamento_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
   }
+  function exportReconciliationReport() {
+    const rows = reconciliationIssues.map((issue) => ({
+      Fonte: issue.source,
+      Material: issue.material,
+      "Código SAP": issue.code,
+      Ocorrências: issue.count,
+      Diagnóstico: issue.detail,
+      "Ação sugerida": issue.action,
+    }));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), "Não conciliados");
+    XLSX.writeFile(workbook, "relatorio_conciliacao_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
+  }
 
   const totalPlanned = ledger.reduce((sum, row) => sum + row.planned, 0);
   const totalApplied = ledger.reduce((sum, row) => sum + row.applied, 0);
   const shortage = consolidatedSupply.shortage;
-  const hasData = Object.keys(imports).length > 0;
+  const hasData = sourceConfig.some((source) => Boolean(imports[source.key]));
   const excluded = datasets.execucao.filter((row) => statusExcluded(row, premises.excludedStatus)).length;
 
   let content: ReactNode;
@@ -889,7 +1057,7 @@ export default function Home() {
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card label="Execução de materiais" value={percent(totalApplied, totalPlanned).toFixed(1) + "%"} note={formatNumber(totalApplied) + " de " + formatNumber(totalPlanned) + " planejados"} tone="emerald" />
         <Card label="Saldo com atenção" value={formatNumber(shortage)} note="Necessidade após rateio do armazém" tone={shortage ? "amber" : "slate"} />
-        <Card label="Pedidos pendentes" value={formatNumber(pendingOrders.reduce((sum, row) => sum + standardQuantity(row, "pending", productFor(row, "pending", dimensions), dimensions), 0))} note={pendingOrders.length ? String(pendingOrders.length) + " linhas de pedido" : "Importe na guia Premissas"} />
+        <Card label="Pedidos pendentes" value={formatNumber(pendingOrders.reduce((sum, row) => sum + standardQuantity(row, "pending", productFor(row, "pending", dimensions), dimensions), 0))} note={pendingOrders.length ? String(pendingOrders.length) + " linhas de pedido" : "Importe na guia Importações"} />
         <Card label="Vínculos de material" value={materialResolution.described ? String(materialResolution.resolved) + "/" + String(materialResolution.described) : "—"} note="Descrições conciliadas pela dimensão" tone={materialResolution.described > materialResolution.resolved ? "amber" : "slate"} />
       </div>
       <div className="grid gap-5 xl:grid-cols-2">{groupedProgress.map((group) => <div className="rounded-2xl border border-slate-200 bg-white p-5" key={group.cycle}><div className="mb-4 flex items-center justify-between"><div><h2 className="font-semibold">Execução por subgrupo — {group.cycle}</h2><p className="mt-1 text-xs text-slate-500">Planejado x aplicado, separado por grupo e subgrupo.</p></div><BarChart3 className="h-5 w-5 text-emerald-700" /></div><div className="space-y-4">{group.rows.length ? group.rows.map((row) => <div key={row.group + "|" + row.subgroup}><div className="mb-1.5 flex items-end justify-between gap-3"><p className="text-sm font-medium">{row.subgroup} <span className="text-xs font-normal text-slate-500">{row.group}</span></p><p className="text-xs font-semibold text-slate-700">{percent(row.applied, row.planned).toFixed(1)}%</p></div><Progress value={percent(row.applied, row.planned)} /><p className="mt-1 text-xs text-slate-500">{formatNumber(row.applied)} aplicado de {formatNumber(row.planned)} planejado</p></div>) : <p className="py-8 text-center text-sm text-slate-500">Sem linhas conciliadas para este ciclo.</p>}</div></div>)}</div>
@@ -1020,7 +1188,19 @@ export default function Home() {
       <p className="rounded-xl bg-slate-50 px-4 py-3 text-xs text-slate-600">Impacto de volume = volume executado − (dose planejada × área executada). Quando não houver correspondência de área, a dose fica indisponível em vez de assumir zero.</p>
     </section> : <Empty title="Sem dados de execução" description="Importe Planejamento, CN52 e ZPS007 para calcular volumes, área e dose." />;
   } else if (active === "Importações") {
-    content = <section className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Nova importação</h2><p className="mt-1 text-xs text-slate-500">As fontes são processadas no navegador desta sessão; nenhum JSON de API é exigido.</p></div><div className="grid gap-3 p-6 md:grid-cols-2">{sourceConfig.map((source) => <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-200 p-4 hover:border-emerald-300" key={source.key}><input accept=".xlsx,.xls" className="sr-only" onChange={(event) => setUploads((current) => ({ ...current, [source.key]: event.target.files?.[0] }))} type="file" /><div className="flex items-center gap-3"><FileUp className="h-5 w-5 text-emerald-700" /><div><p className="text-sm font-semibold">{source.title}</p><p className="text-xs text-slate-500">{imports[source.key]?.fileName || uploads[source.key]?.name || source.hint}</p></div></div><span className="text-xs font-semibold text-emerald-700">{imports[source.key] ? "Importado" : uploads[source.key] ? "Selecionado" : "Selecionar"}</span></label>)}<DimensionUpload onLoaded={setBundle} /></div><div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-slate-600">{message || "Cada fonte forma uma carga da sessão e alimenta os visuais imediatamente."}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={importing} onClick={importFiles} type="button"><Upload className="mr-2 inline h-4 w-4" />{importing ? "Importando..." : "Validar e importar"}</button></div>{Object.keys(imports).length ? <div className="border-t border-slate-100 p-6"><Table headers={["Fonte", "Arquivo", "Linhas", "Abas"]} rows={sourceConfig.map((source) => [source.title, imports[source.key]?.fileName || "—", String(imports[source.key]?.rows ?? "—"), imports[source.key]?.sheets.join(", ") || "—"])} /></div> : null}</section>;
+    content = <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Central de importações</h2><p className="mt-1 text-xs text-slate-500">As fontes são lidas e guardadas neste navegador para permanecerem disponíveis nas próximas aberturas.</p></div>
+      <div className="p-6">
+        <div className={cn("rounded-2xl border p-5", dataFreshness.tone === "emerald" ? "border-emerald-200 bg-emerald-50/60" : dataFreshness.tone === "amber" ? "border-amber-200 bg-amber-50/60" : dataFreshness.tone === "rose" ? "border-rose-200 bg-rose-50/60" : "border-slate-200 bg-slate-50")}>
+          <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">Atualização dos dados</p><p className="mt-1 text-2xl font-bold">{oldestSource ? `Este visual está ${elapsedLabel(oldestSource[1].fileModifiedAt, clock)} sem atualização.` : "Aguardando a primeira importação."}</p><p className="mt-1 text-xs text-slate-600">Considera o arquivo operacional mais antigo: {oldestSource ? `${oldestSource[0] === "dimensoes" ? "Dimensões" : sourceConfig.find((source) => source.key === oldestSource[0])?.title} — ${formatDateTime(oldestSource[1].fileModifiedAt)}` : "importe as fontes para iniciar a avaliação"}.</p></div><span className={cn("rounded-full px-3 py-1 text-xs font-bold", dataFreshness.tone === "emerald" ? "bg-emerald-700 text-white" : dataFreshness.tone === "amber" ? "bg-amber-500 text-amber-950" : dataFreshness.tone === "rose" ? "bg-rose-700 text-white" : "bg-slate-200 text-slate-700")}>{dataFreshness.label}</span></div>
+          <p className="mt-3 text-xs text-slate-600">Até 12 horas: OK · de 12 horas a 2 dias: Em atenção · acima de 2 dias: Necessita atualizar.</p>
+        </div>
+      </div>
+      <div className="grid gap-3 px-6 pb-6 md:grid-cols-2">{sourceConfig.map((source) => <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-200 p-4 hover:border-emerald-300" key={source.key}><input accept=".xlsx,.xls" className="sr-only" onChange={(event) => setUploads((current) => ({ ...current, [source.key]: event.target.files?.[0] }))} type="file" /><div className="flex items-center gap-3"><FileUp className="h-5 w-5 text-emerald-700" /><div><p className="text-sm font-semibold">{source.title}</p><p className="text-xs text-slate-500">{imports[source.key]?.fileName || uploads[source.key]?.name || source.hint}</p>{imports[source.key] ? <p className="mt-1 text-[11px] text-slate-500">Modificado: {formatDateTime(imports[source.key]?.fileModifiedAt)}</p> : null}</div></div><span className="text-xs font-semibold text-emerald-700">{imports[source.key] ? "Importado" : uploads[source.key] ? "Selecionado" : "Selecionar"}</span></label>)}<DimensionUpload count={Object.keys(bundle.materials).length} label={imports.dimensoes?.fileName || "Dimensões.xlsx (opcional)"} onLoaded={(loaded, summary) => { setBundle(loaded); setImports((current) => ({ ...current, dimensoes: summary })); setMessage("Dimensões aplicadas e salvas neste navegador."); }} /></div>
+      <div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-slate-600">{persistenceError || message || (storageReady ? "Cada fonte importada alimenta os visuais e permanece salva neste navegador." : "Recuperando dados salvos neste navegador...")}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={importing} onClick={importFiles} type="button"><Upload className="mr-2 inline h-4 w-4" />{importing ? "Importando..." : "Validar e importar"}</button></div>
+      {Object.keys(imports).length ? <div className="border-t border-slate-100 p-6"><Table headers={["Fonte", "Arquivo", "Modificado em", "Importado em", "Linhas", "Abas"]} rows={[...sourceConfig.map((source) => [source.title, imports[source.key]?.fileName || "—", formatDateTime(imports[source.key]?.fileModifiedAt), formatDateTime(imports[source.key]?.importedAt), String(imports[source.key]?.rows ?? "—"), imports[source.key]?.sheets.join(", ") || "—"]), ["Dimensões / Princípio ativo", imports.dimensoes?.fileName || "—", formatDateTime(imports.dimensoes?.fileModifiedAt), formatDateTime(imports.dimensoes?.importedAt), String(imports.dimensoes?.rows ?? "—"), imports.dimensoes?.sheets.join(", ") || "—"]]} /></div> : null}
+      <div className="border-t border-slate-100 p-6"><div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">Relatório de conciliação</h3><p className="mt-1 text-xs text-slate-500">Mostra materiais, descrições e núcleos que não puderam ser conciliados, com a provável ação necessária.</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700 disabled:opacity-50" disabled={!reconciliationIssues.length} onClick={exportReconciliationReport} type="button"><Download className="h-4 w-4" />Exportar relatório</button></div><Table empty="Nenhuma pendência de conciliação encontrada nas fontes importadas." headers={["Fonte", "Material", "Código SAP", "Ocorrências", "Diagnóstico", "Ação sugerida"]} rows={reconciliationIssues.map((issue) => [issue.source, issue.material, issue.code, String(issue.count), issue.detail, issue.action])} /></div>
+    </section>;
   } else if (active === "Alertas") {
     const failures = consolidatedSupply.failures;
     content = <Table headers={["Tipo", "Situação", "Detalhe"]} rows={[["Ordens excluídas", excluded ? "Atenção" : "Sem registros", String(excluded) + " linhas EXCL não compõem a execução"], ["Conciliação de materiais", materialResolution.described > materialResolution.resolved ? "Atenção" : "Regular", materialResolution.described ? String(materialResolution.resolved) + " de " + String(materialResolution.described) + " descrições resolvidas" : "Importe estoque e dimensões"], ["Ruptura de saldo", failures.length ? "Atenção" : "Sem déficit", failures.length ? String(failures.length) + " materiais com necessidade não atendida" : "Nenhuma falta calculada"], ["Provisionamento", "Disponível", "Defina a janela na Calendarização e exporte o microdetalhe."]]} />;
@@ -1032,10 +1212,10 @@ export default function Home() {
     content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Gerencie premissas operacionais, dimensões e pedidos pendentes.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></section>;
   }
 
-  return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados nesta sessão do navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
+  return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
 
-    {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém e trânsito apenas do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-4"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1080px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={7}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
+    {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém, trânsito e pedidos pendentes do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Volume solicitado" value={formatNumber(provision.pendingOrder)} note="pedidos pendentes" /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1180px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "V. solicitado", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className="px-4 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-400">—</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={8}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
 
-    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais, mapeamentos editáveis e pedidos pendentes.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Pedidos pendentes</h3><p className="mt-1 text-xs text-slate-500">Use Centro, Descrição Material e Saldo Forn. O saldo fornecedor alimenta Volume solicitado.</p><label className="mt-3 flex cursor-pointer items-center justify-between rounded-xl border border-dashed border-emerald-300 bg-emerald-50/50 p-4 hover:border-emerald-500"><input accept=".xlsx,.xls" className="sr-only" onChange={(event) => void loadPending(event.target.files?.[0])} type="file" /><div className="flex items-center gap-3"><FileUp className="h-5 w-5 text-emerald-700" /><div><p className="text-sm font-semibold">Pedidos pendentes</p><p className="text-xs text-slate-500">{pendingLabel}</p></div></div><span className="text-xs font-semibold text-emerald-700">{pendingOrders.length ? "Importado" : "Selecionar"}</span></label>{pendingError ? <p className="mt-2 text-xs text-rose-700">{pendingError}</p> : null}{pendingOrders.length ? <button className="mt-2 text-xs font-semibold text-rose-700" onClick={() => { setPendingOrders([]); setPendingLabel("Pedidos pendentes (opcional)"); }} type="button">Remover pedidos importados</button> : null}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator (a quantidade física é dividida).</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}<p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-500">WBS: [Cultura].[Fazenda].[Safra].[Talhão]-[Índice]; A=1, B=2, C=3, D=4, E=5.</p></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas à conciliação desta sessão."); }} type="button">Salvar</button></div></div></div> : null}
+    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-5xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais e mapeamentos que estão aplicados à conciliação.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator (a quantidade física é dividida).</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}<p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-500">Pedidos pendentes são carregados na guia Importações. WBS: [Cultura].[Fazenda].[Safra].[Talhão]-[Índice]; A=1, B=2, C=3, D=4, E=5.</p></div><div className="border-t border-slate-100 px-6 py-5"><div className="mb-4"><h3 className="text-sm font-semibold">Premissas e dimensões aplicadas</h3><p className="mt-1 text-xs text-slate-500">Visão tabulada de todas as regras, vínculos e conversões ativos nesta sessão.</p></div><Table empty="Nenhuma premissa aplicada." headers={["Tipo", "Chave", "Valor aplicado", "Origem"]} rows={appliedPremiseRows} /></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas e salvas neste navegador."); }} type="button">Salvar</button></div></div></div> : null}
   </main>;
 }
