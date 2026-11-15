@@ -156,7 +156,7 @@ export function cycleFor(row: OperationalRow, bundle?: DimensionBundle) {
   return dimensionCycle ? titleCycle(dimensionCycle) : "Sem ciclo";
 }
 
-export function buildFarmToNucleus(rows: OperationalRow[], bundle: DimensionBundle) {
+export function buildFarmToNucleus(rows: OperationalRow[], bundle: DimensionBundle, planningRows: OperationalRow[] = []) {
   const result: Record<string, string> = {};
   rows.forEach((row) => {
     const nucleus = readText(row, "Nucleo", "Núcleo");
@@ -167,6 +167,13 @@ export function buildFarmToNucleus(rows: OperationalRow[], bundle: DimensionBund
   });
   Object.entries(bundle.centerToNucleus).forEach(([center, nucleus]) => {
     if (nucleus) result[center] = nucleus;
+  });
+  // A relação fazenda → núcleo precisa refletir as exceções do planejamento
+  // para que consumo e execução, ligados pelo WBS, permaneçam conciliados.
+  planningRows.forEach((row) => {
+    const farm = wbsSegment(row, 1);
+    const nucleus = planningNucleusFor(row, bundle, result);
+    if (farm && nucleus !== "Sem núcleo") result[normalizeMaterial(farm)] = nucleus;
   });
   return result;
 }
@@ -181,6 +188,15 @@ export function nucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToN
     || bundle.centerToNucleus[normalizeMaterial(farm)]
     || farmToNucleus[normalizeMaterial(farm)]
     || "Sem núcleo";
+}
+
+/** Applies the Talhão-based nucleus rule only to planning rows. */
+export function planningNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
+  const talhao = headerKey(readText(row, "Talhao", "Talhão"));
+  if (talhao.startsWith("TL")) return "NC-TP";
+  if (talhao.startsWith("FM")) return "NC-STM";
+  if (talhao.startsWith("BM")) return "NC-BBJ";
+  return nucleusFor(row, bundle, farmToNucleus).replace(/NC-VER/g, "NC-AGV");
 }
 
 /** Applies the depot overrides used in the MB52 Power Query only to stock data. */
@@ -299,7 +315,7 @@ export function buildReconciliation({
   planningRows.forEach((row) => {
     const product = productFor(row, "planning", bundle);
     if (product.rawName === "Sem descrição") return;
-    const target = ensure(product, nucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
+    const target = ensure(product, planningNucleusFor(row, bundle, farmToNucleus), cycleFor(row, bundle), cultureFor(row));
     target.planned += standardQuantity(row, "planning", product, bundle);
     target.plannedMaterials.add(product.rawName);
   });

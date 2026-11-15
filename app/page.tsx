@@ -12,6 +12,7 @@ import {
   headerKey,
   numberFrom,
   nucleusFor,
+  planningNucleusFor,
   productFor,
   readNumber,
   readText,
@@ -346,7 +347,7 @@ export default function Home() {
 
   const dimensions = useMemo(() => mergePremises(bundle, dimensionPremises), [bundle, dimensionPremises]);
   const plans = useMemo(() => datasets.planejamento.filter((row) => planningProduct(row, premises.excludedStatus)), [datasets.planejamento, premises.excludedStatus]);
-  const farmToNucleus = useMemo(() => buildFarmToNucleus([...plans, ...datasets.execucao], dimensions), [plans, datasets.execucao, dimensions]);
+  const farmToNucleus = useMemo(() => buildFarmToNucleus([...plans, ...datasets.execucao], dimensions, plans), [plans, datasets.execucao, dimensions]);
   const ledger = useMemo(() => buildReconciliation({
     bundle: dimensions, planningRows: plans, stockRows: datasets.estoque, transitRows: datasets.transito,
     consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
@@ -456,7 +457,7 @@ export default function Home() {
     plans.forEach((row) => {
       const product = productFor(row, "planning", dimensions);
       if (product.rawName === "Sem descrição") return;
-      const nucleus = nucleusFor(row, dimensions, farmToNucleus);
+      const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.plannedVolume += standardQuantity(row, "planning", product, dimensions);
       item.current.plannedArea += planningArea(row);

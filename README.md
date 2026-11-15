@@ -22,6 +22,8 @@ O elemento WBS segue o padrão:
 
 O índice de divisão do talhão é `A=1`, `B=2`, `C=3`, `D=4` e `E=5`.
 
+No Planejamento, o núcleo é ajustado pelo prefixo do talhão: `TL` → `NC-TP`, `FM` → `NC-STM` e `BM` → `NC-BBJ`. Nos demais casos, `NC-VER` é normalizado para `NC-AGV`. Essa regra é exclusiva do Planejamento e também atualiza a relação Fazenda → Núcleo usada para conciliar consumo e execução pelo WBS.
+
 As ligações não dependem do código SAP. A chave operacional é a hierarquia de
 nomes `Princípio ativo → Material agregado (padrão) → Material físico`,
 normalizada para remover diferenças de acentuação, caixa e pontuação. O código
