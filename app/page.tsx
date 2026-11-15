@@ -100,6 +100,7 @@ async function readPendingFile(file: File) {
     const header = pendingHeaderRow(workbook.Sheets[name]);
     if (header < 0) continue;
     return XLSX.utils.sheet_to_json<Row>(workbook.Sheets[name], { range: header, defval: "" })
+      .filter((row) => Boolean(readText(row, "Descrição Material", "Descricao Material", "Produto solicitado")))
       .filter((row) => !["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Eliminado", "Cancelado"))));
   }
   throw new Error("Não localizei Descrição Material e Saldo Forn no arquivo de pedidos pendentes.");
