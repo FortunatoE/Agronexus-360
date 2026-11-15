@@ -42,11 +42,13 @@ Na ZMM_BATCH, o núcleo do estoque é conciliado pela mesma lógica usada no con
 
 Estoque de **fazenda** é o que possui depósito preenchido e centro diferente de `0714`. Estoque de **armazém** é o que pertence ao centro `0714` ou não possui depósito. A ZMM_BATCH preserva ainda o nome e a cidade do armazém, como **BRAVO Sorriso** e **BRAVO Cuiabá**. Linhas com saldo zero são desconsideradas na classificação fazenda/armazém e não geram disponibilidade artificial. O armazém é um pool compartilhado por material agregado: não é duplicado entre núcleos no provisionamento.
 
+Na guia Acompanhamento, esse pool é exibido separadamente como núcleo **ARMAZÉM**. A expansão apresenta primeiro o material físico e, abaixo, cada localização formada por `Nome Est.Esp. - Local Est.Esp.` da ZMM_BATCH. Assim, o saldo central não se mistura ao saldo da fazenda.
+
 ## Visões operacionais
 
 - **Visão geral:** execução por subgrupo, separada entre Safra e Safrinha, e macro por cultura.
 - **Calendarização:** provisionamento por janela de avaliação, com detalhamento de saldo por fazenda, armazém e trânsito e exportação Excel (Resumo e Detalhes).
-- **Acompanhamento:** filtros por ciclo, grupo, subgrupo e cultura; planejamento, saldo, trânsito, aplicado e volume solicitado por princípio ativo, material padrão e núcleo.
+- **Acompanhamento:** inicia em **Safra**; os filtros recalculam planejamento e consumo antes da consolidação. Exibe planejamento, saldo, trânsito, aplicado e volume solicitado por princípio ativo, material padrão e núcleo, com expansão por material físico e localização.
 - **Execução:** percentual já realizado, volumes planejado e executado, dose executada versus planejada e impacto de volume causado pela diferença de dose. A leitura é segmentada por ciclo, cultura, grupo, subgrupo, núcleo e material.
 - **Importações:** seleção das cinco fontes operacionais e da dimensão opcional.
 - **Premissas:** tolerâncias, janelas, status excluído, mapeamentos editáveis e importação de pedidos pendentes (`Centro`, `Descrição Material`, `Saldo Forn`).

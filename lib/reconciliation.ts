@@ -238,12 +238,9 @@ export function stockLocationFor(row: OperationalRow, nucleus: string) {
   const city = readText(row, "Local Est.Esp.", "Local Est Esp", "Cidade");
   const isWarehouse = headerKey(center) === "0714" || !depot;
   const type: StockLocationType = isWarehouse ? "Armazém" : "Fazenda";
-  const cityName = city.split("-")[0]?.trim() || city;
-  const storageName = headerKey(operator).includes("BRAVO")
-    ? ["BRAVO", cityName].filter(Boolean).join(" ")
-    : [operator, city].filter(Boolean).join(" — ");
+  const storageName = [operator, city].filter(Boolean).join(" - ");
   const place = isWarehouse
-    ? `Armazém — ${storageName || center || "sem centro"}${storageName ? "" : depot ? ` / ${depot}` : " / sem depósito"}`
+    ? storageName || `Armazém — ${center || "sem centro"}${depot ? ` / ${depot}` : " / sem depósito"}`
     : `Fazenda — ${nucleus} / ${depot}`;
   return { depot, type, place };
 }

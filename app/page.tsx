@@ -237,6 +237,7 @@ function AnalysisFilters({
 
 type DemandRow = ReconciliationRow & { demand: number; local: number };
 type WarehouseAllocation = { allocated: number; locations: ReconciliationRow["locations"] };
+type MonitoringRow = ReconciliationRow & { isWarehouseView?: boolean };
 type PerformanceAccumulator = {
   active: string;
   appliedArea: number;
@@ -307,6 +308,32 @@ function allocateCentralWarehouse(rows: DemandRow[], stockRows: ReconciliationRo
   return { allocations, totalAvailable };
 }
 
+function StockDetails({ row }: { row: MonitoringRow }) {
+  const groups = new Map<string, { balance: number; locations: ReconciliationRow["locations"]; transit: number }>();
+  row.locations.forEach((location) => {
+    const current = groups.get(location.material) || { balance: 0, locations: [], transit: 0 };
+    if (location.type === "Trânsito") current.transit += location.amount;
+    else current.balance += location.amount;
+    current.locations.push(location);
+    groups.set(location.material, current);
+  });
+  const materials = [...groups.entries()].sort(([left], [right]) => left.localeCompare(right));
+  return <div className="overflow-x-auto rounded-xl border border-emerald-100 bg-white">
+    <table className="w-full min-w-[980px] text-left text-xs">
+      <thead className="bg-emerald-50 text-[10px] uppercase tracking-wide text-emerald-900">
+        <tr>{["Nível", "Material", "Saldo", "Trânsito", "Aplicado", "A entregar", "V. solicitado", "Localização"].map((head) => <th className="px-3 py-2 font-semibold" key={head}>{head}</th>)}</tr>
+      </thead>
+      <tbody className="divide-y divide-emerald-50">
+        {materials.flatMap(([material, detail]) => [
+          <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material</td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
+          ...detail.locations.map((location, index) => <tr key={["location", material, location.location, String(index)].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : formatNumber(location.amount)}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
+        ])}
+        {!materials.length ? <tr><td className="px-3 py-5 text-center text-slate-500" colSpan={8}>Não há saldo ou trânsito detalhado para este material.</td></tr> : null}
+      </tbody>
+    </table>
+  </div>;
+}
+
 export default function Home() {
   const [active, setActive] = useState("Visão geral");
   const [datasets, setDatasets] = useState<Datasets>(emptyDatasets);
@@ -324,7 +351,7 @@ export default function Home() {
   const [showPremises, setShowPremises] = useState(false);
   const [showProvision, setShowProvision] = useState(false);
   const [dark, setDark] = useState(false);
-  const [cycleFilter, setCycleFilter] = useState("Todos");
+  const [cycleFilter, setCycleFilter] = useState("Safra");
   const [groupFilter, setGroupFilter] = useState("Todos");
   const [subgroupFilter, setSubgroupFilter] = useState("Todos");
   const [cultureFilter, setCultureFilter] = useState("Todos");
@@ -402,17 +429,94 @@ export default function Home() {
     subgroups: ["Todos", ...new Set(ledger.map((row) => row.subgroup))],
     cultures: ["Todos", ...new Set(ledger.flatMap((row) => row.cultures))],
   }), [ledger]);
+  const monitoringLedger = useMemo(() => {
+    const matchesScope = (row: Row, source: "planning" | "consumption") => {
+      const product = productFor(row, source, dimensions);
+      return (cycleFilter === "Todos" || cycleFor(row, dimensions) === cycleFilter)
+        && (groupFilter === "Todos" || product.merchandiseGroup === groupFilter)
+        && (subgroupFilter === "Todos" || product.subgroup === subgroupFilter)
+        && (cultureFilter === "Todos" || cultureFor(row) === cultureFilter);
+    };
+    return buildReconciliation({
+      bundle: dimensions,
+      planningRows: plans.filter((row) => matchesScope(row, "planning")),
+      stockRows: datasets.estoque,
+      transitRows: datasets.transito,
+      consumptionRows: datasets.consumo.filter((row) => matchesScope(row, "consumption")),
+      pendingRows: pendingOrders,
+      farmToNucleus,
+    });
+  }, [cycleFilter, cultureFilter, datasets.consumo, datasets.estoque, datasets.transito, dimensions, farmToNucleus, groupFilter, pendingOrders, plans, subgroupFilter]);
+
+  const warehouseMonitoringRows = useMemo(() => {
+    const context = new Map<string, { cultures: Set<string>; cycles: Set<string> }>();
+    monitoringLedger.forEach((row) => {
+      const current = context.get(row.canonicalKey) || { cultures: new Set<string>(), cycles: new Set<string>() };
+      row.cultures.forEach((culture) => current.cultures.add(culture));
+      row.cycles.forEach((cycle) => current.cycles.add(cycle));
+      context.set(row.canonicalKey, current);
+    });
+    const values = new Map<string, MonitoringRow>();
+    monitoringLedger.forEach((row) => row.locations.filter((location) => location.type === "Armazém" && location.amount !== 0).forEach((location) => {
+      const id = row.canonicalKey + "|ARMAZEM";
+      const sourceContext = context.get(row.canonicalKey);
+      const current = values.get(id) || {
+        active: row.active,
+        applied: 0,
+        available: 0,
+        canonicalKey: row.canonicalKey,
+        codes: [],
+        cultures: [...(sourceContext?.cultures || [])].sort(),
+        cycles: [...(sourceContext?.cycles || [])].sort(),
+        farmBalance: 0,
+        id,
+        isWarehouseView: true,
+        locations: [],
+        merchandiseGroup: row.merchandiseGroup,
+        nucleus: "ARMAZÉM",
+        pendingOrder: 0,
+        planned: 0,
+        plannedMaterials: [],
+        shortage: 0,
+        standardMaterial: row.standardMaterial,
+        stockMaterials: [],
+        subgroup: row.subgroup,
+        transit: 0,
+        warehouseBalance: 0,
+      };
+      current.warehouseBalance += location.amount;
+      current.locations.push({ ...location });
+      if (!current.stockMaterials.includes(location.material)) current.stockMaterials.push(location.material);
+      values.set(id, current);
+    }));
+    return [...values.values()].map((row) => ({ ...row, available: row.warehouseBalance, stockMaterials: row.stockMaterials.sort() }));
+  }, [monitoringLedger]);
+
   const executionRows = useMemo(() => {
     const search = normalizeMaterial(query);
-    return ledger.filter((row) => {
-      const line = normalizeMaterial([row.active, row.standardMaterial, row.stockMaterials.join(" "), row.plannedMaterials.join(" "), row.nucleus].join(" "));
+    const farmRows: MonitoringRow[] = monitoringLedger.map((row) => {
+      const locations = row.locations.filter((location) => location.type !== "Armazém");
+      const stockMaterials = [...new Set(locations.map((location) => location.material))].sort();
+      return {
+        ...row,
+        available: row.farmBalance + row.transit,
+        locations,
+        shortage: Math.max(0, row.planned - row.applied - row.farmBalance - row.transit),
+        stockMaterials,
+        warehouseBalance: 0,
+      };
+    }).filter((row) => row.planned || row.applied || row.pendingOrder || row.transit || row.farmBalance);
+    return [...farmRows, ...warehouseMonitoringRows].filter((row) => {
+      const line = normalizeMaterial([row.active, row.standardMaterial, row.stockMaterials.join(" "), row.plannedMaterials.join(" "), row.nucleus, ...row.locations.map((location) => location.location)].join(" "));
       return (cycleFilter === "Todos" || row.cycles.includes(cycleFilter))
         && (groupFilter === "Todos" || row.merchandiseGroup === groupFilter)
         && (subgroupFilter === "Todos" || row.subgroup === subgroupFilter)
         && (cultureFilter === "Todos" || row.cultures.includes(cultureFilter))
         && (!search || line.includes(search));
-    });
-  }, [ledger, cycleFilter, groupFilter, subgroupFilter, cultureFilter, query]);
+    }).sort((left, right) => left.active.localeCompare(right.active)
+      || left.standardMaterial.localeCompare(right.standardMaterial)
+      || left.nucleus.localeCompare(right.nucleus));
+  }, [cycleFilter, cultureFilter, groupFilter, monitoringLedger, query, subgroupFilter, warehouseMonitoringRows]);
 
   const executedAreaByTask = useMemo(() => {
     const values = new Map<string, number>();
@@ -457,6 +561,10 @@ export default function Home() {
     plans.forEach((row) => {
       const product = productFor(row, "planning", dimensions);
       if (product.rawName === "Sem descrição") return;
+      if ((cycleFilter !== "Todos" && cycleFor(row, dimensions) !== cycleFilter)
+        || (groupFilter !== "Todos" && product.merchandiseGroup !== groupFilter)
+        || (subgroupFilter !== "Todos" && product.subgroup !== subgroupFilter)
+        || (cultureFilter !== "Todos" && cultureFor(row) !== cultureFilter)) return;
       const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.plannedVolume += standardQuantity(row, "planning", product, dimensions);
@@ -467,6 +575,10 @@ export default function Home() {
     datasets.consumo.forEach((row) => {
       const product = productFor(row, "consumption", dimensions);
       if (product.rawName === "Sem descrição") return;
+      if ((cycleFilter !== "Todos" && cycleFor(row, dimensions) !== cycleFilter)
+        || (groupFilter !== "Todos" && product.merchandiseGroup !== groupFilter)
+        || (subgroupFilter !== "Todos" && product.subgroup !== subgroupFilter)
+        || (cultureFilter !== "Todos" && cultureFor(row) !== cultureFilter)) return;
       const nucleus = nucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.appliedVolume += standardQuantity(row, "consumption", product, dimensions);
@@ -497,7 +609,7 @@ export default function Home() {
         volumeImpact,
       };
     }).filter((row) => row.plannedVolume || row.appliedVolume).sort((left, right) => right.plannedVolume - left.plannedVolume);
-  }, [plans, datasets.consumo, dimensions, farmToNucleus, executedAreaByTask]);
+  }, [plans, datasets.consumo, dimensions, farmToNucleus, executedAreaByTask, cycleFilter, groupFilter, subgroupFilter, cultureFilter]);
 
   const performanceRows = useMemo(() => {
     const search = normalizeMaterial(query);
@@ -658,10 +770,10 @@ export default function Home() {
   } else if (active === "Calendarização") {
     content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-end justify-between gap-4"><div><h2 className="font-semibold">Calendarização e provisionamento</h2><p className="mt-1 max-w-2xl text-sm text-slate-500">A janela compara demanda planejada, saldo por núcleo, trânsito e apoio do armazém para o mesmo material.</p></div><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={!plans.length} onClick={() => setShowProvision(true)} type="button"><CalendarDays className="h-4 w-4" />Rodar provisionamento</button></div><div className="mt-6 grid gap-3 sm:grid-cols-3"><Card label="Data de avaliação" value={new Intl.DateTimeFormat("pt-BR").format(new Date(evaluationDate + "T00:00:00"))} note="Valor inicial editável" /><Card label="Horizonte padrão" value={premises.horizon} note="dias definidos nas premissas" /><Card label="Materiais com falta" value={consolidatedSupply.failures.length} note="após rateio do armazém" tone="amber" /></div></section>;
   } else if (active === "Acompanhamento") {
-    content = ledger.length ? <section className="space-y-4">
+    content = monitoringLedger.length ? <section className="space-y-4">
       <div>
         <h2 className="font-semibold">Acompanhamento de materiais</h2>
-        <p className="mt-1 text-sm text-slate-500">Princípio ativo → material agregado (padrão) → material físico. O código SAP é apenas diagnóstico; saldo zero não classifica fazenda nem armazém.</p>
+        <p className="mt-1 text-sm text-slate-500">A visão inicia em Safra. O planejamento é recalculado para o ciclo selecionado; armazéns ficam separados do saldo de fazenda e podem ser detalhados por material e localização.</p>
       </div>
       <AnalysisFilters
         cultures={filters.cultures}
@@ -690,7 +802,7 @@ export default function Home() {
                 <td className="px-3 py-3"><button aria-label="Expandir materiais" className="rounded border border-slate-200 p-1 text-slate-600" onClick={() => setExpanded(expanded === row.id ? null : row.id)} type="button"><ChevronDown className={cn("h-3.5 w-3.5", expanded === row.id && "rotate-180")} /></button></td>
                 <td className="px-3 py-3 font-medium">{row.active}</td>
                 <td className="px-3 py-3">{row.cycles.join(", ") || "—"}<br /><span className="text-xs text-slate-500">{row.cultures.join(", ") || "Sem cultura"}</span></td>
-                <td className="px-3 py-3">{row.nucleus}</td>
+                <td className={cn("px-3 py-3", row.isWarehouseView && "font-semibold text-emerald-800")}>{row.nucleus}</td>
                 <td className="px-3 py-3 font-medium">{row.standardMaterial}</td>
                 <td className="px-3 py-3">{row.stockMaterials.join(", ") || "—"}</td>
                 <td className="px-3 py-3">{formatNumber(row.planned)}</td>
@@ -700,7 +812,7 @@ export default function Home() {
                 <td className="px-3 py-3">{formatNumber(Math.max(0, row.planned - row.applied))}</td>
                 <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
               </tr>
-              {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><div className="grid gap-4 md:grid-cols-3"><div><strong>Planejado</strong><p className="mt-1">{row.plannedMaterials.join(", ") || "—"}</p></div><div><strong>Estoque conciliado</strong><p className="mt-1">{row.stockMaterials.join(", ") || "—"}</p></div><div><strong>Locais</strong><p className="mt-1">{row.locations.map((location) => location.location + ": " + formatNumber(location.amount)).join(" · ") || "—"}</p></div></div></td></tr> : null}
+              {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}
             </Fragment>)}
             {!executionRows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={12}>Nenhum material atende aos filtros.</td></tr> : null}
           </tbody>
