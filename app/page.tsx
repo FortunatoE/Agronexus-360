@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import * as XLSX from "xlsx";
 import { DimensionUpload } from "@/components/dimension-upload";
 import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
@@ -60,6 +60,14 @@ const crops = [
 function cn(...values: Array<string | false | undefined>) { return values.filter(Boolean).join(" "); }
 function formatNumber(value: number) { return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 }).format(value || 0); }
 function formatDose(value: number | null) { return value === null ? "n.a." : new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value); }
+function amountToDeliver(row: Pick<ReconciliationRow, "farmBalance" | "warehouseBalance" | "applied" | "transit" | "planned">) {
+  return row.farmBalance + row.warehouseBalance + row.applied + row.transit - row.planned;
+}
+function amountToDeliverColor(value: number) {
+  if (value > 0) return "text-emerald-700";
+  if (value < 0) return "text-rose-700";
+  return "text-slate-950";
+}
 function percent(value: number, total: number) { return total ? Math.max(0, Math.min(100, value * 100 / total)) : 0; }
 function rawPercent(value: number, total: number) { return total ? value * 100 / total : 0; }
 function percentageText(value: number, total: number) { return total > 0 ? rawPercent(value, total).toFixed(1) + "%" : "n.a."; }
@@ -324,10 +332,21 @@ function StockDetails({ row }: { row: MonitoringRow }) {
         <tr>{["Nível", "Material", "Saldo", "Trânsito", "Aplicado", "A entregar", "V. solicitado", "Localização"].map((head) => <th className="px-3 py-2 font-semibold" key={head}>{head}</th>)}</tr>
       </thead>
       <tbody className="divide-y divide-emerald-50">
-        {materials.flatMap(([material, detail]) => [
-          <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material</td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
-          ...detail.locations.map((location, index) => <tr key={["location", material, location.location, String(index)].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : formatNumber(location.amount)}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
-        ])}
+        {materials.flatMap(([material, detail]) => {
+          // A ZMM_BATCH possui uma linha por lote. A visão operacional deve somar
+          // os lotes quando material, tipo de saldo e localização são os mesmos.
+          const consolidated = new Map<string, ReconciliationRow["locations"][number]>();
+          detail.locations.forEach((location) => {
+            const key = [location.type, location.material, location.location].join("\u0000");
+            const current = consolidated.get(key);
+            consolidated.set(key, current ? { ...current, amount: current.amount + location.amount } : { ...location });
+          });
+          const locations = [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location) || left.type.localeCompare(right.type));
+          return [
+            <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material</td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
+            ...locations.map((location) => <tr key={["location", material, location.type, location.location].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : formatNumber(location.amount)}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
+          ];
+        })}
         {!materials.length ? <tr><td className="px-3 py-5 text-center text-slate-500" colSpan={8}>Não há saldo ou trânsito detalhado para este material.</td></tr> : null}
       </tbody>
     </table>
@@ -350,7 +369,7 @@ export default function Home() {
   const [draft, setDraft] = useState<DimensionPremise>({ domain: "Material", key: "", value: "" });
   const [showPremises, setShowPremises] = useState(false);
   const [showProvision, setShowProvision] = useState(false);
-  const [dark, setDark] = useState(false);
+  const [dark, setDark] = useState(() => typeof window !== "undefined" && window.localStorage.getItem("agronexus-theme") === "dark");
   const [cycleFilter, setCycleFilter] = useState("Safra");
   const [groupFilter, setGroupFilter] = useState("Todos");
   const [subgroupFilter, setSubgroupFilter] = useState("Todos");
@@ -366,7 +385,6 @@ export default function Home() {
     return dateKey(end);
   });
 
-  useEffect(() => { setDark(window.localStorage.getItem("agronexus-theme") === "dark"); }, []);
   const toggleTheme = () => setDark((current) => {
     window.localStorage.setItem("agronexus-theme", current ? "light" : "dark");
     return !current;
@@ -809,7 +827,7 @@ export default function Home() {
                 <td className="px-3 py-3">{formatNumber(row.farmBalance + row.warehouseBalance)}</td>
                 <td className="px-3 py-3">{formatNumber(row.transit)}</td>
                 <td className="px-3 py-3">{formatNumber(row.applied)}</td>
-                <td className="px-3 py-3">{formatNumber(Math.max(0, row.planned - row.applied))}</td>
+                <td className={cn("px-3 py-3 font-semibold", amountToDeliverColor(amountToDeliver(row)))}>{formatNumber(amountToDeliver(row))}</td>
                 <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
               </tr>
               {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}

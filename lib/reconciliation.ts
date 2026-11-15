@@ -203,6 +203,8 @@ export function planningNucleusFor(row: OperationalRow, bundle: DimensionBundle,
 export function stockNucleusFor(row: OperationalRow, bundle: DimensionBundle, farmToNucleus: Record<string, string>) {
   const center = headerKey(readText(row, "Cen.", "Centro", "CEN"));
   const depot = headerKey(readText(row, "Dep.", "Depósito", "Deposito", "DEP"));
+  // Regra operacional: todo estoque registrado no centro FVR1 atende ao NC-TP.
+  if (center === "FVR1") return "NC-TP";
   if (center === "FBJ2" && depot === "TR01") return "NC-BBJ";
   if (center === "FBJ2" && depot === "UTS1") return "NC-STM";
   if (!depot) return "BRAVO";
