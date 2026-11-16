@@ -14,9 +14,11 @@ import {
   numberFrom,
   planningNucleusFor,
   productFor,
+  quantityFor,
   readNumber,
   readText,
   nucleusFor,
+  stockLocationFor,
   stockNucleusFor,
   standardAmount,
   standardQuantity,
@@ -37,15 +39,43 @@ type Datasets = Record<SourceKey, Row[]>;
 type ImportSummary = { fileName: string; fileModifiedAt: string; importedAt: string; rows: number; sheets: string[] };
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
+type TaskAction = { id: string; note: string; createdAt: string };
+type TaskItem = { id: string; pendingId: string; title: string; createdAt: string; actions: TaskAction[] };
 type PersistedWorkspace = {
   bundle: DimensionBundle;
   datasets: Datasets;
   dimensionPremises: DimensionPremise[];
   imports: Partial<Record<ImportKey, ImportSummary>>;
   premises: Premises;
-  tasks: string[];
+  tasks: TaskItem[] | string[];
 };
 type ReconciliationIssue = { action: string; code: string; count: number; detail: string; material: string; source: string };
+type PremiseSection = {
+  id: "operacionais" | "materiais" | "nucleos" | "culturas" | "conversoes";
+  title: string;
+  description: string;
+  headers: string[];
+  rows: Array<Array<string | number>>;
+};
+type PendingSignal = {
+  id: string;
+  dueDate: Date | null;
+  daysUntil: number | null;
+  material: string;
+  nucleus: string;
+  quantity: number;
+  reference: string;
+  status: "Demanda próxima" | "Possível atraso" | "Ponto de atenção" | "Alerta" | "Programado" | "Sem data";
+  tone: "emerald" | "sky" | "amber" | "rose" | "slate";
+};
+type OperationalAlert = {
+  id: string;
+  category: string;
+  severity: "attention" | "critical" | "info";
+  title: string;
+  detail: string;
+  metric: string;
+};
 
 const workspaceDatabase = "agronexus-360";
 const workspaceStore = "workspace";
@@ -107,6 +137,43 @@ function freshnessStatus(value?: string, now = Date.now()) {
   if (hours <= 12) return { label: "OK", tone: "emerald" as const };
   if (hours <= 48) return { label: "Em atenção", tone: "amber" as const };
   return { label: "Necessita atualizar", tone: "rose" as const };
+}
+function startOfDay(value: Date) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+}
+function daysFromToday(value: Date, now = new Date()) {
+  return Math.round((startOfDay(value).getTime() - startOfDay(now).getTime()) / 86_400_000);
+}
+function pendingSignalStatus(daysUntil: number | null): Pick<PendingSignal, "status" | "tone"> {
+  if (daysUntil === null) return { status: "Sem data", tone: "slate" };
+  if (daysUntil <= -6) return { status: "Alerta", tone: "rose" };
+  if (daysUntil <= -1) return { status: "Ponto de atenção", tone: "amber" };
+  if (daysUntil <= 1) return { status: "Possível atraso", tone: "amber" };
+  if (daysUntil <= 3) return { status: "Demanda próxima", tone: "sky" };
+  return { status: "Programado", tone: "emerald" };
+}
+function taskId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function persistedTasks(value: unknown): TaskItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => {
+    if (typeof item === "string") {
+      return { id: `legada-${index}-${item}`, pendingId: "", title: item, createdAt: new Date().toISOString(), actions: [] };
+    }
+    const candidate = item as Partial<TaskItem>;
+    return {
+      id: candidate.id || `tarefa-${index}`,
+      pendingId: candidate.pendingId || "",
+      title: candidate.title || "Ação sem título",
+      createdAt: candidate.createdAt || new Date().toISOString(),
+      actions: Array.isArray(candidate.actions) ? candidate.actions.filter((action): action is TaskAction => Boolean(action?.note)).map((action, actionIndex) => ({
+        id: action.id || `acao-${index}-${actionIndex}`,
+        note: action.note,
+        createdAt: action.createdAt || new Date().toISOString(),
+      })) : [],
+    };
+  });
 }
 
 function openWorkspaceDatabase() {
@@ -253,8 +320,8 @@ function Table({ headers, rows, empty = "Nenhum dado no recorte." }: { headers: 
 function Empty({ title, description }: { title: string; description: string }) {
   return <div className="grid min-h-[240px] place-items-center rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center"><div><PackageSearch className="mx-auto h-7 w-7 text-emerald-700" /><h2 className="mt-3 font-semibold">{title}</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">{description}</p></div></div>;
 }
-function Navigation({ active, lastUpdatedAt, onSelect }: { active: string; lastUpdatedAt?: string; onSelect: (value: string) => void }) {
-  return <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] border-r border-slate-200 bg-white px-4 py-5 lg:block"><div className="px-3 pb-7"><div className="flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-700 text-white"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold">AgroNexus</p><p className="text-[10px] font-semibold uppercase tracking-[.15em] text-emerald-700">Planejamento 360°</p></div></div><div className="mt-4 rounded-xl bg-slate-50 px-3 py-2"><p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Última atualização</p><p className="mt-0.5 text-xs font-semibold text-slate-700">{formatDateTime(lastUpdatedAt)}</p></div></div><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[.14em] text-slate-400">Gestão</p> : null}<button className={cn("flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium", active === label ? "bg-emerald-50 text-emerald-800" : "text-slate-600 hover:bg-slate-50")} onClick={() => onSelect(label)} type="button"><Icon className="h-4 w-4" />{label}</button></Fragment>)}</div><div className="absolute bottom-5 left-4 right-4 rounded-2xl bg-slate-900 p-4 text-white"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-semibold">Conciliação por nomes</p><p className="mt-1 text-[11px] leading-relaxed text-slate-300">Códigos SAP são somente diagnósticos; a chave operacional é o nome do material.</p></div></aside>;
+function Navigation({ active, alertCount, lastUpdatedAt, onSelect }: { active: string; alertCount: number; lastUpdatedAt?: string; onSelect: (value: string) => void }) {
+  return <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] border-r border-slate-200 bg-white px-4 py-5 lg:block"><div className="px-3 pb-7"><div className="flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-700 text-white"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold">AgroNexus</p><p className="text-[10px] font-semibold uppercase tracking-[.15em] text-emerald-700">Planejamento 360°</p></div></div><div className="mt-4 rounded-xl bg-slate-50 px-3 py-2"><p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Última atualização</p><p className="mt-0.5 text-xs font-semibold text-slate-700">{formatDateTime(lastUpdatedAt)}</p></div></div><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[.14em] text-slate-400">Gestão</p> : null}<button className={cn("flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium", active === label ? "bg-emerald-50 text-emerald-800" : "text-slate-600 hover:bg-slate-50")} onClick={() => onSelect(label)} type="button"><span className="flex items-center gap-3"><Icon className="h-4 w-4" />{label}</span>{label === "Alertas" && alertCount ? <span className="rounded-full bg-rose-600 px-2 py-0.5 text-[10px] font-bold text-white">{alertCount > 99 ? "99+" : alertCount}</span> : null}</button></Fragment>)}</div><div className="absolute bottom-5 left-4 right-4 rounded-2xl bg-slate-900 p-4 text-white"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-semibold">Conciliação por nomes</p><p className="mt-1 text-[11px] leading-relaxed text-slate-300">Códigos SAP são somente diagnósticos; a chave operacional é o nome do material.</p></div></aside>;
 }
 
 type AnalysisFiltersProps = {
@@ -452,6 +519,7 @@ export default function Home() {
   const [dimensionPremises, setDimensionPremises] = useState<DimensionPremise[]>([]);
   const [draft, setDraft] = useState<DimensionPremise>({ domain: "Material", key: "", value: "" });
   const [showPremises, setShowPremises] = useState(false);
+  const [premiseSection, setPremiseSection] = useState<PremiseSection["id"]>("operacionais");
   const [showProvision, setShowProvision] = useState(false);
   const [dark, setDark] = useState(() => typeof window !== "undefined" && window.localStorage.getItem("agronexus-theme") === "dark");
   const [cycleFilter, setCycleFilter] = useState("Safra");
@@ -461,8 +529,11 @@ export default function Home() {
   const [nucleusFilter, setNucleusFilter] = useState("Todos");
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [task, setTask] = useState("");
-  const [tasks, setTasks] = useState<string[]>([]);
+  const [taskPendingId, setTaskPendingId] = useState("");
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskNote, setTaskNote] = useState("");
+  const [taskActionDrafts, setTaskActionDrafts] = useState<Record<string, string>>({});
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [storageReady, setStorageReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
   const [clock, setClock] = useState(() => Date.now());
@@ -483,7 +554,7 @@ export default function Home() {
       setDimensionPremises(workspace.dimensionPremises || []);
       setImports(workspace.imports || {});
       setPremises({ ...initialPremises, ...(workspace.premises || {}) });
-      setTasks(workspace.tasks || []);
+      setTasks(persistedTasks(workspace.tasks));
     }).catch(() => {
       if (active) setPersistenceError("Não foi possível recuperar os dados salvos neste navegador.");
     }).finally(() => {
@@ -520,6 +591,25 @@ export default function Home() {
     const mb52Fallback = datasets.estoqueMb52.filter((row) => !batchMaterials.has(normalizeMaterial(productFor(row, "stock", dimensions).rawName)));
     return [...datasets.estoque, ...mb52Fallback];
   }, [datasets.estoque, datasets.estoqueMb52, dimensions]);
+  const stockConversionBalances = useMemo(() => {
+    const balances = new Map<string, { converted: number; physical: number; hasConversion: boolean }>();
+    stockRows.forEach((row) => {
+      const product = productFor(row, "stock", dimensions);
+      if (product.rawName === "Sem descrição") return;
+      const physical = quantityFor(row, "stock");
+      if (!physical) return;
+      const nucleus = stockNucleusFor(row, dimensions, farmToNucleus);
+      const location = stockLocationFor(row, nucleus);
+      const id = `${product.canonicalKey}|${normalizeMaterial(location.type === "Armazém" ? "ARMAZEM" : nucleus)}`;
+      const converted = standardAmount(physical, product, dimensions);
+      const current = balances.get(id) || { converted: 0, physical: 0, hasConversion: false };
+      current.converted += converted;
+      current.physical += physical;
+      current.hasConversion ||= Math.abs(physical - converted) > 0.000_001;
+      balances.set(id, current);
+    });
+    return balances;
+  }, [dimensions, farmToNucleus, stockRows]);
   const ledger = useMemo(() => buildReconciliation({
     bundle: dimensions, planningRows: plans, stockRows, transitRows: datasets.transito,
     consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
@@ -583,23 +673,41 @@ export default function Home() {
     return [...issues.values()].sort((left, right) => left.source.localeCompare(right.source) || left.material.localeCompare(right.material));
   }, [datasets.consumo, datasets.estoque, datasets.estoqueMb52, datasets.transito, dimensions, farmToNucleus, pendingOrders, plans]);
 
-  const appliedPremiseRows = useMemo<ReactNode[][]>(() => {
-    const rows: ReactNode[][] = [
-      ["Regra operacional", "Tolerância de desvio", premises.tolerance + "%", "Aplicação"],
-      ["Regra operacional", "Amostra mínima", premises.sample, "Aplicação"],
-      ["Regra operacional", "Janelas de demanda", premises.horizon, "Aplicação"],
-      ["Regra operacional", "Status excluído", premises.excludedStatus, "Aplicação"],
-    ];
+  const premiseSections = useMemo<PremiseSection[]>(() => {
     const materials = new Map<string, DimensionBundle["materials"][string]>();
     Object.values(dimensions.materials).forEach((material) => materials.set(normalizeMaterial(material.material), material));
-    [...materials.values()].sort((left, right) => left.material.localeCompare(right.material)).forEach((material) => {
-      rows.push(["Material", material.material, `${material.aggregateMaterial} · ${material.principleActive} · ${material.merchandiseGroup} / ${material.subgroup}`, "Dimensões"]);
-    });
-    Object.entries(dimensions.centerToNucleus).sort(([left], [right]) => left.localeCompare(right)).forEach(([center, nucleus]) => rows.push(["Centro/Fazenda", center, nucleus, "Dimensões"]));
-    Object.entries(dimensions.cultureToCycle).sort(([left], [right]) => left.localeCompare(right)).forEach(([culture, cycle]) => rows.push(["Cultura", culture, cycle, "Dimensões"]));
-    Object.entries(dimensions.conversions).sort(([left], [right]) => left.localeCompare(right)).forEach(([pair, factor]) => rows.push(["Conversão", pair.replace("|", " → "), formatNumber(factor), "Dimensões"]));
-    return rows;
+    return [
+      {
+        id: "operacionais", title: "Regras operacionais", description: "Parâmetros que guiam as análises e conciliações.",
+        headers: ["Premissa", "Valor"],
+        rows: [["Tolerância de desvio", premises.tolerance + "%"], ["Amostra mínima", premises.sample], ["Janelas de demanda", premises.horizon], ["Status excluído", premises.excludedStatus]],
+      },
+      {
+        id: "materiais", title: "Materiais e princípios ativos", description: "Material físico, material agregado e classificação utilizada nas visões.",
+        headers: ["Material físico", "Material agregado", "Princípio ativo", "Grupo", "Subgrupo", "Dose padrão"],
+        rows: [...materials.values()].sort((left, right) => left.material.localeCompare(right.material)).map((material) => [material.material, material.aggregateMaterial, material.principleActive, material.merchandiseGroup, material.subgroup, material.standardDose]),
+      },
+      {
+        id: "nucleos", title: "Centros, fazendas e núcleos", description: "Vínculos que definem onde cada saldo e demanda são consolidados.",
+        headers: ["Centro ou fazenda", "Núcleo aplicado"],
+        rows: Object.entries(dimensions.centerToNucleus).sort(([left], [right]) => left.localeCompare(right)).map(([center, nucleus]) => [center, nucleus]),
+      },
+      {
+        id: "culturas", title: "Culturas e ciclos", description: "Classificação de cultura entre Safra e Safrinha.",
+        headers: ["Cultura", "Ciclo aplicado"],
+        rows: Object.entries(dimensions.cultureToCycle).sort(([left], [right]) => left.localeCompare(right)).map(([culture, cycle]) => [culture, cycle]),
+      },
+      {
+        id: "conversoes", title: "Conversões de dose", description: "Fatores que convertem o saldo físico para o material agregado.",
+        headers: ["Material padrão", "Apresentação física", "Fator de conversão"],
+        rows: Object.entries(dimensions.conversions).sort(([left], [right]) => left.localeCompare(right)).map(([pair, factor]) => {
+          const [standard, physical] = pair.split("|");
+          return [standard, physical, factor];
+        }),
+      },
+    ];
   }, [dimensions, premises]);
+  const selectedPremiseSection = premiseSections.find((section) => section.id === premiseSection) || premiseSections[0];
 
   const groupedProgress = useMemo(() => {
     type ProgressRow = { group: string; subgroup: string; planned: number; applied: number };
@@ -797,10 +905,6 @@ export default function Home() {
     plans.forEach((row) => {
       const product = productFor(row, "planning", dimensions);
       if (product.rawName === "Sem descrição") return;
-      if ((cycleFilter !== "Todos" && cycleFor(row, dimensions) !== cycleFilter)
-        || (groupFilter !== "Todos" && product.merchandiseGroup !== groupFilter)
-        || (subgroupFilter !== "Todos" && product.subgroup !== subgroupFilter)
-        || (cultureFilter !== "Todos" && cultureFor(row) !== cultureFilter)) return;
       const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.plannedVolume += standardQuantity(row, "planning", product, dimensions);
@@ -811,10 +915,6 @@ export default function Home() {
     datasets.consumo.forEach((row) => {
       const product = productFor(row, "consumption", dimensions);
       if (product.rawName === "Sem descrição") return;
-      if ((cycleFilter !== "Todos" && cycleFor(row, dimensions) !== cycleFilter)
-        || (groupFilter !== "Todos" && product.merchandiseGroup !== groupFilter)
-        || (subgroupFilter !== "Todos" && product.subgroup !== subgroupFilter)
-        || (cultureFilter !== "Todos" && cultureFor(row) !== cultureFilter)) return;
       const nucleus = consumptionNucleusFor(row, dimensions, farmToNucleus);
       const item = ensure(product, nucleus, cycleFor(row, dimensions), cultureFor(row));
       item.current.appliedVolume += standardQuantity(row, "consumption", product, dimensions);
@@ -845,7 +945,7 @@ export default function Home() {
         volumeImpact,
       };
     }).filter((row) => row.plannedVolume || row.appliedVolume).sort((left, right) => right.plannedVolume - left.plannedVolume);
-  }, [plans, datasets.consumo, dimensions, farmToNucleus, executedAreaByTask, cycleFilter, groupFilter, subgroupFilter, cultureFilter]);
+  }, [plans, datasets.consumo, dimensions, farmToNucleus, executedAreaByTask]);
 
   const performanceRows = useMemo(() => {
     const search = normalizeMaterial(query);
@@ -932,6 +1032,117 @@ export default function Home() {
     };
   }, [ledger]);
 
+  const pendingSignals = useMemo<PendingSignal[]>(() => pendingOrders.map((row, index) => {
+    const product = productFor(row, "pending", dimensions);
+    const nucleus = nucleusFor(row, dimensions, farmToNucleus);
+    const dueDate = dateFromPlan(readText(row, "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Data prevista", "Previsão de utilização", "Previsao de utilizacao"));
+    const daysUntil = dueDate ? daysFromToday(dueDate, new Date(clock)) : null;
+    const reference = readText(row, "Pedido", "Nº pedido", "No pedido", "Documento", "Doc. compra", "Solicitação", "Solicitacao") || "Pedido pendente";
+    const signal = pendingSignalStatus(daysUntil);
+    return {
+      id: normalizeMaterial([reference, product.rawName, nucleus, dueDate ? dateKey(dueDate) : String(index)].join("|")) || `pedido-${index}`,
+      dueDate,
+      daysUntil,
+      material: product.canonicalName,
+      nucleus,
+      quantity: standardQuantity(row, "pending", product, dimensions),
+      reference,
+      ...signal,
+    };
+  }).sort((left, right) => (left.daysUntil ?? Number.MAX_SAFE_INTEGER) - (right.daysUntil ?? Number.MAX_SAFE_INTEGER)), [clock, dimensions, farmToNucleus, pendingOrders]);
+
+  const farol = useMemo(() => ({
+    demand: pendingSignals.filter((signal) => signal.status === "Demanda próxima").length,
+    delay: pendingSignals.filter((signal) => signal.status === "Possível atraso").length,
+    attention: pendingSignals.filter((signal) => signal.status === "Ponto de atenção").length,
+    alert: pendingSignals.filter((signal) => signal.status === "Alerta").length,
+  }), [pendingSignals]);
+
+  const supplyAlerts = useMemo<OperationalAlert[]>(() => {
+    const start = startOfDay(new Date(clock));
+    const finish = new Date(start);
+    finish.setDate(finish.getDate() + 30);
+    const datedPlans = plans.map((row) => ({ row, dueDate: dateFromPlan(readText(row, "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data")) }));
+    const plannedSoon = datedPlans.filter((item) => item.dueDate && item.dueDate >= start && item.dueDate <= finish);
+    if (!plannedSoon.length) return [];
+    const dueDates = new Map<string, Date>();
+    plannedSoon.forEach(({ row, dueDate }) => {
+      const product = productFor(row, "planning", dimensions);
+      const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
+      const id = `${product.canonicalKey}|${normalizeMaterial(nucleus)}`;
+      const current = dueDates.get(id);
+      if (!current || dueDate! < current) dueDates.set(id, dueDate!);
+    });
+    const windowLedger = buildReconciliation({
+      bundle: dimensions, planningRows: plannedSoon.map((item) => item.row), stockRows,
+      transitRows: datasets.transito, consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
+    });
+    const demands: DemandRow[] = windowLedger.filter((row) => row.planned > row.applied).map((row) => ({
+      ...row, demand: Math.max(0, row.planned - row.applied), local: row.farmBalance + row.transit,
+    }));
+    const allocation = allocateCentralWarehouse(demands, windowLedger);
+    return demands.filter((row) => row.demand > 0 && row.farmBalance <= 0).map((row) => {
+      const support = allocation.allocations.get(row.id) || { allocated: 0, locations: [] };
+      const locations = consolidateLocations(support.locations);
+      const place = locations.map((location) => location.location).join(", ");
+      const fromCuiaba = locations.some((location) => normalizeMaterial(location.location).includes("CUIABA"));
+      const dueDate = dueDates.get(row.id);
+      const warehouseDetail = support.allocated > 0
+        ? ` Há ${formatNumber(support.allocated)} no armazém${place ? `: ${place}` : ""}.${fromCuiaba ? " Origem Cuiabá: priorize o envio pelo maior tempo logístico." : " Priorize o repasse ao núcleo."}`
+        : " Não há apoio disponível no armazém para esta demanda.";
+      return {
+        id: `repasse-${row.id}`,
+        category: "Repasse em até 30 dias",
+        severity: support.allocated > 0 ? "attention" : "critical",
+        title: `${row.standardMaterial} — ${row.nucleus}`,
+        detail: `Uso previsto ${dueDate ? new Intl.DateTimeFormat("pt-BR").format(dueDate) : "nos próximos 30 dias"}; a fazenda não possui saldo. Demanda restante: ${formatNumber(row.demand)}.${warehouseDetail}`,
+        metric: `${formatNumber(row.demand)} necessários`,
+      };
+    });
+  }, [clock, datasets.consumo, datasets.transito, dimensions, farmToNucleus, pendingOrders, plans, stockRows]);
+
+  const doseIncreaseAlerts = useMemo<OperationalAlert[]>(() => executionPerformance
+    .filter((row) => row.plannedDose !== null && row.plannedDose > 0 && row.appliedDose !== null && row.appliedDose > row.plannedDose * 1.05)
+    .map((row) => {
+      const increase = ((row.appliedDose! / row.plannedDose!) - 1) * 100;
+      return {
+        id: `dose-${row.id}`,
+        category: "Aumento de dose na execução",
+        severity: increase >= 15 ? "critical" : "attention",
+        title: `${row.standardMaterial} — ${row.nucleus}`,
+        detail: `Dose executada ${formatDose(row.appliedDose)} frente a ${formatDose(row.plannedDose)} planejada. O acréscimo gera ${signedNumber(row.volumeImpact)} de impacto na área já executada.`,
+        metric: `+${increase.toFixed(1)}%`,
+      };
+    }).sort((left, right) => Number(right.metric.replace(/[^0-9,.]/g, "").replace(",", ".")) - Number(left.metric.replace(/[^0-9,.]/g, "").replace(",", "."))), [executionPerformance]);
+
+  const expiredStockAlerts = useMemo<OperationalAlert[]>(() => {
+    const values = new Map<string, { amount: number; days: number; location: string; material: string; type: string; value: number }>();
+    stockRows.forEach((row) => {
+      const expiry = dateFromPlan(readText(row, "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade"));
+      if (!expiry || expiry >= startOfDay(new Date(clock))) return;
+      const product = productFor(row, "stock", dimensions);
+      if (product.rawName === "Sem descrição") return;
+      const nucleus = stockNucleusFor(row, dimensions, farmToNucleus);
+      const location = stockLocationFor(row, nucleus);
+      const key = [product.canonicalKey, location.type, location.place].join("|");
+      const current = values.get(key) || { amount: 0, days: 0, location: location.place, material: product.canonicalName, type: location.type, value: 0 };
+      current.amount += standardQuantity(row, "stock", product, dimensions);
+      current.days = Math.max(current.days, Math.max(1, -daysFromToday(expiry, new Date(clock))));
+      current.value += readNumber(row, "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque");
+      values.set(key, current);
+    });
+    return [...values.entries()].map(([id, item]) => ({
+      id: `vencido-${id}`,
+      category: "Estoque vencido",
+      severity: "critical" as const,
+      title: `${item.material} — ${item.type}`,
+      detail: `${item.location}. Produto vencido há ${item.days} dia${item.days === 1 ? "" : "s"}; saldo convertido de ${formatNumber(item.amount)} e valor agregado de ${new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(item.value)}.`,
+      metric: `${item.days} dia${item.days === 1 ? "" : "s"}`,
+    })).sort((left, right) => Number(right.metric.split(" ")[0]) - Number(left.metric.split(" ")[0]));
+  }, [clock, dimensions, farmToNucleus, stockRows]);
+
+  const operationalAlerts = useMemo(() => [...supplyAlerts, ...doseIncreaseAlerts, ...expiredStockAlerts], [doseIncreaseAlerts, expiredStockAlerts, supplyAlerts]);
+
   async function importFiles() {
     const selected = sourceConfig.filter((source) => uploads[source.key]);
     if (!selected.length) { setMessage("Selecione ao menos uma fonte antes de importar."); return; }
@@ -970,6 +1181,36 @@ export default function Home() {
     setDimensionPremises((current) => [...current, { ...draft, key: draft.key.trim(), value: draft.value.trim() }]);
     setDraft((current) => ({ ...current, key: "", value: "" }));
   }
+  function exportPremiseSection() {
+    const section = selectedPremiseSection;
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([section.headers, ...section.rows]), section.title.slice(0, 31));
+    XLSX.writeFile(workbook, `premissas_${section.id}_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
+  }
+  function addLinkedTask() {
+    if (!taskNote.trim()) return;
+    const linked = pendingSignals.find((signal) => signal.id === taskPendingId);
+    const now = new Date().toISOString();
+    setTasks((current) => [...current, {
+      id: taskId("tarefa"),
+      pendingId: taskPendingId,
+      title: taskTitle.trim() || (linked ? `Ação para ${linked.material} — ${linked.nucleus}` : "Ação operacional"),
+      createdAt: now,
+      actions: [{ id: taskId("acao"), note: taskNote.trim(), createdAt: now }],
+    }]);
+    setTaskTitle("");
+    setTaskNote("");
+    setTaskPendingId("");
+  }
+  function appendTaskAction(taskIdValue: string) {
+    const note = taskActionDrafts[taskIdValue]?.trim();
+    if (!note) return;
+    setTasks((current) => current.map((task) => task.id === taskIdValue ? {
+      ...task,
+      actions: [...task.actions, { id: taskId("acao"), note, createdAt: new Date().toISOString() }],
+    } : task));
+    setTaskActionDrafts((current) => ({ ...current, [taskIdValue]: "" }));
+  }
   function exportProvision() {
     const summary = provision.rows.map((row) => ({
       "Núcleo": row.nucleus, "Princípio ativo": row.active, Grupo: row.merchandiseGroup, Subgrupo: row.subgroup,
@@ -1000,22 +1241,26 @@ export default function Home() {
       "A entregar": group.totals.toDeliver,
       "Volume solicitado": group.totals.pendingOrder,
     }));
-    const summary = executionRows.map((row) => ({
-      "Princípio ativo": row.active,
-      Ciclo: row.cycles.join(", "),
-      Cultura: row.cultures.join(", "),
-      Núcleo: row.nucleus,
-      Grupo: row.merchandiseGroup,
-      Subgrupo: row.subgroup,
-      "Material padrão": row.standardMaterial,
-      "Material em estoque": row.stockMaterials.join(", "),
-      "Qtd. planejada": row.planned,
-      Saldo: row.farmBalance + row.warehouseBalance,
-      Trânsito: row.transit,
-      Aplicado: row.applied,
-      "A entregar": amountToDeliver(row),
-      "Volume solicitado": row.pendingOrder,
-    }));
+    const summary = executionRows.map((row) => {
+      const conversion = stockConversionBalances.get(row.id);
+      return {
+        "Princípio ativo": row.active,
+        Ciclo: row.cycles.join(", "),
+        Cultura: row.cultures.join(", "),
+        Núcleo: row.nucleus,
+        Grupo: row.merchandiseGroup,
+        Subgrupo: row.subgroup,
+        "Material padrão": row.standardMaterial,
+        "Material em estoque": row.stockMaterials.join(", "),
+        "Qtd. planejada": row.planned,
+        "Saldo convertido": row.farmBalance + row.warehouseBalance,
+        "Saldo físico sem conversão": conversion?.hasConversion ? conversion.physical : "",
+        Trânsito: row.transit,
+        Aplicado: row.applied,
+        "A entregar": amountToDeliver(row),
+        "Volume solicitado": row.pendingOrder,
+      };
+    });
     const details = executionRows.flatMap((row) => consolidateLocations(row.locations).map((location) => ({
       "Princípio ativo": row.active,
       Núcleo: row.nucleus,
@@ -1049,7 +1294,6 @@ export default function Home() {
   const totalApplied = ledger.reduce((sum, row) => sum + row.applied, 0);
   const shortage = consolidatedSupply.shortage;
   const hasData = sourceConfig.some((source) => Boolean(imports[source.key]));
-  const excluded = datasets.execucao.filter((row) => statusExcluded(row, premises.excludedStatus)).length;
 
   let content: ReactNode;
   if (active === "Visão geral") {
@@ -1095,14 +1339,17 @@ export default function Home() {
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
         <table className="w-full min-w-[1300px] text-left text-sm">
           <thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
-            <tr>{["", "Princípio ativo", "Ciclo / cultura", "Núcleo", "Material padrão", "Material em estoque", "Qtd. planejada", "Saldo", "Trânsito", "Aplicado", "A entregar", "V. solicitado"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr>
+            <tr>{["", "Princípio ativo", "Ciclo / cultura", "Núcleo", "Material padrão", "Material em estoque", "Qtd. planejada", "Saldo convertido", "Trânsito", "Aplicado", "A entregar", "V. solicitado"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {monitoringGroups.map((group) => <Fragment key={group.active}>
               <tr className="bg-emerald-50/70 text-emerald-950">
                 <td className="px-3 py-2.5 font-semibold" colSpan={12}>Princípio ativo: {group.active}</td>
               </tr>
-              {group.rows.map((row) => <Fragment key={row.id}>
+              {group.rows.map((row) => {
+                const conversion = stockConversionBalances.get(row.id);
+                const convertedBalance = row.farmBalance + row.warehouseBalance;
+                return <Fragment key={row.id}>
                 <tr>
                   <td className="px-3 py-3"><button aria-label="Expandir materiais" className="rounded border border-slate-200 p-1 text-slate-600" onClick={() => setExpanded(expanded === row.id ? null : row.id)} type="button"><ChevronDown className={cn("h-3.5 w-3.5", expanded === row.id && "rotate-180")} /></button></td>
                   <td className="px-3 py-3 text-slate-400">—</td>
@@ -1111,14 +1358,15 @@ export default function Home() {
                   <td className="px-3 py-3 font-medium">{row.standardMaterial}</td>
                   <td className="px-3 py-3">{row.stockMaterials.join(", ") || "—"}</td>
                   <td className="px-3 py-3">{formatNumber(row.planned)}</td>
-                  <td className="px-3 py-3">{formatNumber(row.farmBalance + row.warehouseBalance)}</td>
+                  <td className="px-3 py-3">{conversion?.hasConversion ? <><span className="inline-flex rounded-md bg-emerald-100 px-2 py-1 font-bold text-emerald-900">{formatNumber(convertedBalance)}</span><span className="mt-1 block text-[11px] text-slate-500">saldo físico: {formatNumber(conversion.physical)}</span></> : formatNumber(convertedBalance)}</td>
                   <td className="px-3 py-3">{formatNumber(row.transit)}</td>
                   <td className="px-3 py-3">{formatNumber(row.applied)}</td>
                   <td className={cn("px-3 py-3 font-semibold", amountToDeliverColor(amountToDeliver(row)))}>{formatNumber(amountToDeliver(row))}</td>
                   <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
                 </tr>
                 {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}
-              </Fragment>)}
+              </Fragment>;
+              })}
               <tr className="border-y border-emerald-200 bg-emerald-50/50 font-semibold text-slate-800">
                 <td className="px-3 py-3" colSpan={6}>Total — {group.active}</td>
                 <td className="px-3 py-3">{formatNumber(group.totals.planned)}</td>
@@ -1202,20 +1450,46 @@ export default function Home() {
       <div className="border-t border-slate-100 p-6"><div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">Relatório de conciliação</h3><p className="mt-1 text-xs text-slate-500">Mostra materiais, descrições e núcleos que não puderam ser conciliados, com a provável ação necessária.</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700 disabled:opacity-50" disabled={!reconciliationIssues.length} onClick={exportReconciliationReport} type="button"><Download className="h-4 w-4" />Exportar relatório</button></div><Table empty="Nenhuma pendência de conciliação encontrada nas fontes importadas." headers={["Fonte", "Material", "Código SAP", "Ocorrências", "Diagnóstico", "Ação sugerida"]} rows={reconciliationIssues.map((issue) => [issue.source, issue.material, issue.code, String(issue.count), issue.detail, issue.action])} /></div>
     </section>;
   } else if (active === "Alertas") {
-    const failures = consolidatedSupply.failures;
-    content = <Table headers={["Tipo", "Situação", "Detalhe"]} rows={[["Ordens excluídas", excluded ? "Atenção" : "Sem registros", String(excluded) + " linhas EXCL não compõem a execução"], ["Conciliação de materiais", materialResolution.described > materialResolution.resolved ? "Atenção" : "Regular", materialResolution.described ? String(materialResolution.resolved) + " de " + String(materialResolution.described) + " descrições resolvidas" : "Importe estoque e dimensões"], ["Ruptura de saldo", failures.length ? "Atenção" : "Sem déficit", failures.length ? String(failures.length) + " materiais com necessidade não atendida" : "Nenhuma falta calculada"], ["Provisionamento", "Disponível", "Defina a janela na Calendarização e exporte o microdetalhe."]]} />;
+    const alertStyle = {
+      attention: "border-amber-200 bg-amber-50 text-amber-950",
+      critical: "border-rose-200 bg-rose-50 text-rose-950",
+      info: "border-sky-200 bg-sky-50 text-sky-950",
+    };
+    const alertLabel = { attention: "Atenção", critical: "Crítico", info: "Informativo" };
+    content = <section className="space-y-5">
+      <div><h2 className="font-semibold">Alertas operacionais</h2><p className="mt-1 text-sm text-slate-500">Prioridades calculadas a partir do planejamento, saldo por localização, execução e validade dos lotes.</p></div>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <Card label="Repasse em até 30 dias" value={supplyAlerts.length} note="sem saldo na fazenda" tone={supplyAlerts.length ? "amber" : "slate"} />
+        <Card label="Aumento de dose > 5%" value={doseIncreaseAlerts.length} note="comparado ao planejado" tone={doseIncreaseAlerts.length ? "amber" : "slate"} />
+        <Card label="Estoque vencido" value={expiredStockAlerts.length} note="fazenda e armazém" tone={expiredStockAlerts.length ? "rose" : "slate"} />
+        <Card label="Farol crítico" value={farol.alert} note="pedidos pendentes há mais de 5 dias" tone={farol.alert ? "rose" : "slate"} />
+      </div>
+      {operationalAlerts.length ? <div className="grid gap-3">{operationalAlerts.map((alert) => <article className={cn("rounded-2xl border p-4", alertStyle[alert.severity])} key={alert.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide opacity-70">{alert.category}</p><h3 className="mt-1 font-semibold">{alert.title}</h3><p className="mt-2 max-w-4xl text-sm leading-relaxed">{alert.detail}</p></div><span className="rounded-full bg-white/80 px-3 py-1 text-xs font-bold">{alertLabel[alert.severity]} · {alert.metric}</span></div></article>)}</div> : <Empty title="Nenhum alerta operacional no momento" description="Com as fontes atualizadas, novos riscos de saldo, dose e validade aparecerão aqui automaticamente." />}
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600"><p className="font-semibold text-slate-800">Sinalização na plataforma</p><p className="mt-1">Os riscos acima já ficam destacados neste painel e no menu lateral. O disparo por e-mail será conectado após a autorização do serviço de envio, preservando destinatários e frequência configuráveis nas Premissas.</p></div>
+    </section>;
   } else if (active === "Tarefas") {
-    content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Tarefas</h2><div className="mt-5 flex gap-2"><input className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTask(event.target.value)} placeholder="Descreva uma ação" value={task} /><button className="rounded-xl bg-emerald-700 px-4 text-sm font-semibold text-white" onClick={() => { if (task.trim()) { setTasks((current) => [...current, task.trim()]); setTask(""); } }} type="button">Adicionar</button></div><div className="mt-5 space-y-2">{tasks.length ? tasks.map((item) => <div className="flex items-center gap-3 rounded-xl bg-slate-50 px-4 py-3 text-sm" key={item}><CheckCircle2 className="h-4 w-4 text-emerald-700" />{item}</div>) : <p className="text-sm text-slate-500">Nenhuma tarefa criada nesta sessão.</p>}</div></section>;
+    const signalStyle = {
+      emerald: "bg-emerald-100 text-emerald-800", sky: "bg-sky-100 text-sky-800", amber: "bg-amber-100 text-amber-900", rose: "bg-rose-100 text-rose-800", slate: "bg-slate-100 text-slate-700",
+    };
+    content = <section className="space-y-5">
+      <div><h2 className="font-semibold">Farol de pedidos pendentes</h2><p className="mt-1 text-sm text-slate-500">A data DtRemPed indica a previsão de utilização na fazenda e orienta a prioridade da equipe responsável.</p></div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Card label="Demanda em até 3 dias" value={farol.demand} note="sinalização antecipada" tone={farol.demand ? "emerald" : "slate"} /><Card label="Possível atraso" value={farol.delay} note="vence hoje ou amanhã" tone={farol.delay ? "amber" : "slate"} /><Card label="Ponto de atenção" value={farol.attention} note="1 a 3 dias em atraso" tone={farol.attention ? "amber" : "slate"} /><Card label="Alerta" value={farol.alert} note="mais de 5 dias em atraso" tone={farol.alert ? "rose" : "slate"} /></div>
+      <Table empty="Importe PEDIDOS PENDENTES para ativar o farol." headers={["Farol", "Previsão", "Pedido", "Material", "Núcleo", "Volume solicitado"]} rows={pendingSignals.map((signal) => [<span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-bold", signalStyle[signal.tone])} key={signal.id}>{signal.status}</span>, signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", signal.reference, signal.material, signal.nucleus, formatNumber(signal.quantity)])} />
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação ao pedido e registre por que o material faltou, está faltando ou pode faltar.</p><div className="mt-4 grid gap-3"><select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select><input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></div>
+        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Histórico de ações</h3><div className="mt-4 space-y-3">{tasks.length ? tasks.slice().reverse().map((item) => { const linked = pendingSignals.find((signal) => signal.id === item.pendingId); return <article className="rounded-xl bg-slate-50 p-4" key={item.id}><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-800">{item.title}</p><p className="mt-1 text-xs text-slate-500">{linked ? `${linked.reference} · ${linked.material} · ${linked.nucleus}` : "Ação geral"} · criado em {formatDateTime(item.createdAt)}</p></div><CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /></div><div className="mt-3 space-y-2 border-l-2 border-emerald-200 pl-3">{item.actions.map((action) => <div key={action.id}><p className="text-sm text-slate-700">{action.note}</p><p className="mt-1 text-[11px] text-slate-500">{formatDateTime(action.createdAt)}</p></div>)}</div><div className="mt-3 flex gap-2"><input className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" onChange={(event) => setTaskActionDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Adicionar atualização" value={taskActionDrafts[item.id] || ""} /><button className="rounded-lg border border-emerald-700 px-3 text-sm font-semibold text-emerald-700" onClick={() => appendTaskAction(item.id)} type="button">Salvar</button></div></article>; }) : <p className="py-10 text-center text-sm text-slate-500">Nenhuma ação registrada ainda.</p>}</div></div>
+      </div>
+    </section>;
   } else if (active === "Usuários") {
     content = <Table headers={["Perfil", "Permissões"]} rows={[["Administrador", "Importações, premissas, usuários e regras"], ["Editor", "Tarefas, alertas e relatórios"], ["Visualizador", "Consulta e exportações autorizadas"]]} />;
   } else {
     content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Gerencie premissas operacionais, dimensões e pedidos pendentes.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></section>;
   }
 
-  return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
+  return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
 
     {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém, trânsito e pedidos pendentes do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Volume solicitado" value={formatNumber(provision.pendingOrder)} note="pedidos pendentes" /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1180px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "V. solicitado", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className="px-4 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-400">—</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={8}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
 
-    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-5xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais e mapeamentos que estão aplicados à conciliação.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator (a quantidade física é dividida).</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}<p className="mt-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-500">Pedidos pendentes são carregados na guia Importações. WBS: [Cultura].[Fazenda].[Safra].[Talhão]-[Índice]; A=1, B=2, C=3, D=4, E=5.</p></div><div className="border-t border-slate-100 px-6 py-5"><div className="mb-4"><h3 className="text-sm font-semibold">Premissas e dimensões aplicadas</h3><p className="mt-1 text-xs text-slate-500">Visão tabulada de todas as regras, vínculos e conversões ativos nesta sessão.</p></div><Table empty="Nenhuma premissa aplicada." headers={["Tipo", "Chave", "Valor aplicado", "Origem"]} rows={appliedPremiseRows} /></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas e salvas neste navegador."); }} type="button">Salvar</button></div></div></div> : null}
+    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais e mapeamentos aplicados à conciliação.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator.</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}</div><div className="border-t border-slate-100 px-6 py-5"><div className="mb-4"><h3 className="text-sm font-semibold">Catálogo de premissas</h3><p className="mt-1 text-xs text-slate-500">Escolha um tipo para consultar os dados em tabela e exportá-los para edição.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">{premiseSections.map((section) => <button className={cn("rounded-xl border p-4 text-left", premiseSection === section.id ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white hover:border-emerald-300")} key={section.id} onClick={() => setPremiseSection(section.id)} type="button"><p className="text-sm font-semibold">{section.title}</p><p className="mt-1 text-xs text-slate-500">{section.rows.length} registros</p></button>)}</div><div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h4 className="font-semibold">{selectedPremiseSection.title}</h4><p className="mt-1 text-xs text-slate-500">{selectedPremiseSection.description}</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportPremiseSection} type="button"><Download className="h-4 w-4" />Exportar para edição</button></div><Table empty="Nenhum registro nesta premissa." headers={selectedPremiseSection.headers} rows={selectedPremiseSection.rows} /></div></div><div className="border-t border-slate-100 px-6 py-5"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4"><p className="text-sm font-semibold text-sky-950">Alertas por e-mail</p><p className="mt-1 text-xs leading-relaxed text-sky-900">A programação de destinatários e frequência será habilitada assim que o serviço de envio for autorizado. A plataforma já sinaliza os alertas operacionais no painel.</p></div></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas e salvas neste navegador."); }} type="button">Salvar</button></div></div></div> : null}
   </main>;
 }
