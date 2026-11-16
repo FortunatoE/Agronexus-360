@@ -39,8 +39,9 @@ type Datasets = Record<SourceKey, Row[]>;
 type ImportSummary = { fileName: string; fileModifiedAt: string; importedAt: string; rows: number; sheets: string[] };
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
+type EmailSettings = { defaultCopy: string; nucleusRecipients: Record<string, string> };
 type TaskAction = { id: string; note: string; createdAt: string };
-type TaskItem = { id: string; pendingId: string; title: string; createdAt: string; actions: TaskAction[] };
+type TaskItem = { id: string; pendingId: string; material?: string; nucleus?: string; title: string; createdAt: string; actions: TaskAction[] };
 type PersistedWorkspace = {
   bundle: DimensionBundle;
   datasets: Datasets;
@@ -48,6 +49,7 @@ type PersistedWorkspace = {
   imports: Partial<Record<ImportKey, ImportSummary>>;
   premises: Premises;
   tasks: TaskItem[] | string[];
+  emailSettings?: EmailSettings;
 };
 type ReconciliationIssue = { action: string; code: string; count: number; detail: string; material: string; source: string };
 type PremiseSection = {
@@ -82,6 +84,7 @@ const workspaceStore = "workspace";
 const workspaceRecord = "current";
 const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [], pedidos: [] };
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
+const initialEmailSettings: EmailSettings = { defaultCopy: "", nucleusRecipients: {} };
 const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header: number }> = [
   { key: "planejamento", title: "Planejamento", hint: "PLANEJAMENTO.xlsx", header: 0 },
   { key: "execucao", title: "Execução SAP", hint: "ZPS007.xlsx", header: 1 },
@@ -165,6 +168,8 @@ function persistedTasks(value: unknown): TaskItem[] {
     return {
       id: candidate.id || `tarefa-${index}`,
       pendingId: candidate.pendingId || "",
+      material: candidate.material || "",
+      nucleus: candidate.nucleus || "",
       title: candidate.title || "Ação sem título",
       createdAt: candidate.createdAt || new Date().toISOString(),
       actions: Array.isArray(candidate.actions) ? candidate.actions.filter((action): action is TaskAction => Boolean(action?.note)).map((action, actionIndex) => ({
@@ -516,6 +521,7 @@ export default function Home() {
   const [importing, setImporting] = useState(false);
   const [bundle, setBundle] = useState<DimensionBundle>(emptyDimensionBundle);
   const [premises, setPremises] = useState<Premises>(initialPremises);
+  const [emailSettings, setEmailSettings] = useState<EmailSettings>(initialEmailSettings);
   const [dimensionPremises, setDimensionPremises] = useState<DimensionPremise[]>([]);
   const [draft, setDraft] = useState<DimensionPremise>({ domain: "Material", key: "", value: "" });
   const [showPremises, setShowPremises] = useState(false);
@@ -530,10 +536,24 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [taskPendingId, setTaskPendingId] = useState("");
+  const [taskLinkMode, setTaskLinkMode] = useState<"pedido" | "material">("pedido");
+  const [taskMaterialLink, setTaskMaterialLink] = useState("");
   const [taskTitle, setTaskTitle] = useState("");
   const [taskNote, setTaskNote] = useState("");
   const [taskActionDrafts, setTaskActionDrafts] = useState<Record<string, string>>({});
   const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [taskSignalFilter, setTaskSignalFilter] = useState("Todos");
+  const [taskOrderFilter, setTaskOrderFilter] = useState("Todos");
+  const [taskNucleusFilter, setTaskNucleusFilter] = useState("Todos");
+  const [taskMaterialFilter, setTaskMaterialFilter] = useState("");
+  const [showNotification, setShowNotification] = useState(false);
+  const [notificationNucleus, setNotificationNucleus] = useState("Todos");
+  const [notificationDays, setNotificationDays] = useState("5");
+  const [notificationTo, setNotificationTo] = useState("");
+  const [notificationCc, setNotificationCc] = useState("");
+  const [notificationMessage, setNotificationMessage] = useState("");
+  const [sendingNotification, setSendingNotification] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"premissas" | "email">("premissas");
   const [storageReady, setStorageReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
   const [clock, setClock] = useState(() => Date.now());
@@ -554,6 +574,7 @@ export default function Home() {
       setDimensionPremises(workspace.dimensionPremises || []);
       setImports(workspace.imports || {});
       setPremises({ ...initialPremises, ...(workspace.premises || {}) });
+      setEmailSettings({ ...initialEmailSettings, ...(workspace.emailSettings || {}), nucleusRecipients: workspace.emailSettings?.nucleusRecipients || {} });
       setTasks(persistedTasks(workspace.tasks));
     }).catch(() => {
       if (active) setPersistenceError("Não foi possível recuperar os dados salvos neste navegador.");
@@ -565,10 +586,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!storageReady) return;
-    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks }).catch(() => {
+    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks, emailSettings }).catch(() => {
       setPersistenceError("Não foi possível salvar esta carga neste navegador.");
     });
-  }, [bundle, datasets, dimensionPremises, imports, premises, storageReady, tasks]);
+  }, [bundle, datasets, dimensionPremises, emailSettings, imports, premises, storageReady, tasks]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 60_000);
@@ -1058,6 +1079,19 @@ export default function Home() {
     alert: pendingSignals.filter((signal) => signal.status === "Alerta").length,
   }), [pendingSignals]);
 
+  const taskNuclei = useMemo(() => ["Todos", ...[...new Set(pendingSignals.map((signal) => signal.nucleus).filter(Boolean))].sort()], [pendingSignals]);
+  const taskOrders = useMemo(() => ["Todos", ...[...new Set(pendingSignals.map((signal) => signal.reference).filter(Boolean))].sort()], [pendingSignals]);
+  const filteredPendingSignals = useMemo(() => {
+    const materialSearch = normalizeMaterial(taskMaterialFilter);
+    return pendingSignals.filter((signal) => (taskSignalFilter === "Todos" || signal.status === taskSignalFilter)
+      && (taskOrderFilter === "Todos" || signal.reference === taskOrderFilter)
+      && (taskNucleusFilter === "Todos" || signal.nucleus === taskNucleusFilter)
+      && (!materialSearch || normalizeMaterial(signal.material).includes(materialSearch)));
+  }, [pendingSignals, taskMaterialFilter, taskNucleusFilter, taskOrderFilter, taskSignalFilter]);
+  const notificationCandidates = useMemo(() => pendingSignals.filter((signal) => signal.daysUntil !== null
+    && signal.daysUntil <= -Number(notificationDays || 0)
+    && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus)), [notificationDays, notificationNucleus, pendingSignals]);
+
   const supplyAlerts = useMemo<OperationalAlert[]>(() => {
     const start = startOfDay(new Date(clock));
     const finish = new Date(start);
@@ -1190,17 +1224,22 @@ export default function Home() {
   function addLinkedTask() {
     if (!taskNote.trim()) return;
     const linked = pendingSignals.find((signal) => signal.id === taskPendingId);
+    const material = taskLinkMode === "pedido" ? linked?.material || "" : taskMaterialLink;
+    const nucleus = taskLinkMode === "pedido" ? linked?.nucleus || "" : "";
     const now = new Date().toISOString();
     setTasks((current) => [...current, {
       id: taskId("tarefa"),
-      pendingId: taskPendingId,
-      title: taskTitle.trim() || (linked ? `Ação para ${linked.material} — ${linked.nucleus}` : "Ação operacional"),
+      pendingId: taskLinkMode === "pedido" ? taskPendingId : "",
+      material,
+      nucleus,
+      title: taskTitle.trim() || (material ? `Ação para ${material}${nucleus ? ` — ${nucleus}` : ""}` : "Ação operacional"),
       createdAt: now,
       actions: [{ id: taskId("acao"), note: taskNote.trim(), createdAt: now }],
     }]);
     setTaskTitle("");
     setTaskNote("");
     setTaskPendingId("");
+    setTaskMaterialLink("");
   }
   function appendTaskAction(taskIdValue: string) {
     const note = taskActionDrafts[taskIdValue]?.trim();
@@ -1210,6 +1249,76 @@ export default function Home() {
       actions: [...task.actions, { id: taskId("acao"), note, createdAt: new Date().toISOString() }],
     } : task));
     setTaskActionDrafts((current) => ({ ...current, [taskIdValue]: "" }));
+  }
+  function openNotification() {
+    const firstNucleus = taskNuclei.length > 1 ? taskNuclei[1] : "Todos";
+    setNotificationNucleus(firstNucleus);
+    setNotificationTo(emailSettings.nucleusRecipients[firstNucleus] || "");
+    setNotificationCc(emailSettings.defaultCopy || "");
+    setNotificationMessage("");
+    setShowNotification(true);
+  }
+  async function sendNotification() {
+    if (!notificationTo.trim() || !notificationCandidates.length) {
+      setNotificationMessage("Informe o destinatário e selecione uma faixa que possua pedidos pendentes.");
+      return;
+    }
+    setSendingNotification(true);
+    setNotificationMessage("");
+    try {
+      const response = await fetch("/api/send-alert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: notificationTo,
+          cc: notificationCc,
+          nucleus: notificationNucleus,
+          threshold: notificationDays,
+          notices: notificationCandidates.map((signal) => ({
+            reference: signal.reference,
+            material: signal.material,
+            nucleus: signal.nucleus,
+            dueDate: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data",
+            delay: signal.daysUntil === null ? "Sem cálculo" : `${Math.abs(signal.daysUntil)} dia(s)`,
+            quantity: formatNumber(signal.quantity),
+          })),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Não foi possível enviar a notificação.");
+      setNotificationMessage(`E-mail enviado com ${notificationCandidates.length} pedido(s) pendente(s).`);
+    } catch (error) {
+      setNotificationMessage(error instanceof Error ? error.message : "Não foi possível enviar a notificação.");
+    } finally {
+      setSendingNotification(false);
+    }
+  }
+  function exportTasks() {
+    const farolRows = filteredPendingSignals.map((signal) => ({
+      Farol: signal.status,
+      Previsão: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data",
+      "Dias para uso": signal.daysUntil ?? "Sem cálculo",
+      Pedido: signal.reference,
+      Material: signal.material,
+      Núcleo: signal.nucleus,
+      "Volume solicitado": signal.quantity,
+    }));
+    const history = tasks.flatMap((task) => task.actions.map((action) => {
+      const linked = pendingSignals.find((signal) => signal.id === task.pendingId);
+      return { Tarefa: task.title, Pedido: linked?.reference || "", Material: linked?.material || "", Núcleo: linked?.nucleus || "", Ação: action.note, "Registrada em": formatDateTime(action.createdAt) };
+    }));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(farolRows), "Farol de pedidos");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(history), "Histórico de ações");
+    XLSX.writeFile(workbook, `tarefas_e_farol_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
+  }
+  function exportAlerts() {
+    const alerts = operationalAlerts.map((alert) => ({ Categoria: alert.category, Prioridade: alert.severity === "critical" ? "Crítico" : alert.severity === "attention" ? "Atenção" : "Informativo", Título: alert.title, Detalhe: alert.detail, Indicador: alert.metric }));
+    const farolRows = pendingSignals.filter((signal) => signal.status !== "Programado" && signal.status !== "Sem data").map((signal) => ({ Farol: signal.status, Pedido: signal.reference, Material: signal.material, Núcleo: signal.nucleus, Previsão: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", "Volume solicitado": signal.quantity }));
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(alerts), "Alertas operacionais");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(farolRows), "Farol de pedidos");
+    XLSX.writeFile(workbook, `alertas_operacionais_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
   }
   function exportProvision() {
     const summary = provision.rows.map((row) => ({
@@ -1457,7 +1566,7 @@ export default function Home() {
     };
     const alertLabel = { attention: "Atenção", critical: "Crítico", info: "Informativo" };
     content = <section className="space-y-5">
-      <div><h2 className="font-semibold">Alertas operacionais</h2><p className="mt-1 text-sm text-slate-500">Prioridades calculadas a partir do planejamento, saldo por localização, execução e validade dos lotes.</p></div>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Alertas operacionais</h2><p className="mt-1 text-sm text-slate-500">Prioridades calculadas a partir do planejamento, saldo por localização, execução e validade dos lotes.</p></div><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={exportAlerts} type="button"><Download className="h-4 w-4" />Exportar Excel</button></div>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card label="Repasse em até 30 dias" value={supplyAlerts.length} note="sem saldo na fazenda" tone={supplyAlerts.length ? "amber" : "slate"} />
         <Card label="Aumento de dose > 5%" value={doseIncreaseAlerts.length} note="comparado ao planejado" tone={doseIncreaseAlerts.length ? "amber" : "slate"} />
@@ -1465,28 +1574,31 @@ export default function Home() {
         <Card label="Farol crítico" value={farol.alert} note="pedidos pendentes há mais de 5 dias" tone={farol.alert ? "rose" : "slate"} />
       </div>
       {operationalAlerts.length ? <div className="grid gap-3">{operationalAlerts.map((alert) => <article className={cn("rounded-2xl border p-4", alertStyle[alert.severity])} key={alert.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide opacity-70">{alert.category}</p><h3 className="mt-1 font-semibold">{alert.title}</h3><p className="mt-2 max-w-4xl text-sm leading-relaxed">{alert.detail}</p></div><span className="rounded-full bg-white/80 px-3 py-1 text-xs font-bold">{alertLabel[alert.severity]} · {alert.metric}</span></div></article>)}</div> : <Empty title="Nenhum alerta operacional no momento" description="Com as fontes atualizadas, novos riscos de saldo, dose e validade aparecerão aqui automaticamente." />}
-      <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600"><p className="font-semibold text-slate-800">Sinalização na plataforma</p><p className="mt-1">Os riscos acima já ficam destacados neste painel e no menu lateral. O disparo por e-mail será conectado após a autorização do serviço de envio, preservando destinatários e frequência configuráveis nas Premissas.</p></div>
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600"><p className="font-semibold text-slate-800">Sinalização na plataforma</p><p className="mt-1">Os riscos acima ficam destacados neste painel e no menu lateral. Para notificar pedidos por núcleo, use a ação de e-mail na guia Tarefas.</p></div>
     </section>;
   } else if (active === "Tarefas") {
     const signalStyle = {
       emerald: "bg-emerald-100 text-emerald-800", sky: "bg-sky-100 text-sky-800", amber: "bg-amber-100 text-amber-900", rose: "bg-rose-100 text-rose-800", slate: "bg-slate-100 text-slate-700",
     };
     content = <section className="space-y-5">
-      <div><h2 className="font-semibold">Farol de pedidos pendentes</h2><p className="mt-1 text-sm text-slate-500">A data DtRemPed indica a previsão de utilização na fazenda e orienta a prioridade da equipe responsável.</p></div>
+      <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Farol de pedidos pendentes</h2><p className="mt-1 text-sm text-slate-500">A data DtRemPed indica a previsão de utilização na fazenda e orienta a prioridade da equipe responsável.</p></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={exportTasks} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-3 py-2 text-sm font-semibold text-white" onClick={openNotification} type="button"><Bell className="h-4 w-4" />Notificar por e-mail</button></div></div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Card label="Demanda em até 3 dias" value={farol.demand} note="sinalização antecipada" tone={farol.demand ? "emerald" : "slate"} /><Card label="Possível atraso" value={farol.delay} note="vence hoje ou amanhã" tone={farol.delay ? "amber" : "slate"} /><Card label="Ponto de atenção" value={farol.attention} note="1 a 3 dias em atraso" tone={farol.attention ? "amber" : "slate"} /><Card label="Alerta" value={farol.alert} note="mais de 5 dias em atraso" tone={farol.alert ? "rose" : "slate"} /></div>
-      <Table empty="Importe PEDIDOS PENDENTES para ativar o farol." headers={["Farol", "Previsão", "Pedido", "Material", "Núcleo", "Volume solicitado"]} rows={pendingSignals.map((signal) => [<span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-bold", signalStyle[signal.tone])} key={signal.id}>{signal.status}</span>, signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", signal.reference, signal.material, signal.nucleus, formatNumber(signal.quantity)])} />
+      <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-4"><label className="grid gap-1 text-xs font-semibold text-slate-600">Farol<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskSignalFilter(event.target.value)} value={taskSignalFilter}>{["Todos", "Demanda próxima", "Possível atraso", "Ponto de atenção", "Alerta", "Programado", "Sem data"].map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskOrderFilter(event.target.value)} value={taskOrderFilter}>{taskOrders.map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Núcleo<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskNucleusFilter(event.target.value)} value={taskNucleusFilter}>{taskNuclei.map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Material<input className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskMaterialFilter(event.target.value)} placeholder="Digite para filtrar" value={taskMaterialFilter} /></label></div>
+      <Table empty="Nenhum pedido atende aos filtros selecionados." headers={["Farol", "Previsão", "Pedido", "Material", "Núcleo", "Volume solicitado"]} rows={filteredPendingSignals.map((signal) => [<span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-bold", signalStyle[signal.tone])} key={signal.id}>{signal.status}</span>, signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", signal.reference, signal.material, signal.nucleus, formatNumber(signal.quantity)])} />
       <div className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação ao pedido e registre por que o material faltou, está faltando ou pode faltar.</p><div className="mt-4 grid gap-3"><select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select><input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></div>
-        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Histórico de ações</h3><div className="mt-4 space-y-3">{tasks.length ? tasks.slice().reverse().map((item) => { const linked = pendingSignals.find((signal) => signal.id === item.pendingId); return <article className="rounded-xl bg-slate-50 p-4" key={item.id}><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-800">{item.title}</p><p className="mt-1 text-xs text-slate-500">{linked ? `${linked.reference} · ${linked.material} · ${linked.nucleus}` : "Ação geral"} · criado em {formatDateTime(item.createdAt)}</p></div><CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /></div><div className="mt-3 space-y-2 border-l-2 border-emerald-200 pl-3">{item.actions.map((action) => <div key={action.id}><p className="text-sm text-slate-700">{action.note}</p><p className="mt-1 text-[11px] text-slate-500">{formatDateTime(action.createdAt)}</p></div>)}</div><div className="mt-3 flex gap-2"><input className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" onChange={(event) => setTaskActionDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Adicionar atualização" value={taskActionDrafts[item.id] || ""} /><button className="rounded-lg border border-emerald-700 px-3 text-sm font-semibold text-emerald-700" onClick={() => appendTaskAction(item.id)} type="button">Salvar</button></div></article>; }) : <p className="py-10 text-center text-sm text-slate-500">Nenhuma ação registrada ainda.</p>}</div></div>
+        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação a um pedido específico ou agrupe o acompanhamento por material.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-xs font-semibold text-slate-600">Vincular por<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskLinkMode(event.target.value as "pedido" | "material")} value={taskLinkMode}><option value="pedido">Pedido pendente</option><option value="material">Material</option></select></label>{taskLinkMode === "pedido" ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select></label> : <label className="grid gap-1 text-xs font-semibold text-slate-600">Material<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskMaterialLink(event.target.value)} value={taskMaterialLink}><option value="">Selecione o material</option>{[...new Set(pendingSignals.map((signal) => signal.material))].sort().map((material) => <option key={material}>{material}</option>)}</select></label>}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></div>
+        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Histórico de ações</h3><div className="mt-4 space-y-3">{tasks.length ? tasks.slice().reverse().map((item) => { const linked = pendingSignals.find((signal) => signal.id === item.pendingId); const reference = linked ? `${linked.reference} · ${linked.material} · ${linked.nucleus}` : item.material ? `${item.material}${item.nucleus ? ` · ${item.nucleus}` : ""}` : "Ação geral"; return <article className="rounded-xl bg-slate-50 p-4" key={item.id}><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-800">{item.title}</p><p className="mt-1 text-xs text-slate-500">{reference} · criado em {formatDateTime(item.createdAt)}</p></div><CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /></div><div className="mt-3 space-y-2 border-l-2 border-emerald-200 pl-3">{item.actions.map((action) => <div key={action.id}><p className="text-sm text-slate-700">{action.note}</p><p className="mt-1 text-[11px] text-slate-500">{formatDateTime(action.createdAt)}</p></div>)}</div><div className="mt-3 flex gap-2"><input className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" onChange={(event) => setTaskActionDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Adicionar atualização" value={taskActionDrafts[item.id] || ""} /><button className="rounded-lg border border-emerald-700 px-3 text-sm font-semibold text-emerald-700" onClick={() => appendTaskAction(item.id)} type="button">Salvar</button></div></article>; }) : <p className="py-10 text-center text-sm text-slate-500">Nenhuma ação registrada ainda.</p>}</div></div>
       </div>
     </section>;
   } else if (active === "Usuários") {
     content = <Table headers={["Perfil", "Permissões"]} rows={[["Administrador", "Importações, premissas, usuários e regras"], ["Editor", "Tarefas, alertas e relatórios"], ["Visualizador", "Consulta e exportações autorizadas"]]} />;
   } else {
-    content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Gerencie premissas operacionais, dimensões e pedidos pendentes.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></section>;
+    content = <section className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Padronize premissas e destinatários das notificações por núcleo.</p></div><div className="flex gap-2 border-b border-slate-100 px-6 pt-4"><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "premissas" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("premissas")} type="button">Premissas</button><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "email" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("email")} type="button">E-mails por núcleo</button></div>{settingsTab === "premissas" ? <div className="p-6"><p className="text-sm text-slate-500">Ajuste dimensões, conversões e regras aplicadas às análises.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></div> : <div className="space-y-5 p-6"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-950"><p className="font-semibold">Envio por domínio corporativo</p><p className="mt-1 text-xs">Os destinatários abaixo são sugeridos no envio manual de alertas. Use endereços internos @agroboaesperanca.com.br, separados por vírgula.</p></div><label className="grid max-w-xl gap-1.5 text-sm font-medium">Cópia padrão (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, defaultCopy: event.target.value }))} placeholder="planejamento@agroboaesperanca.com.br" value={emailSettings.defaultCopy} /></label><div><h3 className="text-sm font-semibold">Destinatário padrão por núcleo</h3><div className="mt-3 grid gap-3 md:grid-cols-2">{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <label className="grid gap-1.5 text-sm font-medium" key={nucleus}>{nucleus}<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, nucleusRecipients: { ...current.nucleusRecipients, [nucleus]: event.target.value } }))} placeholder={`responsavel.${nucleus.toLowerCase()}@agroboaesperanca.com.br`} value={emailSettings.nucleusRecipients[nucleus] || ""} /></label>)}</div>{taskNuclei.length === 1 ? <p className="mt-3 text-sm text-slate-500">Os núcleos aparecem após a importação de pedidos pendentes.</p> : null}</div></div>}</section>;
   }
 
   return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
+
+    {showNotification ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Notificar pedidos pendentes</h2><p className="mt-1 text-xs text-slate-500">O e-mail lista os pedidos em atraso da faixa selecionada para o núcleo.</p></div><button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Núcleo<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => { const nucleus = event.target.value; setNotificationNucleus(nucleus); setNotificationTo(emailSettings.nucleusRecipients[nucleus] || ""); }} value={notificationNucleus}><option>Todos</option>{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1.5 text-sm font-medium">Notificar atrasos a partir de<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationDays(event.target.value)} value={notificationDays}><option value="1">1 dia</option><option value="3">3 dias</option><option value="5">5 dias</option><option value="10">10 dias</option></select></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Para<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationTo(event.target.value)} placeholder="responsavel@agroboaesperanca.com.br" value={notificationTo} /></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Cópia (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@agroboaesperanca.com.br" value={notificationCc} /></label></div><div className="border-t border-slate-100 px-6 py-4"><div className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-950"><strong>{notificationCandidates.length} pedido(s)</strong> serão incluídos no aviso. O envio aceita endereços internos @agroboaesperanca.com.br.</div>{notificationMessage ? <p className={cn("mt-3 text-sm", notificationMessage.startsWith("E-mail enviado") ? "text-emerald-700" : "text-rose-700")}>{notificationMessage}</p> : null}<div className="mt-4 flex justify-end gap-2"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={sendingNotification || !notificationCandidates.length} onClick={sendNotification} type="button">{sendingNotification ? "Enviando..." : "Enviar e-mail"}</button></div></div></div></div> : null}
 
     {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém, trânsito e pedidos pendentes do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Volume solicitado" value={formatNumber(provision.pendingOrder)} note="pedidos pendentes" /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1180px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "V. solicitado", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className="px-4 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-400">—</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={8}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
 
