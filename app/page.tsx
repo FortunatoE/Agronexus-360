@@ -40,6 +40,7 @@ type ImportSummary = { fileName: string; fileModifiedAt: string; importedAt: str
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
 type EmailSettings = { defaultCopy: string; nucleusRecipients: Record<string, string> };
+type DashboardSettings = { daeCycle: "Safra" | "Safrinha" | "Ambos" };
 type TaskAction = { id: string; note: string; createdAt: string };
 type TaskItem = { id: string; pendingId: string; material?: string; nucleus?: string; title: string; createdAt: string; actions: TaskAction[] };
 type PersistedWorkspace = {
@@ -50,6 +51,7 @@ type PersistedWorkspace = {
   premises: Premises;
   tasks: TaskItem[] | string[];
   emailSettings?: EmailSettings;
+  dashboardSettings?: DashboardSettings;
 };
 type ReconciliationIssue = { action: string; code: string; count: number; detail: string; material: string; source: string };
 type PremiseSection = {
@@ -85,6 +87,7 @@ const workspaceRecord = "current";
 const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [], pedidos: [] };
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
 const initialEmailSettings: EmailSettings = { defaultCopy: "", nucleusRecipients: {} };
+const initialDashboardSettings: DashboardSettings = { daeCycle: "Safra" };
 const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header: number }> = [
   { key: "planejamento", title: "Planejamento", hint: "PLANEJAMENTO.xlsx", header: 0 },
   { key: "execucao", title: "Execução SAP", hint: "ZPS007.xlsx", header: 1 },
@@ -389,6 +392,7 @@ function AnalysisFilters({
 type DemandRow = ReconciliationRow & { demand: number; local: number };
 type WarehouseAllocation = { allocated: number; locations: ReconciliationRow["locations"] };
 type MonitoringRow = ReconciliationRow & { isWarehouseView?: boolean };
+type PhysicalStockBalance = { converted: number; physical: number; hasConversion: boolean };
 type MonitoringGroup = {
   active: string;
   rows: MonitoringRow[];
@@ -481,7 +485,11 @@ function consolidateLocations(locations: ReconciliationRow["locations"]) {
   return [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location) || left.type.localeCompare(right.type));
 }
 
-function StockDetails({ row }: { row: MonitoringRow }) {
+function stockDetailKey(rowId: string, location: ReconciliationRow["locations"][number]) {
+  return [rowId, normalizeMaterial(location.material), location.type, location.location].join("\u0000");
+}
+
+function StockDetails({ row, physicalBalances }: { row: MonitoringRow; physicalBalances: Map<string, PhysicalStockBalance> }) {
   const groups = new Map<string, { balance: number; locations: ReconciliationRow["locations"]; transit: number }>();
   row.locations.forEach((location) => {
     const current = groups.get(location.material) || { balance: 0, locations: [], transit: 0 };
@@ -501,9 +509,12 @@ function StockDetails({ row }: { row: MonitoringRow }) {
           // A ZMM_BATCH possui uma linha por lote. A visão operacional soma os
           // lotes quando material, tipo de saldo e localização são os mesmos.
           const locations = consolidateLocations(detail.locations);
+          const locationBalances = locations.map((location) => ({ location, balance: physicalBalances.get(stockDetailKey(row.id, location)) }));
+          const hasConversion = locationBalances.some(({ balance }) => balance?.hasConversion);
+          const physicalBalance = locationBalances.reduce((sum, { location, balance }) => sum + (location.type === "Trânsito" ? 0 : balance?.physical || 0), 0);
           return [
-            <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material</td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
-            ...locations.map((location) => <tr key={["location", material, location.type, location.location].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : formatNumber(location.amount)}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
+            <tr className="bg-emerald-50/40" key={"material|" + material}><td className="px-3 py-2 font-semibold">Material<br /><span className={cn("text-[10px]", hasConversion ? "text-emerald-800" : "text-slate-500")}>{hasConversion ? "Com conversão" : "Sem conversão"}</span></td><td className="px-3 py-2 font-semibold">{material}</td><td className="px-3 py-2">{formatNumber(detail.balance)}{hasConversion ? <span className="mt-1 block text-[10px] font-semibold text-emerald-800">Físico: {formatNumber(physicalBalance)}</span> : null}</td><td className="px-3 py-2">{formatNumber(detail.transit)}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-500">{row.isWarehouseView ? "Estoque de armazém" : "Estoque do núcleo"}</td></tr>,
+            ...locationBalances.map(({ location, balance }) => <tr key={["location", material, location.type, location.location].join("|")}><td className="px-3 py-2 pl-7 text-slate-500">↳ Local{balance?.hasConversion ? <span className="block text-[10px] font-semibold text-emerald-800">Convertido</span> : null}</td><td className="px-3 py-2">{location.material}</td><td className="px-3 py-2">{location.type === "Trânsito" ? "—" : <>{formatNumber(location.amount)}{balance?.hasConversion ? <span className="mt-1 block text-[10px] font-semibold text-emerald-800">Físico: {formatNumber(balance.physical)}</span> : null}</>}</td><td className="px-3 py-2">{location.type === "Trânsito" ? formatNumber(location.amount) : "—"}</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-400">—</td><td className="px-3 py-2 text-slate-600">{location.location}</td></tr>),
           ];
         })}
         {!materials.length ? <tr><td className="px-3 py-5 text-center text-slate-500" colSpan={8}>Não há saldo ou trânsito detalhado para este material.</td></tr> : null}
@@ -522,6 +533,7 @@ export default function Home() {
   const [bundle, setBundle] = useState<DimensionBundle>(emptyDimensionBundle);
   const [premises, setPremises] = useState<Premises>(initialPremises);
   const [emailSettings, setEmailSettings] = useState<EmailSettings>(initialEmailSettings);
+  const [dashboardSettings, setDashboardSettings] = useState<DashboardSettings>(initialDashboardSettings);
   const [dimensionPremises, setDimensionPremises] = useState<DimensionPremise[]>([]);
   const [draft, setDraft] = useState<DimensionPremise>({ domain: "Material", key: "", value: "" });
   const [showPremises, setShowPremises] = useState(false);
@@ -575,6 +587,7 @@ export default function Home() {
       setImports(workspace.imports || {});
       setPremises({ ...initialPremises, ...(workspace.premises || {}) });
       setEmailSettings({ ...initialEmailSettings, ...(workspace.emailSettings || {}), nucleusRecipients: workspace.emailSettings?.nucleusRecipients || {} });
+      setDashboardSettings({ ...initialDashboardSettings, ...(workspace.dashboardSettings || {}) });
       setTasks(persistedTasks(workspace.tasks));
     }).catch(() => {
       if (active) setPersistenceError("Não foi possível recuperar os dados salvos neste navegador.");
@@ -586,10 +599,10 @@ export default function Home() {
 
   useEffect(() => {
     if (!storageReady) return;
-    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks, emailSettings }).catch(() => {
+    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks, emailSettings, dashboardSettings }).catch(() => {
       setPersistenceError("Não foi possível salvar esta carga neste navegador.");
     });
-  }, [bundle, datasets, dimensionPremises, emailSettings, imports, premises, storageReady, tasks]);
+  }, [bundle, dashboardSettings, datasets, dimensionPremises, emailSettings, imports, premises, storageReady, tasks]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 60_000);
@@ -628,6 +641,27 @@ export default function Home() {
       current.physical += physical;
       current.hasConversion ||= Math.abs(physical - converted) > 0.000_001;
       balances.set(id, current);
+    });
+    return balances;
+  }, [dimensions, farmToNucleus, stockRows]);
+  const stockLocationConversionBalances = useMemo(() => {
+    const balances = new Map<string, PhysicalStockBalance>();
+    stockRows.forEach((row) => {
+      const product = productFor(row, "stock", dimensions);
+      if (product.rawName === "Sem descrição") return;
+      const physical = quantityFor(row, "stock");
+      if (!physical) return;
+      const nucleus = stockNucleusFor(row, dimensions, farmToNucleus);
+      const stockLocation = stockLocationFor(row, nucleus);
+      const rowId = `${product.canonicalKey}|${normalizeMaterial(stockLocation.type === "Armazém" ? "ARMAZEM" : nucleus)}`;
+      const converted = standardAmount(physical, product, dimensions);
+      const location = { amount: converted, location: stockLocation.place, material: product.rawName, type: stockLocation.type } as ReconciliationRow["locations"][number];
+      const key = stockDetailKey(rowId, location);
+      const current = balances.get(key) || { converted: 0, physical: 0, hasConversion: false };
+      current.converted += converted;
+      current.physical += physical;
+      current.hasConversion ||= Math.abs(physical - converted) > 0.000_001;
+      balances.set(key, current);
     });
     return balances;
   }, [dimensions, farmToNucleus, stockRows]);
@@ -701,7 +735,7 @@ export default function Home() {
       {
         id: "operacionais", title: "Regras operacionais", description: "Parâmetros que guiam as análises e conciliações.",
         headers: ["Premissa", "Valor"],
-        rows: [["Tolerância de desvio", premises.tolerance + "%"], ["Amostra mínima", premises.sample], ["Janelas de demanda", premises.horizon], ["Status excluído", premises.excludedStatus]],
+        rows: [["Tolerância de desvio", premises.tolerance + "%"], ["Amostra mínima", premises.sample], ["Janelas de demanda", premises.horizon], ["Status excluído", premises.excludedStatus], ["Ciclo exibido na visão DAE", dashboardSettings.daeCycle]],
       },
       {
         id: "materiais", title: "Materiais e princípios ativos", description: "Material físico, material agregado e classificação utilizada nas visões.",
@@ -727,7 +761,7 @@ export default function Home() {
         }),
       },
     ];
-  }, [dimensions, premises]);
+  }, [dashboardSettings.daeCycle, dimensions, premises]);
   const selectedPremiseSection = premiseSections.find((section) => section.id === premiseSection) || premiseSections[0];
 
   const groupedProgress = useMemo(() => {
@@ -759,6 +793,46 @@ export default function Home() {
       .filter((row) => headerKey(readText(row, "Cultura", "WBS element", "WBS")).includes(crop.code))
       .reduce((sum, row) => sum + readNumber(row, "Área Executada", "Area Executada", "Qtde. executada"), 0),
   })), [datasets.execucao]);
+
+  const daeByNucleus = useMemo(() => {
+    type DaeGroup = { nucleus: string; culture: string; cycle: string; totalArea: number; dates: Map<string, { area: number; date: Date }> };
+    const groups = new Map<string, DaeGroup>();
+    plans.forEach((row) => {
+      const cycle = cycleFor(row, dimensions);
+      if (dashboardSettings.daeCycle !== "Ambos" && cycle !== dashboardSettings.daeCycle) return;
+      const culture = cultureFor(row);
+      const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
+      const area = planningArea(row);
+      const key = [nucleus, culture, cycle].join("|");
+      const group = groups.get(key) || { nucleus, culture, cycle, totalArea: 0, dates: new Map() };
+      group.totalArea += area;
+      const plantingDate = dateFromPlan(readText(row, "Data de plantio", "Data Plantio", "Dt. Plantio", "Dt Plantio", "DT_Plantio", "DATA_PLANTIO", "Plantio"));
+      if (plantingDate) {
+        const dateKeyValue = dateKey(plantingDate);
+        const dateGroup = group.dates.get(dateKeyValue) || { area: 0, date: plantingDate };
+        dateGroup.area += area;
+        group.dates.set(dateKeyValue, dateGroup);
+      }
+      groups.set(key, group);
+    });
+    const nucleusGroups = new Map<string, Array<{ area: number; culture: string; cycle: string; days: number; plantedAt: Date; share: number }>>();
+    groups.forEach((group) => group.dates.forEach((dateGroup) => {
+      const entries = nucleusGroups.get(group.nucleus) || [];
+      entries.push({
+        area: dateGroup.area,
+        culture: group.culture,
+        cycle: group.cycle,
+        days: Math.max(0, -daysFromToday(dateGroup.date, new Date(clock))),
+        plantedAt: dateGroup.date,
+        share: group.totalArea ? dateGroup.area * 100 / group.totalArea : 0,
+      });
+      nucleusGroups.set(group.nucleus, entries);
+    }));
+    return [...nucleusGroups.entries()].map(([nucleus, entries]) => ({
+      nucleus,
+      entries: entries.sort((left, right) => right.days - left.days || right.area - left.area),
+    })).sort((left, right) => left.nucleus.localeCompare(right.nucleus));
+  }, [clock, dashboardSettings.daeCycle, dimensions, farmToNucleus, plans]);
 
   const filters = useMemo(() => ({
     cycles: ["Todos", ...new Set(ledger.flatMap((row) => row.cycles))],
@@ -1415,6 +1489,7 @@ export default function Home() {
       </div>
       <div className="grid gap-5 xl:grid-cols-2">{groupedProgress.map((group) => <div className="rounded-2xl border border-slate-200 bg-white p-5" key={group.cycle}><div className="mb-4 flex items-center justify-between"><div><h2 className="font-semibold">Execução por subgrupo — {group.cycle}</h2><p className="mt-1 text-xs text-slate-500">Planejado x aplicado, separado por grupo e subgrupo.</p></div><BarChart3 className="h-5 w-5 text-emerald-700" /></div><div className="space-y-4">{group.rows.length ? group.rows.map((row) => <div key={row.group + "|" + row.subgroup}><div className="mb-1.5 flex items-end justify-between gap-3"><p className="text-sm font-medium">{row.subgroup} <span className="text-xs font-normal text-slate-500">{row.group}</span></p><p className="text-xs font-semibold text-slate-700">{percent(row.applied, row.planned).toFixed(1)}%</p></div><Progress value={percent(row.applied, row.planned)} /><p className="mt-1 text-xs text-slate-500">{formatNumber(row.applied)} aplicado de {formatNumber(row.planned)} planejado</p></div>) : <p className="py-8 text-center text-sm text-slate-500">Sem linhas conciliadas para este ciclo.</p>}</div></div>)}</div>
       <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4"><h2 className="font-semibold">Macro por cultura</h2><p className="mt-1 text-xs text-slate-500">Área executada registrada no ZPS007, por safra e safrinha.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{macroCrop.map((crop) => <div className="rounded-xl bg-slate-50 p-4" key={crop.code}><p className="text-xs font-semibold text-emerald-700">{crop.cycle}</p><p className="mt-1 font-semibold">{crop.name}</p><p className="mt-3 text-lg font-bold">{formatNumber(crop.applied)}</p><p className="text-xs text-slate-500">área executada registrada</p></div>)}</div></div>
+      {daeByNucleus.length ? <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">DAE por núcleo</h2><p className="mt-1 text-xs text-slate-500">Idade desde a data de plantio registrada no planejamento, por cultura e núcleo.</p></div><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-800">Ciclo: {dashboardSettings.daeCycle}</span></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{daeByNucleus.map(({ nucleus, entries }) => <article className="rounded-xl border border-slate-200 bg-slate-50 p-4" key={nucleus}><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Núcleo</p><h3 className="mt-1 font-semibold">{nucleus}</h3></div><div className="rounded-lg bg-white px-3 py-2 text-right shadow-sm"><p className="text-xl font-bold text-emerald-800">{entries[0]?.days} DAE</p><p className="text-[10px] text-slate-500">mais antigo</p></div></div><div className="mt-4 space-y-3">{entries.slice(0, 4).map((entry) => <div className="border-t border-slate-200 pt-3" key={[entry.culture, entry.cycle, dateKey(entry.plantedAt)].join("|")}><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{entry.culture}</p><p className="text-xs text-slate-500">{entry.cycle} · plantio em {new Intl.DateTimeFormat("pt-BR").format(entry.plantedAt)}</p></div><p className="text-right text-sm font-bold text-slate-800">{entry.days} DAE<br /><span className="text-xs font-normal text-slate-500">{formatNumber(entry.area)} ha · {entry.share.toFixed(1)}%</span></p></div></div>)}{entries.length > 4 ? <p className="text-xs text-slate-500">+ {entries.length - 4} datas de plantio neste núcleo</p> : null}</div></article>)}</div></div> : <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-5 text-sm text-slate-500">A visão DAE será ativada quando o Planejamento contiver a data de plantio reconhecida para o ciclo selecionado.</div>}
       {materialResolution.described > materialResolution.resolved ? <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><p><strong>Conciliação incompleta:</strong> {materialResolution.described - materialResolution.resolved} descrições não estão nas dimensões. Elas são identificadas, mas nunca viram uma chave pelo código SAP.</p></div> : null}
     </section> : <Empty title="Comece pela importação" description="Carregue Planejamento, CN52, ZMM_BATCH, MB52 e MB5T. Depois envie Dimensões para conciliar materiais pelo nome." />;
   } else if (active === "Calendarização") {
@@ -1473,7 +1548,7 @@ export default function Home() {
                   <td className={cn("px-3 py-3 font-semibold", amountToDeliverColor(amountToDeliver(row)))}>{formatNumber(amountToDeliver(row))}</td>
                   <td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td>
                 </tr>
-                {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails row={row} /></td></tr> : null}
+                {expanded === row.id ? <tr><td className="bg-emerald-50 px-5 py-4 text-xs text-emerald-950" colSpan={12}><StockDetails physicalBalances={stockLocationConversionBalances} row={row} /></td></tr> : null}
               </Fragment>;
               })}
               <tr className="border-y border-emerald-200 bg-emerald-50/50 font-semibold text-slate-800">
@@ -1594,6 +1669,14 @@ export default function Home() {
     content = <Table headers={["Perfil", "Permissões"]} rows={[["Administrador", "Importações, premissas, usuários e regras"], ["Editor", "Tarefas, alertas e relatórios"], ["Visualizador", "Consulta e exportações autorizadas"]]} />;
   } else {
     content = <section className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Padronize premissas e destinatários das notificações por núcleo.</p></div><div className="flex gap-2 border-b border-slate-100 px-6 pt-4"><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "premissas" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("premissas")} type="button">Premissas</button><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "email" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("email")} type="button">E-mails por núcleo</button></div>{settingsTab === "premissas" ? <div className="p-6"><p className="text-sm text-slate-500">Ajuste dimensões, conversões e regras aplicadas às análises.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></div> : <div className="space-y-5 p-6"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-950"><p className="font-semibold">Envio por domínio corporativo</p><p className="mt-1 text-xs">Os destinatários abaixo são sugeridos no envio manual de alertas. Use endereços internos @agroboaesperanca.com.br, separados por vírgula.</p></div><label className="grid max-w-xl gap-1.5 text-sm font-medium">Cópia padrão (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, defaultCopy: event.target.value }))} placeholder="planejamento@agroboaesperanca.com.br" value={emailSettings.defaultCopy} /></label><div><h3 className="text-sm font-semibold">Destinatário padrão por núcleo</h3><div className="mt-3 grid gap-3 md:grid-cols-2">{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <label className="grid gap-1.5 text-sm font-medium" key={nucleus}>{nucleus}<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, nucleusRecipients: { ...current.nucleusRecipients, [nucleus]: event.target.value } }))} placeholder={`responsavel.${nucleus.toLowerCase()}@agroboaesperanca.com.br`} value={emailSettings.nucleusRecipients[nucleus] || ""} /></label>)}</div>{taskNuclei.length === 1 ? <p className="mt-3 text-sm text-slate-500">Os núcleos aparecem após a importação de pedidos pendentes.</p> : null}</div></div>}</section>;
+  }
+
+  if (active === "Configurações") {
+    content = <section className="rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Padronize as visões operacionais e os destinatários das notificações por núcleo.</p></div>
+      <div className="flex gap-2 border-b border-slate-100 px-6 pt-4"><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "premissas" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("premissas")} type="button">Visões e premissas</button><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "email" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("email")} type="button">E-mails por núcleo</button></div>
+      {settingsTab === "premissas" ? <div className="space-y-5 p-6"><div className="max-w-xl rounded-xl border border-emerald-200 bg-emerald-50 p-4"><label className="grid gap-1.5 text-sm font-semibold text-emerald-950">Ciclo exibido na visão DAE<select className="rounded-xl border border-emerald-200 bg-white px-3 py-2.5 text-sm font-normal text-slate-800" onChange={(event) => setDashboardSettings({ daeCycle: event.target.value as DashboardSettings["daeCycle"] })} value={dashboardSettings.daeCycle}><option>Safra</option><option>Safrinha</option><option>Ambos</option></select></label><p className="mt-2 text-xs text-emerald-900">A visão geral mostrará a idade desde o plantio por núcleo apenas para o ciclo escolhido.</p></div><div><p className="text-sm text-slate-500">Ajuste dimensões, conversões e regras que sustentam as análises.</p><button className="mt-4 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></div></div> : <div className="space-y-5 p-6"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-950"><p className="font-semibold">Envio por domínio corporativo</p><p className="mt-1 text-xs">Os destinatários abaixo são sugeridos no envio manual de alertas. Use endereços internos @agroboaesperanca.com.br, separados por vírgula.</p></div><label className="grid max-w-xl gap-1.5 text-sm font-medium">Cópia padrão (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, defaultCopy: event.target.value }))} placeholder="planejamento@agroboaesperanca.com.br" value={emailSettings.defaultCopy} /></label><div><h3 className="text-sm font-semibold">Destinatário padrão por núcleo</h3><div className="mt-3 grid gap-3 md:grid-cols-2">{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <label className="grid gap-1.5 text-sm font-medium" key={nucleus}>{nucleus}<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, nucleusRecipients: { ...current.nucleusRecipients, [nucleus]: event.target.value } }))} placeholder={`responsavel.${nucleus.toLowerCase()}@agroboaesperanca.com.br`} value={emailSettings.nucleusRecipients[nucleus] || ""} /></label>)}</div>{taskNuclei.length === 1 ? <p className="mt-3 text-sm text-slate-500">Os núcleos aparecem após a importação de pedidos pendentes.</p> : null}</div></div>}
+    </section>;
   }
 
   return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
