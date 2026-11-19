@@ -461,35 +461,39 @@ table {
 
 .pacman-loader path {
   fill: #fde047;
-  transform-box: fill-box;
+  transform-box: view-box;
   transform-origin: center;
+  transform: rotate(var(--pacman-open-angle));
   animation: pacman-chomp 0.75s ease-in-out infinite;
 }
+
+.pacman-jaw-upper { --pacman-open-angle: -36deg; }
+.pacman-jaw-lower { --pacman-open-angle: 36deg; }
 
 .pacman-dot {
   position: absolute;
   top: 25px;
+  left: 0;
   width: 9px;
   height: 9px;
   border-radius: 999px;
   background: #a7f3d0;
-  animation: pacman-dots 1.2s linear infinite;
+  transform: translateX(var(--pacman-dot-rest));
+  animation: pacman-dots 2.25s linear infinite;
 }
 
-.pacman-dot-one { left: 76px; }
-.pacman-dot-two { left: 112px; animation-delay: 0.2s; }
-.pacman-dot-three { left: 148px; animation-delay: 0.4s; }
+.pacman-dot-one { --pacman-dot-rest: 76px; animation-delay: -1.875s; }
+.pacman-dot-two { --pacman-dot-rest: 112px; animation-delay: -1.125s; }
+.pacman-dot-three { --pacman-dot-rest: 148px; animation-delay: -0.375s; }
 
 @keyframes pacman-chomp {
-  0%, 100% { transform: scaleY(1); }
-  50% { transform: scaleY(0.88); }
+  50% { transform: rotate(0deg); }
 }
 
 @keyframes pacman-dots {
-  0% { opacity: 0; transform: translateX(20px) scale(0.65); }
-  25% { opacity: 1; }
-  85% { opacity: 1; }
-  100% { opacity: 0; transform: translateX(-60px) scale(0.65); }
+  0% { opacity: 0; transform: translateX(168px); }
+  10%, 92% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(20px); }
 }
 
 @media (prefers-reduced-motion: reduce) {
