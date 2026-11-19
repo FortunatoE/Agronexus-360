@@ -28,18 +28,22 @@ function formatCalendarMonth(month: string) {
   return `${monthNames[Number(month.slice(5)) - 1]}/${month.slice(2, 4)}`;
 }
 
-function seasonPeriod(year: number): ClosingCalendarPeriod {
-  return { start: `${year}-04`, end: `${year + 1}-08` };
+function seasonPeriod(monthKey: string): ClosingCalendarPeriod {
+  const [year, month] = monthKey.split("-").map(Number);
+  const startYear = year - (month < 4 ? 1 : 0);
+  return { start: `${startYear}-04`, end: `${startYear + 1}-08` };
 }
 
 function defaultPeriod(registeredMonths: string[]): ClosingCalendarPeriod {
   const now = new Date();
-  const current = seasonPeriod(now.getFullYear() - (now.getMonth() < 3 ? 1 : 0));
-  if (!registeredMonths.length || registeredMonths.some((month) => month >= current.start && month <= current.end)) return current;
-
-  const reference = registeredMonths.find((month) => month > current.end) ?? registeredMonths[registeredMonths.length - 1];
-  const [year, month] = reference.split("-").map(Number);
-  return seasonPeriod(year - (month < 4 ? 1 : 0));
+  const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  let period = seasonPeriod(registeredMonths[0] ?? currentMonth);
+  // A safra seguinte só toma o lugar da anterior após o fim do período em tela.
+  for (const month of registeredMonths) {
+    if (currentMonth <= period.end) break;
+    if (month > period.end) period = seasonPeriod(month);
+  }
+  return period;
 }
 
 function monthsInPeriod({ start, end }: ClosingCalendarPeriod) {
