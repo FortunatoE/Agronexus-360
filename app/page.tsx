@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { base64ToBytes } from "@/lib/workspace-base64";
 import { DimensionUpload } from "@/components/dimension-upload";
 import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
 import {
@@ -305,10 +306,6 @@ function bytesToBase64(bytes: Uint8Array) {
   let output = "";
   for (let index = 0; index < bytes.length; index += 0x8000) output += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
   return window.btoa(output);
-}
-function base64ToBytes(value: string) {
-  const binary = window.atob(value);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 function workspaceCodec<T>(action: "decode" | "encode", value: unknown) {
   if (typeof Worker === "undefined") return Promise.reject(new Error("Worker indisponível"));

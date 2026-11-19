@@ -1,3 +1,5 @@
+import { base64ToBytes } from "../lib/workspace-base64";
+
 type CodecRequest = {
   action: "decode" | "encode";
   id: string;
@@ -8,11 +10,6 @@ function bytesToBase64(bytes: Uint8Array) {
   let output = "";
   for (let index = 0; index < bytes.length; index += 0x8000) output += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
   return btoa(output);
-}
-
-function base64ToBytes(value: string) {
-  const binary = atob(value);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
 async function encode(value: unknown) {
