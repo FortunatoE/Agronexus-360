@@ -1085,14 +1085,23 @@ export default function Home() {
   }, [dimensions]);
 
   const planningDistribution = useMemo(() => {
-    type PlanningSchedule = { active: string; cycle: string; culture: string; months: Record<string, number>; planned: number; product: string };
+    type PlanningSchedule = { active: string; cycle: string; culture: string; merchandiseGroup: string; months: Record<string, number>; planned: number; product: string; subgroup: string };
     const values = new Map<string, PlanningSchedule>();
     plans.forEach((row) => {
       const product = productFor(row, "planning", dimensions);
       const cycle = cycleFor(row, dimensions);
       const culture = cultureFor(row);
       const key = `${product.canonicalKey}|${cycle}`;
-      const current = values.get(key) || { active: product.active, cycle, culture, months: {}, planned: 0, product: product.canonicalName };
+      const current = values.get(key) || {
+        active: product.active,
+        cycle,
+        culture,
+        merchandiseGroup: product.merchandiseGroup || "Sem grupo",
+        months: {},
+        planned: 0,
+        product: product.canonicalName,
+        subgroup: product.subgroup || "Sem subgrupo",
+      };
       const amount = standardQuantity(row, "planning", product, dimensions);
       current.planned += amount;
       const scheduledAt = dateFromPlan(readText(row, "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data"));
