@@ -247,7 +247,6 @@ export function readPendingOrderDetails(row: OperationalRow) {
   const delivered = quantity(field("delivered"));
   const remaining = quantity(field("remaining"));
   return {
-    orderDate: String(field("orderDate") ?? "").trim(),
     item: String(field("item") ?? "").trim(),
     ordered: ordered ?? (delivered !== null && remaining !== null ? delivered + remaining : null),
     delivered: delivered ?? (ordered !== null && remaining !== null && ordered >= remaining ? ordered - remaining : null),

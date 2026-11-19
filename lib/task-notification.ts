@@ -1,10 +1,10 @@
 import { normalizeMaterial } from "@/lib/material-dimension";
 import { headerKey, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
 
-type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow };
+type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow; dueDate: Date | null };
 
 type OrderEmailRow = {
-  orderDate: string;
+  dueDate: Date | null;
   reference: string;
   item: string;
   material: string;
@@ -16,6 +16,7 @@ type OrderEmailRow = {
 };
 
 const headers = ["DATA PED", "PEDIDO", "ITEM PED", "INSUMO", "QTD PEDIDO", "QTD ENTREGUE", "FALTA ENTREGAR"];
+const dateFormat = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
 const volumeFormat = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 4 });
 const missingValue = "—";
 const encoder = new TextEncoder();
@@ -75,8 +76,6 @@ export function resolveTaskNotificationOrders(
         : material !== "SEMDESCRICAO" && sameOrder.filter((line) => line.material === material).length === 1
           ? lines.filter((line) => line.material === material && (!code || !line.code || line.code === code)) : [];
     const matched = matches.length === 1 && (!code || !matches[0].code || matches[0].code === code) ? matches[0] : undefined;
-    const orderDates = new Set(lines.map((line) => line.orderDate).filter(Boolean));
-    const orderDate = details.orderDate || matched?.orderDate || (orderDates.size === 1 ? [...orderDates][0] : "");
     const ordered = details.ordered ?? matched?.ordered ?? null;
     let delivered = details.delivered ?? matched?.delivered ?? null;
     let remaining = details.remaining ?? matched?.remaining ?? null;
@@ -87,7 +86,7 @@ export function resolveTaskNotificationOrders(
     }
     if (remaining !== null && remaining <= 0) return [];
     return [{
-      orderDate,
+      dueDate: signal.dueDate,
       reference: signal.reference,
       item: details.item || matched?.item || "",
       material: signal.physicalMaterial,
@@ -117,7 +116,7 @@ export function buildTaskNotification(nucleus: string, minimumDays: number, rows
   const formatVolume = (value: number | null) => value === null ? missingValue : volumeFormat.format(value);
   const cells = rows.map((row) => {
     const fields = [
-      row.orderDate || missingValue, row.reference, row.item || missingValue, row.material,
+      row.dueDate ? dateFormat.format(row.dueDate) : missingValue, row.reference, row.item || missingValue, row.material,
       formatVolume(row.ordered), formatVolume(row.delivered), formatVolume(row.remaining),
     ];
     if (showRecordedQuantity) fields.push(row.recordedQuantity === null ? "" : formatVolume(row.recordedQuantity));

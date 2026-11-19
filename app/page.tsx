@@ -1624,12 +1624,15 @@ export default function Home() {
   const pendingSignals = useMemo<PendingSignal[]>(() => pendingOrders.map((row, index) => {
     const product = productFor(row, "pending", dimensions);
     const nucleus = nucleusFor(row, dimensions, farmToNucleus);
-    const dueDate = dateFromPlan(readText(row, "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Data prevista", "Previsão de utilização", "Previsao de utilizacao"));
+    const dueDateValue = readText(row, "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Data prevista", "Previsão de utilização", "Previsao de utilizacao");
+    const previousDueDate = dateFromPlan(dueDateValue);
+    const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(dueDateValue) ? dateFromPlan(`${dueDateValue}T00:00:00`) : previousDueDate;
     const daysUntil = dueDate ? daysFromToday(dueDate, new Date(clock)) : null;
     const reference = readText(row, "Pedido", "Nº pedido", "No pedido", "Documento", "Doc. compra", "Solicitação", "Solicitacao") || "Pedido pendente";
     const signal = pendingSignalStatus(daysUntil);
     return {
-      id: normalizeMaterial([reference, product.rawName, nucleus, dueDate ? dateKey(dueDate) : String(index)].join("|")) || `pedido-${index}`,
+      // Mantém o vínculo das tarefas já registradas para datas ISO antes interpretadas em UTC.
+      id: normalizeMaterial([reference, product.rawName, nucleus, previousDueDate ? dateKey(previousDueDate) : String(index)].join("|")) || `pedido-${index}`,
       dueDate,
       daysUntil,
       material: product.canonicalName,
@@ -1739,12 +1742,7 @@ export default function Home() {
       && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus));
     if (!candidates.length) return null;
 
-    const dateFormatter = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
-    const rows = resolveTaskNotificationOrders(candidates, pendingSignals, datasets.pedidosCompra).map((row) => {
-      const date = dateFromPlan(/^\d{4}-\d{2}-\d{2}$/.test(row.orderDate) ? `${row.orderDate}T00:00:00` : row.orderDate);
-      return { ...row, orderDate: date ? dateFormatter.format(date) : "" };
-    });
-
+    const rows = resolveTaskNotificationOrders(candidates, pendingSignals, datasets.pedidosCompra);
     return rows.length ? { ...buildTaskNotification(notificationNucleus, minimumDays, rows), count: rows.length } : null;
   }, [datasets.pedidosCompra, notificationDays, notificationNucleus, pendingSignals, scopedPendingSignals, showNotification]);
   const notificationRecipients = parseNotificationRecipients(notificationTo);
