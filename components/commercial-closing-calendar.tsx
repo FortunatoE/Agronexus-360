@@ -7,6 +7,7 @@ import { useMemo, useState } from "react";
 type Closing = {
   id: string;
   product: string;
+  active: string;
   destination: string;
   deliveryLocation: string;
   culture: string;
@@ -176,7 +177,9 @@ export function CommercialClosingCalendar({
                 {open ? group.rows.map(({ closing, unit, volumes }) => (
                   <tr className="bg-white text-slate-700 [&>td]:border-t [&>th]:border-t" key={closing.id}>
                     <th className={cn(identityColumn, "pl-7 font-medium")} scope="row">
-                      <span className="block wrap-anywhere text-slate-900">{closing.product}</span>
+                      <span className="block wrap-anywhere text-slate-900">
+                        {closing.product}{closing.active ? ` (${closing.active})` : ""}
+                      </span>
                       <span className="block wrap-anywhere text-[10px] font-normal leading-4 text-slate-500">
                         {[closing.destination, closing.deliveryLocation, closing.culture || closing.cycle].filter(Boolean).join(" · ")}
                       </span>

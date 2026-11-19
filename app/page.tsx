@@ -1,7 +1,9 @@
 "use client";
 
 import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { buildCommercialClosingOverview, matchesCommercialClosing, resolveCommercialClosings } from "@/lib/commercial-closings";
 import { base64ToBytes } from "@/lib/workspace-base64";
+import { CommercialClosingBalances } from "@/components/commercial-closing-balances";
 import { CommercialClosingCalendar, type ClosingCalendarPeriod } from "@/components/commercial-closing-calendar";
 import { DimensionUpload } from "@/components/dimension-upload";
 import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
@@ -1100,7 +1102,10 @@ export default function Home() {
     return values;
   }, [dimensions, plans]);
 
-  const selectedClosingSchedule = useMemo(() => planningDistribution.get(`${normalizeMaterial(closingDraft.product)}|${closingDraft.cycle}`), [closingDraft.cycle, closingDraft.product, planningDistribution]);
+  const selectedClosingSchedule = useMemo(() => {
+    const product = productFor({ Produto: closingDraft.product }, "planning", dimensions);
+    return planningDistribution.get(`${product.canonicalKey}|${closingDraft.cycle}`);
+  }, [closingDraft.cycle, closingDraft.product, dimensions, planningDistribution]);
   const registeredClosingMonths = useMemo(() => {
     const months = new Set<string>();
     for (const closing of commercialClosings.closings) {
@@ -1117,33 +1122,21 @@ export default function Home() {
     return [...values].sort();
   }, [commercialClosings.closings, planningDistribution]);
 
-  const commercialGapByProduct = useMemo(() => {
-    const closed = new Map<string, number>();
-    commercialClosings.closings.forEach((closing) => {
-      const key = `${normalizeMaterial(closing.product)}|${closing.cycle}`;
-      closed.set(key, (closed.get(key) || 0) + closing.totalVolume);
-    });
-    const values = new Map<string, { active: string; closed: number; cycle: string; product: string; planned: number; remaining: number }>();
-    planningDistribution.forEach((schedule, key) => {
-      const totalClosed = closed.get(key) || 0;
-      values.set(key, { active: schedule.active, closed: totalClosed, cycle: schedule.cycle, product: schedule.product, planned: schedule.planned, remaining: Math.max(0, schedule.planned - totalClosed) });
-    });
-    commercialClosings.closings.forEach((closing) => {
-      const key = `${normalizeMaterial(closing.product)}|${closing.cycle}`;
-      if (values.has(key)) return;
-      values.set(key, { active: closing.active || "Não informado", closed: closing.totalVolume, cycle: closing.cycle, product: closing.product, planned: 0, remaining: 0 });
-    });
-    return values;
-  }, [commercialClosings.closings, planningDistribution]);
-
-  const filteredCommercialClosings = useMemo(() => {
-    const normalizedQuery = normalizeMaterial(closingQuery);
-    return commercialClosings.closings.filter((closing) => {
-      if (closingCycleFilter !== "Todos" && closing.cycle !== closingCycleFilter) return false;
-      if (!normalizedQuery) return true;
-      return [closing.active, closing.product, closing.supplier, closing.destination, closing.orderNumber].some((value) => normalizeMaterial(value).includes(normalizedQuery));
-    }).sort((left, right) => left.product.localeCompare(right.product) || left.supplier.localeCompare(right.supplier));
-  }, [closingCycleFilter, closingQuery, commercialClosings.closings]);
+  const resolvedCommercialClosings = useMemo(() => resolveCommercialClosings(
+    commercialClosings.closings,
+    planningDistribution,
+    dimensions,
+    new Map(commercialOrders.map((order) => [order.key, order])),
+  ), [commercialClosings.closings, commercialOrders, dimensions, planningDistribution]);
+  const normalizedClosingQuery = normalizeMaterial(closingQuery);
+  const filteredCommercialClosings = useMemo(() => resolvedCommercialClosings.filter((entry) => (
+    (closingCycleFilter === "Todos" || entry.closing.cycle === closingCycleFilter)
+      && matchesCommercialClosing(entry, normalizedClosingQuery)
+  )).sort((left, right) => left.physicalProduct.localeCompare(right.physicalProduct) || left.closing.supplier.localeCompare(right.closing.supplier)),
+  [closingCycleFilter, normalizedClosingQuery, resolvedCommercialClosings]);
+  const commercialOverview = useMemo(() => buildCommercialClosingOverview(
+    planningDistribution, resolvedCommercialClosings, closingCycleFilter, normalizedClosingQuery,
+  ), [closingCycleFilter, normalizedClosingQuery, planningDistribution, resolvedCommercialClosings]);
 
   const materialResolution = useMemo(() => {
     const input: Array<[Row[], "stock" | "transit" | "consumption"]> = [[stockRows, "stock"], [datasets.transito, "transit"], [datasets.consumo, "consumption"]];
@@ -2038,8 +2031,8 @@ export default function Home() {
       orderKey,
       supplier: order?.supplier || current.supplier,
       paymentDue: order?.dueDate ? (dateFromPlan(order.dueDate) ? dateKey(dateFromPlan(order.dueDate)!) : current.paymentDue) : current.paymentDue,
-      active: order?.active !== "Não conciliado" ? order.active : current.active,
-      product: order?.standardProduct || current.product,
+      active: order && order.active !== "Não conciliado" ? order.active : current.active,
+      product: order?.product || current.product,
       unit: order?.unit || current.unit,
       currency: order?.currency || current.currency,
       unitPrice: order?.unitPrice ? String(order.unitPrice) : current.unitPrice,
@@ -2590,20 +2583,23 @@ export default function Home() {
     }
     const supplierOptions = [...suppliers].sort(([, left], [, right]) => left.localeCompare(right, "pt-BR"));
     const supplierFilter = closingSupplierFilter !== null && suppliers.has(closingSupplierFilter) ? closingSupplierFilter : null;
-    const filteredSupplierGroups = new Map<string, CommercialClosing[]>();
-    for (const closing of filteredCommercialClosings) {
-      const key = closingSupplierKey(closing.supplier);
+    const filteredSupplierGroups = new Map<string, typeof filteredCommercialClosings>();
+    for (const entry of filteredCommercialClosings) {
+      const key = closingSupplierKey(entry.closing.supplier);
       if (supplierFilter !== null && key !== supplierFilter) continue;
       const group = filteredSupplierGroups.get(key);
-      if (group) group.push(closing);
-      else filteredSupplierGroups.set(key, [closing]);
+      if (group) group.push(entry);
+      else filteredSupplierGroups.set(key, [entry]);
     }
     const showSupplierFilter = closingTab === "calendario" || closingTab === "distribuicoes";
-    const filteredOrderKeys = new Set(filteredCommercialClosings.map((closing) => closing.orderKey).filter(Boolean));
+    const filteredOrderKeys = new Set(commercialOverview.closings.map((closing) => closing.orderKey).filter(Boolean));
     const suppliedByLinkedOrders = commercialOrders.filter((order) => filteredOrderKeys.has(order.key)).reduce((sum, order) => sum + order.supplied, 0);
-    const closedVolume = filteredCommercialClosings.reduce((sum, closing) => sum + closing.totalVolume, 0);
-    const commercialFinancial = (currency: CommercialClosing["currency"]) => filteredCommercialClosings.filter((closing) => closing.currency === currency).reduce((sum, closing) => sum + closing.totalVolume * closing.unitPrice, 0);
-    const filteredGaps = [...commercialGapByProduct.values()].filter((row) => closingCycleFilter === "Todos" || row.cycle === closingCycleFilter).sort((left, right) => right.remaining - left.remaining || left.product.localeCompare(right.product));
+    const physicalVolumes = new Map<string, number>();
+    for (const closing of commercialOverview.closings) {
+      const unit = closing.unit?.trim().toUpperCase() || "";
+      physicalVolumes.set(unit, (physicalVolumes.get(unit) ?? 0) + closing.totalVolume);
+    }
+    const commercialFinancial = (currency: CommercialClosing["currency"]) => commercialOverview.closings.filter((closing) => closing.currency === currency).reduce((sum, closing) => sum + closing.totalVolume * closing.unitPrice, 0);
     const selectedOrderForDraft = commercialOrders.find((order) => order.key === closingDraft.orderKey);
     const draftDistributed = Object.values(closingDistributionDraft).reduce((sum, amount) => sum + numberFrom(amount), 0);
     content = currentUser?.role === "admin" ? <section className="space-y-6">
@@ -2656,7 +2652,10 @@ export default function Home() {
         <CommercialClosingCalendar
           groups={supplierOptions.flatMap(([key, name]) => {
             const closings = filteredSupplierGroups.get(key);
-            return closings ? [{ key, name, closings }] : [];
+            return closings ? [{
+              key, name,
+              closings: closings.map(({ closing, active, physicalProduct }) => ({ ...closing, active, product: physicalProduct })),
+            }] : [];
           })}
           onPeriodChange={setClosingCalendarPeriod}
           period={closingCalendarPeriod}
@@ -2664,7 +2663,28 @@ export default function Home() {
           supplier={supplierFilter === null ? undefined : suppliers.get(supplierFilter)}
         />
       ) : null}
-      {closingTab === "painel" ? <section className="space-y-5"><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Card label="Volume fechado" value={formatNumber(closedVolume)} note={`${filteredCommercialClosings.length} distribuição(ões)`} tone="emerald" /><Card label="Quantidade fornecida" value={formatNumber(suppliedByLinkedOrders)} note="pedidos vinculados" tone={suppliedByLinkedOrders ? "sky" : "slate"} /><Card label="Fechado em BRL" value={formatCurrency(commercialFinancial("BRL"), "BRL")} note="volume × valor unitário" tone="slate" /><Card label="Fechado em USD" value={formatCurrency(commercialFinancial("USD"), "USD")} note="volume × valor unitário" tone="slate" /></div><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Quanto falta fechar</h3><p className="mt-1 text-xs text-slate-500">Planejamento menos as distribuições comerciais registradas, por material padrão e ciclo.</p></div><span className="text-xs font-semibold text-slate-500">Base: Planejamento conciliado</span></div><div className="mt-4 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Ciclo", "Princípio ativo", "Produto", "Planejado", "Fechado", "Falta fechar"].map((head) => <th className="px-3 py-2.5 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{filteredGaps.map((row) => <tr key={`${row.cycle}|${row.product}`}><td className="px-3 py-3">{row.cycle}</td><td className="px-3 py-3">{row.active}</td><td className="px-3 py-3 font-semibold">{row.product}</td><td className="px-3 py-3">{formatNumber(row.planned)}</td><td className="px-3 py-3 text-emerald-700">{formatNumber(row.closed)}</td><td className={cn("px-3 py-3 font-bold", row.remaining > 0 ? "text-rose-700" : "text-emerald-700")}>{formatNumber(row.remaining)}</td></tr>)}{!filteredGaps.length ? <tr><td className="px-3 py-10 text-center text-slate-500" colSpan={6}>Importe o Planejamento para calcular o volume restante do ciclo.</td></tr> : null}</tbody></table></div></section></section> : null}
+      {closingTab === "painel" ? (
+        <section className="space-y-5">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <Card
+              label="Volume físico fechado"
+              note={`${commercialOverview.closings.length} distribuição(ões)`}
+              tone="emerald"
+              value={physicalVolumes.size ? [...physicalVolumes].sort(([left], [right]) => left.localeCompare(right)).map(([unit, value]) => (
+                <span className="block text-xl" key={unit}>{formatNumber(value)}{unit ? ` ${unit}` : ""}</span>
+              )) : "0"}
+            />
+            <Card label="Quantidade fornecida" value={formatNumber(suppliedByLinkedOrders)} note="pedidos vinculados" tone={suppliedByLinkedOrders ? "emerald" : "slate"} />
+            <Card label="Fechado em BRL" value={formatCurrency(commercialFinancial("BRL"), "BRL")} note="volume físico × valor unitário" tone="slate" />
+            <Card label="Fechado em USD" value={formatCurrency(commercialFinancial("USD"), "USD")} note="volume físico × valor unitário" tone="slate" />
+          </div>
+          <CommercialClosingBalances
+            empty={normalizedClosingQuery || planningDistribution.size ? "Nenhum produto encontrado para os filtros atuais." : "Importe o Planejamento para calcular o volume restante do ciclo."}
+            expandMatches={Boolean(normalizedClosingQuery)}
+            groups={commercialOverview.groups}
+          />
+        </section>
+      ) : null}
       {closingTab === "distribuicoes" ? <section className="space-y-5"><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold">{editingClosingId ? "Editar distribuição" : "Nova distribuição comercial"}</h3><p className="mt-1 text-xs leading-relaxed text-slate-500">O calendário pode ser sugerido pelo planejamento, usando as datas previstas de aplicação derivadas do DAE.</p></div>{editingClosingId ? <button className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-600" onClick={resetClosingDraft} type="button">Cancelar edição</button> : null}</div><div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4"><label className="grid gap-1 text-xs font-semibold text-slate-600">Fornecedor<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, supplier: event.target.value }))} value={closingDraft.supplier} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Vencimento para pagamento<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, paymentDue: event.target.value }))} type="date" value={closingDraft.paymentDue} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Destino<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, destination: event.target.value }))} placeholder="Ex.: 0714 ou núcleo" value={closingDraft.destination} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Local de entrega<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, deliveryLocation: event.target.value }))} placeholder="Fazenda ou armazém" value={closingDraft.deliveryLocation} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Ciclo<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, cycle: event.target.value as CommercialClosing["cycle"] }))} value={closingDraft.cycle}><option>Safra</option><option>Safrinha</option></select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Cultura<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, culture: event.target.value }))} placeholder="Ex.: Soja" value={closingDraft.culture} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Princípio ativo<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, active: event.target.value }))} value={closingDraft.active} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Produto<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" list="commercial-materials" onChange={(event) => { const product = event.target.value; const option = commercialMaterialOptions.find((item) => normalizeMaterial(item.product) === normalizeMaterial(product)); setClosingDraft((current) => ({ ...current, product, active: option?.active || current.active })); }} value={closingDraft.product} /><datalist id="commercial-materials">{commercialMaterialOptions.map((item) => <option key={item.product} value={item.product}>{item.active}</option>)}</datalist></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Moeda<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, currency: event.target.value as CommercialClosing["currency"] }))} value={closingDraft.currency}><option value="BRL">BRL</option><option value="USD">USD</option></select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Valor unitário<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDraft((current) => ({ ...current, unitPrice: event.target.value }))} value={closingDraft.unitPrice} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Embalagem<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, packaging: event.target.value }))} placeholder="Ex.: galão 20 L" value={closingDraft.packaging} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Volume total<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDraft((current) => ({ ...current, totalVolume: event.target.value }))} value={closingDraft.totalVolume} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Unidade<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, unit: event.target.value }))} placeholder="L, KG, UN" value={closingDraft.unit} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600 xl:col-span-2">Pedido de compra vinculado<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!commercialOrders.length} onChange={(event) => applyClosingOrder(event.target.value)} value={closingDraft.orderKey}><option value="">Vincular depois</option>{commercialOrders.map((order) => <option key={order.key} value={order.key}>{order.orderNumber} · item {order.item} · {order.product} · fornecido {formatNumber(order.supplied)} {order.unit}</option>)}</select></label></div>{selectedOrderForDraft ? <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-900">Pedido {selectedOrderForDraft.orderNumber}: {formatNumber(selectedOrderForDraft.ordered)} pedido, {formatNumber(selectedOrderForDraft.supplied)} fornecido e {formatNumber(selectedOrderForDraft.balance)} a fornecer.</p> : null}<div className="mt-5 border-t border-slate-100 pt-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h4 className="font-semibold">Distribuição mensal</h4><p className="mt-1 text-xs text-slate-500">Preencha os volumes por mês. Total distribuído: <strong>{formatNumber(draftDistributed)}</strong> de {formatNumber(numberFrom(closingDraft.totalVolume))}.</p></div><button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700" onClick={applyPlanningDistribution} type="button">Sugerir pelo planejamento</button></div><div className="mt-4 grid gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">{closingMonths.map((month) => <label className="grid gap-1 text-xs font-semibold text-slate-600" key={month}>{formatMonth(month)}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDistributionDraft((current) => ({ ...current, [month]: numberFrom(event.target.value) }))} value={closingDistributionDraft[month] || ""} /></label>)}{!closingMonths.length ? <p className="text-sm text-amber-800">Ainda não há meses previstos no Planejamento para criar a distribuição.</p> : null}</div></div><div className="mt-5 flex justify-end"><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={saveCommercialClosing} type="button">{editingClosingId ? "Salvar alterações" : "Salvar fechamento"}</button></div></section>
         <section className="rounded-2xl border border-slate-200 bg-white p-5">
           <h3 className="font-semibold">Distribuições registradas</h3>
@@ -2704,7 +2724,7 @@ export default function Home() {
                           </div>
                         </th>
                       </tr>
-                      {closings.map((closing) => {
+                      {closings.map(({ closing }) => {
                         const order = commercialOrders.find((item) => item.key === closing.orderKey);
                         return (
                           <tr key={closing.id}>
