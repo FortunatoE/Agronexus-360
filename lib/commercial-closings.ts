@@ -1,5 +1,5 @@
 import { normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
-import { conversionFactor, productFor } from "@/lib/reconciliation";
+import { productFor, registeredConversionFactor } from "@/lib/reconciliation";
 
 type ClosingRecord = {
   active: string;
@@ -62,7 +62,7 @@ export function resolveCommercialClosings<T extends ClosingRecord>(
   const targetsByPhysicalProduct = new Map<string, Set<string>>();
   for (const [pair, factor] of Object.entries(dimensions.conversions)) {
     const [target, physical] = pair.split("|");
-    if (!target || !physical || !(factor > 0)) continue;
+    if (!target || !physical || !Number.isFinite(factor) || factor <= 0) continue;
     const targets = targetsByPhysicalProduct.get(physical) ?? new Set<string>();
     targets.add(target);
     targetsByPhysicalProduct.set(physical, targets);
@@ -97,7 +97,7 @@ export function resolveCommercialClosings<T extends ClosingRecord>(
       physicalProduct,
       standardProduct: product.canonicalName,
       plannedKey: schedule ? key : null,
-      factor: schedule ? conversionFactor(product, dimensions) : 1,
+      factor: schedule ? registeredConversionFactor(product, dimensions) ?? 1 : 1,
     };
   });
 }

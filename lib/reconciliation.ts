@@ -387,6 +387,11 @@ export function quantityFor(row: OperationalRow, source: ProductSource) {
   return readNumber(row, ...quantityFields[source]);
 }
 
+export function registeredConversionFactor(product: ResolvedProduct, bundle: DimensionBundle) {
+  const factor = bundle.conversions[`${normalizeMaterial(product.canonicalName)}|${normalizeMaterial(product.rawName)}`];
+  return Number.isFinite(factor) && factor > 0 ? factor : undefined;
+}
+
 /**
  * Expresses a physical material in the unit of its material agregado. The
  * Premissas sheet stores conversions as `material padrão|apresentação física`.
@@ -394,8 +399,8 @@ export function quantityFor(row: OperationalRow, source: ProductSource) {
  * the unit of the aggregated material.
  */
 export function conversionFactor(product: ResolvedProduct, bundle: DimensionBundle) {
-  const explicit = bundle.conversions[`${normalizeMaterial(product.canonicalName)}|${normalizeMaterial(product.rawName)}`];
-  if (explicit && explicit > 0) return explicit;
+  const explicit = registeredConversionFactor(product, bundle);
+  if (explicit !== undefined) return explicit;
   // Fallback seguro para dimensões que já trazem as duas doses, mas ainda não
   // receberam a premissa de conversão explícita.
   const physicalDose = bundle.materials[normalizeMaterial(product.rawName)]?.standardDose || 0;

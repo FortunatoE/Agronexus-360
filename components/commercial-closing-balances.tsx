@@ -23,7 +23,7 @@ export function CommercialClosingBalances({
   return (
     <section aria-labelledby="closing-balances-title" className="rounded-2xl border border-slate-200 bg-white p-5">
       <h3 className="font-semibold" id="closing-balances-title">Quanto falta fechar</h3>
-      <p className="mt-1 text-xs text-slate-500">O saldo de cada produto planejado considera todos os fechamentos vinculados no ciclo.</p>
+      <p className="mt-1 text-xs text-slate-500">O saldo considera os fechamentos vinculados no ciclo. A conversão de dose usa o fator cadastrado em Premissas.</p>
       {groups.length ? (
         <div className="mt-4 overflow-x-auto">
           <table className="w-full min-w-[680px] text-sm">
