@@ -4,329 +4,400 @@
   <img src="docs/assets/agronexus-architecture.svg" alt="Arquitetura operacional do AgroNexus 360" width="100%" />
 </p>
 
-<p align="center"><strong>Planejamento agrícola, conciliação SAP e inteligência de insumos em uma única experiência operacional.</strong></p>
+<p align="center"><strong>Planejamento agrícola, conciliação SAP, abastecimento e logística operacional em uma única plataforma.</strong></p>
 
 <p align="center">
   <a href="https://agronexus-360.vercel.app">Aplicação em produção</a> ·
-  <a href="#arquitetura">Arquitetura</a> ·
-  <a href="#motor-de-conciliação">Motor de conciliação</a> ·
-  <a href="#evolução-planejada">Roadmap</a>
+  <a href="#arquitetura-atual">Arquitetura</a> ·
+  <a href="#motor-de-conciliação">Conciliação</a> ·
+  <a href="#logística-de-carregamento">Logística</a> ·
+  <a href="#fechamentos-comerciais">Fechamentos</a>
 </p>
-
-> Projeto pessoal de **Emmanuel Fortunato**, Analista de Planejamento. O AgroNexus 360° transforma uma rotina complexa de planilhas, exportações SAP e validações manuais em um produto digital auditável, orientado a decisão e construído a partir de regras reais da operação agrícola.
 
 ![React](https://img.shields.io/badge/React-19-149eca?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6?logo=typescript&logoColor=white)
 ![Vite](https://img.shields.io/badge/Vite-8-646cff?logo=vite&logoColor=white)
 ![Vercel](https://img.shields.io/badge/Deploy-Vercel-000000?logo=vercel&logoColor=white)
+![Neon](https://img.shields.io/badge/Base%20central-Neon%20Postgres-00e599)
 ![SAP](https://img.shields.io/badge/Dados-SAP-0faaff?logo=sap&logoColor=white)
 
-## Por que este projeto existe
+> Projeto pessoal de **Emmanuel Fortunato**, Analista de Planejamento. O AgroNexus 360° transforma regras reais de planejamento, planilhas Excel e relatórios SAP em uma experiência operacional auditável, compartilhada e orientada à decisão.
 
-Planejamento de insumos não termina quando um plano é aprovado. Ele depende de conciliar continuamente demanda prevista, execução registrada, estoque físico, materiais em trânsito, pedidos pendentes e particularidades de cada núcleo produtivo.
+## Índice
 
-Na prática, esse processo costuma ficar espalhado entre relatórios SAP, planilhas com Power Query, tabelas dinâmicas e conhecimento tácito da equipe. O AgroNexus 360° cria uma camada de decisão para responder perguntas que deveriam estar prontas para a gestão:
+- [Problema que resolve](#problema-que-resolve)
+- [Diferenciais profissionais](#diferenciais-profissionais)
+- [Capacidades da plataforma](#capacidades-da-plataforma)
+- [Arquitetura atual](#arquitetura-atual)
+- [Fontes de dados e importação](#fontes-de-dados-e-importação)
+- [Motor de conciliação](#motor-de-conciliação)
+- [Visões operacionais](#visões-operacionais)
+- [Logística de carregamento](#logística-de-carregamento)
+- [Fechamentos comerciais](#fechamentos-comerciais)
+- [Segurança, perfis e persistência](#segurança-perfis-e-persistência)
+- [Como executar](#como-executar-localmente)
+- [Operação e publicação](#operação-e-publicação)
+- [Roadmap técnico](#roadmap-técnico)
 
-- Quanto do planejamento já foi executado, por cultura, ciclo, núcleo ou subgrupo?
-- Qual produto está em risco de ruptura na próxima janela de aplicação?
-- O estoque está na fazenda certa, no armazém ou em trânsito?
-- Uma alteração de dose aumentou ou reduziu a necessidade de volume?
-- O que não conciliou por novo cadastro, apresentação diferente ou erro na origem?
+## Problema que resolve
 
-Não é um dashboard genérico. É uma aplicação de planejamento construída com a pergunta operacional como ponto de partida e com engenharia de dados como meio para reduzir incerteza.
+O planejamento de insumos não termina quando a demanda é aprovada. A operação precisa conciliar continuamente plano agrícola, execução, consumo, saldo físico, materiais em trânsito, pedidos pendentes, estoque em armazéns e exceções de cadastro.
 
-## O que este projeto demonstra no meu currículo
+Antes do AgroNexus, essa leitura ficava dispersa entre relatórios SAP, Power Query, tabelas dinâmicas, fórmulas e conhecimento tácito. A plataforma organiza essas informações em respostas operacionais claras:
 
-| Competência | Evidência no AgroNexus 360° |
+- Quanto do planejamento já foi executado por ciclo, cultura, grupo, subgrupo e núcleo?
+- Qual volume ainda precisa ser aplicado e qual é o impacto de uma dose diferente da planejada?
+- Há saldo no núcleo, trânsito, armazém ou risco real de ruptura?
+- Qual produto precisa de repasse antes da próxima janela de aplicação?
+- Qual material não conciliou e exige uma nova premissa ou correção na origem?
+- O que foi fechado comercialmente, onde será entregue, quando será faturado e quanto falta vincular ao pedido de compra?
+- Qual motorista, veículo, nota fiscal, solicitação e material pertencem à mesma viagem de carregamento?
+
+O objetivo não é apenas exibir indicadores: é deixar explícitas as regras de negócio para que a decisão seja repetível, rastreável e mais rápida.
+
+## Diferenciais profissionais
+
+| Competência | Evidência no projeto |
 | --- | --- |
-| Visão de negócio | Modelagem de decisões de insumos, calendário agrícola, risco de ruptura e priorização por núcleo. |
-| Domínio SAP + Excel | Leitura de Planejamento, ZPS007, CN52, ZMM_BATCH, MB52, MB5T e pedidos pendentes. |
-| Engenharia de dados aplicada | Normalização textual, modelo canônico de material, fallback de fontes e governança de exceções. |
-| Produto digital | Interface responsiva, filtros, detalhamento progressivo, exportações Excel e feedback de qualidade. |
-| Rastreabilidade | Regras de WBS, centro, depósito, lote, conversão e saldo são explícitas e auditáveis. |
-| Autonomia técnica | Projeto pessoal publicado, versionado e evoluído a partir de problemas reais de planejamento. |
+| Conhecimento de negócio | Traduz fluxo de safra, calendário agrícola, abastecimento, faturamento e logística em produto digital. |
+| SAP e Excel aplicados | Integra Planejamento, ZPS007, CN52, ZMM_BATCH, MB52, MB5T, pedidos pendentes, solicitações web e pedidos de compra. |
+| Engenharia de dados | Normaliza nomes, converte apresentações, aplica fallbacks e mantém exceções como dados auditáveis. |
+| Produto operacional | Interface responsiva, filtros, agrupamentos, expansão por detalhe, exportações Excel e ações contextualizadas. |
+| Arquitetura full-stack | Frontend React, APIs serverless, autenticação por sessão, base PostgreSQL central e payload compactado. |
+| Governança | Perfis administrativos e operadores por núcleo, histórico de tarefas, premissas e trilha de auditoria. |
+| Autonomia | Projeto pessoal publicado, versionado e evoluído a partir de situações reais de planejamento. |
 
-## Capacidades atuais
+## Capacidades da plataforma
 
-| Frente | Entrega operacional |
+| Módulo | Entrega operacional |
 | --- | --- |
-| Visão geral | Execução por grupo/subgrupo, Safra e Safrinha, macro por cultura e indicadores de risco. |
-| Calendarização | Provisionamento por período, demanda, saldo de fazenda, trânsito, armazém e volume solicitado. |
-| Acompanhamento | Agrupamento por princípio ativo, totais por grupo, filtro de núcleo e detalhamento por material/localização. |
-| Execução | Volume planejado x executado, percentual, dose planejada x realizada e impacto da diferença de dose. |
-| Importações | Sete fontes, Dimensões, datas dos arquivos, indicador de defasagem e persistência local. |
-| Conciliação | Relatório de itens sem dimensão, descrição ou núcleo, com ação sugerida e exportação Excel. |
-| Premissas | Consulta tabulada de regras operacionais, mapeamentos, centros, culturas e conversões aplicados. |
+| Visão geral | Prioridades do dia, riscos, pedidos urgentes, execução por subgrupo, cultura e DAE por núcleo. |
+| Calendarização | Provisionamento por intervalo de datas com demanda, saldo, trânsito, armazém, apoio entre núcleos e volume solicitado. |
+| Acompanhamento | Visão por princípio ativo, material padrão, material físico e localização; totais e estoque convertido/físico. |
+| Execução | Planejado x aplicado, percentual executado, dose planejada x utilizada e impacto da diferença de dose. |
+| Importações | Validação de fontes, metadados, data de arquivo, frescor da base e relatório de itens não conciliados. |
+| Alertas | Repasse em até 30 dias, risco de disponibilidade, variação expressiva de dose e vencimento de estoque. |
+| Tarefas | Farol de pedidos, filtros, histórico de ações, vínculo a pedido/material e exportação. |
+| Premissas | Visão tabulada e editável de dimensões, conversões, centros, núcleos, culturas e regras operacionais. |
+| Logística | Motoristas, veículos, rotas com múltiplas solicitações, NF, receita e documento Excel. |
+| Fechamentos | Distribuições comercialmente fechadas, calendarização mensal, anotações e vínculo posterior aos pedidos de compra. |
+| Usuários | Login, sessão, administração de contas e recorte de acesso para operadores por núcleo. |
 
-## Visão do fluxo
+## Arquitetura atual
+
+```mermaid
+flowchart TB
+    U[Usuário autenticado] --> WEB[React 19 + TypeScript]
+    WEB --> UX[Visões e motor de decisão]
+    WEB --> IMPORT[Worker de importação XLSX]
+    IMPORT --> RULES[Normalização + Dimensões + Conciliação]
+    RULES --> WS[Workspace operacional compartilhado]
+    WEB --> API[APIs serverless Vercel]
+    API --> AUTH[Autenticação e sessões]
+    API --> WS
+    AUTH --> DB[(Neon PostgreSQL)]
+    WS --> DB
+    RULES --> EXPORT[Exportações Excel]
+```
+
+### Componentes técnicos
+
+| Camada | Tecnologias | Responsabilidade |
+| --- | --- | --- |
+| Interface | React 19, TypeScript, Vite/Vinext, Tailwind CSS, Lucide | Navegação, filtros, tabelas, cards, acessibilidade e responsividade. |
+| Processamento de planilhas | SheetJS (`xlsx`) + Web Workers | Leitura de Excel e processamento de importações fora da thread principal. |
+| Regras de domínio | TypeScript em `lib/` | Conciliação de materiais, WBS, núcleo, saldo, trânsito, conversões e provisionamento. |
+| Autenticação | API Vercel + Node `crypto` | Senha com `scrypt` e salt, sessão com token aleatório e cookie `HttpOnly`, `Secure`, `SameSite=Lax`. |
+| Persistência central | Neon Serverless PostgreSQL | Usuários, sessões e workspace operacional compartilhado. |
+| Transporte de workspace | JSON compactado em GZIP/Base64 | Reduz transferência e tempo de inicialização sem perder o conjunto operacional. |
+| Deploy | Vercel | SPA estática e funções serverless para autenticação, usuários, alertas e workspace. |
+
+### Estrutura do repositório
+
+```text
+plataforma/
+├── app/
+│   ├── page.tsx                    # Interface, estados, regras de visualização e fluxos
+│   ├── globals.css                 # Tokens, tema e responsividade
+│   └── layout.tsx                  # Metadados e ícone da aplicação
+├── api/
+│   ├── _core.js                    # PostgreSQL, usuários, sessões e compactação
+│   ├── auth.js                     # Login, sessão atual e logout
+│   ├── users.js                    # Administração de usuários
+│   ├── workspace.js                # Leitura/gravação do workspace central
+│   └── send-alert.js               # Integração de alerta por e-mail quando configurada
+├── components/
+│   └── dimension-upload.tsx        # Importação e edição de dimensões/premissas
+├── lib/
+│   ├── reconciliation.ts           # WBS, núcleo, saldo, trânsito e reconciliação
+│   ├── material-dimension.ts       # Material padrão, ativo, grupo, subgrupo e fator
+│   └── operational-normalization.ts # Normalização e leitura tolerante de campos
+├── workers/
+│   ├── import-worker.ts            # Parsing de planilhas em segundo plano
+│   └── workspace-codec.worker.ts   # GZIP/Base64 do workspace no navegador
+├── scripts/                         # Diagnósticos, compactação e verificações administrativas
+├── public/agronexus-favicon.svg     # Identidade visual do navegador
+├── docs/assets/                     # Diagramas utilizados neste README
+├── vite.vercel.config.ts            # Build voltado para Vercel
+└── vercel.json                      # Build e fallback da SPA
+```
+
+### Workspace compartilhado
+
+O dado operacional não depende mais apenas do navegador local. A aplicação armazena um workspace central em `agronexus_platform_workspace`, com chave única `operacional`, para que os usuários autorizados trabalhem sobre a mesma base.
+
+O cliente mantém uma cópia leve no IndexedDB somente como apoio de interface. Dados operacionais completos vêm da base central; isso evita duplicar dezenas de megabytes localmente e reduz os travamentos observados nas primeiras cargas.
+
+O formato do payload usa:
+
+```text
+PersistedWorkspace
+  ├── datasets             # fontes importadas e respectivas linhas
+  ├── dimensions           # dimensões e fatores de conversão
+  ├── tasks                # tarefas e histórico de ações
+  ├── logistics            # motoristas, veículos e viagens
+  ├── commercialClosings   # distribuições, vínculo de pedido e anotações
+  ├── premises             # parâmetros operacionais
+  ├── emailSettings        # destinatários e regras de alerta
+  └── dashboardSettings    # preferências, como ciclo de DAE
+```
+
+## Fontes de dados e importação
+
+| Fonte | Papel | Exemplos de campos reconhecidos |
+| --- | --- | --- |
+| Planejamento | Demanda, dose, WBS, área e data prevista | Material, Classificação, Atividade, Talhão, WBS, volume, área e data. |
+| ZPS007 | Execução e área registrada | DiagRede, operação, status e área executada. |
+| CN52 | Consumo/aplicado | Elemento PEP, centro, talhão, material e quantidade retirada. |
+| ZMM_BATCH | Estoque prioritário | Centro, depósito, lote, utilização livre, nome/local de estoque especial. |
+| MB52 | Complemento de estoque | Usado somente quando a apresentação não aparece na BATCH. |
+| MB5T | Materiais em trânsito | Centro, destino, material e quantidade. |
+| Pedidos pendentes | Demanda em aberto | Pedido, produto, volume e `DtRemPed`. |
+| Dimensões.xlsx | Semântica e regras | Ativo, grupo, subgrupo, padrão, conversão, centro, núcleo e cultura. |
+| Estoque webAgil | Saldo disponível para carregamento | Produto, lote, saldo, paletes e armazém. |
+| Relação de solicitação webAgil | Solicitações de carregamento | Solicitação, destino, produto, lote, quantidade e unidade. |
+| Pedidos de compra | Vínculo de fechamentos | Número do pedido, fornecedor, item e quantidade fornecida. |
+
+### Contrato de atualização
+
+1. Um administrador seleciona as fontes na Central de importações.
+2. O worker identifica cabeçalhos tolerando variantes de acento, abreviação e pontuação.
+3. Os registros são normalizados e conciliados contra as dimensões.
+4. O workspace compactado é persistido na base central e passa a atender os demais usuários.
+5. A tela mostra data de arquivo, data de carga e situação de atualização.
+6. Itens sem correspondência viram exceções exportáveis; não se tornam saldo ou planejamento artificial.
+
+> Dimensões e Planejamento são bases de referência: não devem receber o aviso de atraso como se fossem fontes de execução diária.
+
+## Motor de conciliação
 
 <p align="center">
   <img src="docs/assets/reconciliation-flow.svg" alt="Fluxo de conciliação e governança de dados" width="100%" />
 </p>
 
-```mermaid
-flowchart LR
-    A[Arquivos SAP e Excel] --> B[Leitura no navegador]
-    B --> C[Normalização de texto e números]
-    C --> D[Dimensões e premissas]
-    D --> E[Livro de conciliação]
-    E --> F[Saldo por núcleo]
-    E --> G[Execução e dose]
-    E --> H[Provisionamento]
-    E --> I[Exceções de qualidade]
-    F --> J[Decisão operacional]
-    G --> J
-    H --> J
-    I --> J
-```
+### Material: semântica antes do código SAP
 
-## Arquitetura
-
-```text
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              EXPERIÊNCIA WEB                                │
-│ React 19 + TypeScript + Vite + XLSX                                         │
-│ Visão geral | Calendarização | Acompanhamento | Execução | Importações      │
-└────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         CAMADA DE DOMÍNIO E CONCILIAÇÃO                      │
-│ material-dimension.ts  → dimensões, nomes normalizados e materiais padrão  │
-│ reconciliation.ts      → WBS, núcleo, estoque, trânsito, consumo e pedidos │
-│ page.tsx               → regras de visualização e decisões operacionais     │
-└────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                   ┌──────────────────┴──────────────────┐
-                   ▼                                     ▼
-┌──────────────────────────────────────┐   ┌────────────────────────────────┐
-│ Persistência atual                    │   │ Caminho de persistência central │
-│ IndexedDB no navegador                │   │ Worker + D1 + R2 + Drizzle      │
-│ dados no mesmo dispositivo            │   │ estrutura preparada no projeto   │
-└──────────────────────────────────────┘   └────────────────────────────────┘
-```
-
-### Stack
-
-| Camada | Tecnologias | Responsabilidade |
-| --- | --- | --- |
-| Interface | React 19, TypeScript, Vite, Lucide | UX, filtros, tabelas, cards, modais e exportações. |
-| Leitura de arquivos | SheetJS (`xlsx`) | Importação de `.xlsx`/`.xls`, cabeçalhos e geração de relatórios Excel. |
-| Regras de negócio | TypeScript puro | Conciliação, conversões, classificação de estoque e cálculos de decisão. |
-| Persistência local | IndexedDB | Mantém cargas, dimensões, premissas e tarefas no mesmo navegador. |
-| Produção | Vercel + SPA Vite | Publicação estática, rápida e independente da API central. |
-| Evolução central | Cloudflare Workers, D1, R2 e Drizzle | Base para versões compartilhadas, auditoria e armazenamento centralizado. |
-
-### Estrutura de código
-
-```text
-plataforma/
-├── app/
-│   ├── page.tsx                  # Interface, cálculos e persistência local
-│   ├── api/imports/route.ts      # Rota de ingestão central preparada
-│   └── globals.css               # Tema e estilos globais
-├── components/
-│   └── dimension-upload.tsx      # Leitura de Dimensões.xlsx e Premissas
-├── lib/
-│   ├── reconciliation.ts         # WBS, núcleo, saldo e conciliação
-│   ├── material-dimension.ts     # Normalização e conversões
-│   └── operational-normalization.ts
-├── db/schema.ts                  # Versões, arquivos, premissas e auditoria
-├── worker/index.ts               # Worker para implantação Cloudflare
-├── docs/assets/                  # Diagramas técnicos deste README
-├── vite.vercel.config.ts         # Build SPA para Vercel
-└── vercel.json                   # Rewrites e produção
-```
-
-## Fontes de dados e contratos de entrada
-
-| Fonte | Papel no produto | Exemplos de campos reconhecidos |
-| --- | --- | --- |
-| Planejamento | Demanda prevista, dose, área, WBS e data de aplicação | Material, Classificação, Núcleo, WBS, data, volume e área. |
-| ZPS007 | Execução e área registrada | DiagRede, Operação, Área Executada e status. |
-| CN52 | Consumo/aplicado | Elemento PEP, material, quantidade retirada e centro. |
-| ZMM_BATCH | Fonte prioritária de estoque | Centro, depósito, lote, texto breve, utilização livre e armazém/cidade. |
-| MB52 | Estoque complementar | Centro, depósito, texto breve e utilização livre. |
-| MB5T | Materiais em trânsito | Centro/destino, descrição e quantidade. |
-| Pedidos pendentes | Volume solicitado ainda em aberto | Centro, Descrição Material, Saldo Forn ou Qtd.pedido. |
-| Dimensões.xlsx | Semântica operacional | Ativo, grupo, subgrupo, material agregado, centros, culturas e fatores. |
-
-### Estratégia de ingestão
-
-1. O usuário seleciona uma ou mais fontes na Central de importações.
-2. A aplicação lê a planilha ou identifica a linha de cabeçalho compatível quando o layout exige.
-3. Cada arquivo recebe metadados de nome, abas, quantidade de linhas, data de modificação e data da importação.
-4. Linhas e premissas são persistidas em IndexedDB; a carga volta ao abrir a aplicação no mesmo navegador.
-5. Os visuais são recalculados a partir do conjunto de dados conciliado, sem cópia manual entre planilhas.
-
-> A persistência atual é local ao navegador. Para a fase pessoal do projeto, isso reduz infraestrutura e mantém velocidade. A camada D1/R2 já modelada no repositório abre caminho para colaboração, versionamento e governança central.
-
-## Motor de conciliação
-
-### A chave é a semântica do material, não o código SAP
-
-O código SAP é preservado para auditoria, mas não compõe a chave operacional. A conciliação usa a hierarquia:
+O código SAP é mantido para auditoria, mas a chave operacional é formada pela descrição normalizada. A hierarquia utilizada é:
 
 ```text
 Princípio ativo
   └── Material agregado (padrão)
-        └── Material físico / apresentação em estoque
+        └── Material físico / apresentação de estoque
 ```
 
-Antes do vínculo com as dimensões, os nomes passam por normalização:
+Exemplo de normalização:
 
 ```text
-"VÉRTIMEC 84 SC" → "VERTIMEC84SC"
-"Vertimec-84 SC" → "VERTIMEC84SC"
+"VÉRTIMEC 84 SC"  → VERTIMEC84SC
+"Vertimec-84 SC"  → VERTIMEC84SC
 ```
 
-Essa etapa reduz falsos negativos por acentuação, caixa, hífen ou pontuação e mantém a lógica aderente à forma como os produtos aparecem no SAP e nas planilhas.
+Isso reduz falsos negativos por acento, caixa, hífen, espaços ou variações de apresentação. Quando uma relação padrão → físico possui fator, o sistema apresenta estoque convertido e, em detalhe, o saldo físico real.
 
-### WBS e núcleo produtivo
+### WBS, talhão e núcleo
 
-O padrão de WBS tratado pelo projeto é:
+O padrão de WBS é interpretado a partir de:
 
 ```text
-[Cultura].[Fazenda].[Safra].[Talhão]-[Índice]
+[Cultura].[Fazenda].[Safra].[Talhão].[Índice da divisão]
 
-Índice: A=1 · B=2 · C=3 · D=4 · E=5
+A = 1 · B = 2 · C = 3 · D = 4 · E = 5
 ```
+
+Regras operacionais relevantes:
 
 | Contexto | Regra | Resultado |
 | --- | --- | --- |
-| Planejamento | Talhão inicia com `TL` | `NC-TP` |
-| Planejamento | Talhão inicia com `FM` | `NC-STM` |
-| Planejamento | Talhão inicia com `BM` | `NC-BBJ` |
-| Planejamento | Núcleo `NC-VER` | normaliza para `NC-AGV` |
-| CN52 | Centro `FBJ2` e talhão `FM` | `NC-STM` |
-| CN52 | Centro `FBJ2` e talhão `BM` | `NC-BBJ` |
-| CN52 | Talhão inicia com `TL` | `NC-TP` |
+| Planejamento | Talhão iniciado por `TL` | `NC-TP` |
+| Planejamento | Talhão iniciado por `FM` | `NC-STM` |
+| Planejamento | Talhão iniciado por `BM` | `NC-BBJ` |
+| Planejamento | Núcleo `NC-VER` | `NC-AGV` |
+| CN52 | Unidade/talhão com regra BBJ, STM ou TP | Núcleo específico na execução |
 | Estoque | Centro `FVR1` | `NC-TP` |
-| Estoque | `FBJ2` + depósito `TR01` | `NC-BBJ` |
-| Estoque | `FBJ2` + depósito `UTS1` | `NC-STM` |
-| Estoque | Depósito vazio | pool de armazém `BRAVO` |
+| Estoque | Depósito vazio ou centro `0714` | Armazém central |
 
-As regras são delimitadas por contexto. Uma exceção aplicada ao estoque não altera silenciosamente o planejamento ou o trânsito.
+Essas regras são contextuais: uma exceção de estoque não reescreve silenciosamente planejamento, execução ou trânsito.
 
-### Conversão de apresentação física
+### BATCH, MB52, armazém e lote
 
-O fator da dimensão é indexado pela composição:
-
-```text
-material padrão | apresentação física
-```
-
-Quando há fator válido:
-
-```text
-quantidade padronizada = quantidade física / fator de conversão
-```
-
-Se o Planejamento já informar `Volume ajustado (produto) padrão`, esse valor tem precedência. Essa decisão evita reprocessar um volume já ajustado por regra operacional anterior.
-
-### Estoque, armazém e fallback MB52
-
-| Conceito | Regra implementada |
+| Conceito | Regra |
 | --- | --- |
-| Fazenda | Saldo com depósito preenchido e centro diferente de `0714`. |
-| Armazém | Centro `0714` ou depósito vazio; localização formada por `Nome Est.Esp. - Local Est.Esp.` quando disponível. |
-| Lote | Não divide a decisão visual: lotes iguais são consolidados por tipo, material físico e localização. |
-| BATCH | Fonte prioritária, pois contém saldo, lote e contexto de armazém/cidade. |
-| MB52 | Fallback: só entra quando a apresentação física não existe na BATCH, impedindo dupla contagem. |
-| Saldo zero | Não cria disponibilidade artificial para fazenda ou armazém. |
-| Armazém central | É rateado uma única vez por material agregado no provisionamento. |
+| BATCH | Fonte prioritária: contém lote, saldo e descrição de armazém/cidade. |
+| MB52 | Fallback apenas para materiais ausentes na BATCH; evita dupla contagem. |
+| Fazenda | Saldo com depósito preenchido, exceto o tratamento específico de armazém. |
+| Armazém | Centro `0714` ou depósito vazio; localização usa nome e local do estoque especial quando disponível. |
+| Lote | Não fragmenta os visuais decisórios: é consolidado por material, tipo de saldo e localização. |
+| Saldo zero | Não é oferecido como apoio de fazenda, armazém ou outro núcleo. |
 
-### Fórmulas operacionais
+### Fórmulas que orientam decisão
 
 ```text
-Demanda da janela = max(0, planejado − aplicado)
-
-Disponibilidade local = saldo da fazenda + trânsito
-
-Saldo após atendimento = disponibilidade local + apoio do armazém − demanda
-
-A entregar = saldo + aplicado + trânsito − quantidade planejada
-
-Impacto de dose = volume executado − (dose planejada × área executada)
+Demanda da janela       = max(0, planejado − aplicado)
+Disponibilidade local   = saldo na fazenda + trânsito
+Saldo após atendimento  = disponibilidade local + apoio − demanda
+A entregar              = saldo + aplicado + trânsito − quantidade planejada
+Impacto de dose         = volume executado − (dose planejada × área executada)
 ```
 
-O indicador **A entregar** é codificado visualmente: positivo em verde, negativo em vermelho e zero em preto.
+O provisionamento aloca saldo central uma única vez por material agregado. Depois disso, sugere apoio de outros núcleos somente para o saldo realmente disponível.
 
-## Governança e qualidade de dados
+### Governança de exceções
 
-O sistema não converte ausência de dado em saldo zero. Registros que não podem ser conciliados viram evidência para correção.
-
-### Relatório de conciliação
-
-A Central de importações gera uma tabela e uma exportação Excel para os casos abaixo.
-
-| Diagnóstico | Leitura | Próxima ação sugerida |
+| Exceção | Interpretação | Ação sugerida |
 | --- | --- | --- |
-| Descrição de material ausente | A origem não permitiu identificar o produto. | Corrigir a descrição no arquivo SAP/Excel. |
-| Sem vínculo nas dimensões | Produto existe na fonte, mas não possui semântica operacional cadastrada. | Criar cadastro ou corrigir grafia em Dimensões.xlsx. |
-| Núcleo não conciliado | Centro/Fazenda não encontrou uma regra de destino. | Criar ou ajustar Centro/Fazenda → Núcleo. |
+| Material sem dimensão | A origem contém uma descrição ainda sem padrão operacional. | Cadastrar novo vínculo ou corrigir a grafia. |
+| Núcleo não conciliado | Centro, fazenda ou talhão não possui regra correspondente. | Atualizar a dimensão Centro/Fazenda → Núcleo. |
+| Dados incompletos | Campo necessário não veio da fonte. | Corrigir exportação SAP/Excel antes da decisão. |
+| Conversão indefinida | Há material físico sem fator para o padrão. | Completar a dimensão de conversão. |
 
-### Indicador de atualização
+O sistema privilegia ausência explícita de conciliação em vez de transformar incerteza em número zero.
 
-O card usa o arquivo operacional mais antigo carregado para impedir que uma fonte recente esconda outra fonte defasada.
-
-| Idade do arquivo | Estado | Intenção |
-| --- | --- | --- |
-| Até 12 horas | OK | Base apta para acompanhamento diário. |
-| Acima de 12 horas até 2 dias | Em atenção | Revisar se a rotina de atualização ocorreu. |
-| Acima de 2 dias | Necessita atualizar | Recomenda-se uma nova carga antes da decisão. |
-
-## Visões de decisão
+## Visões operacionais
 
 ### Visão geral
 
-- Percentual de execução de materiais.
-- Execução por subgrupo, separada entre Safra e Safrinha.
-- Macro por cultura.
-- Indicadores de saldo com atenção, pedidos pendentes e cobertura de vínculos.
+- Centro de decisão com riscos, pendências e pedidos urgentes.
+- Execução por grupo e subgrupo, separando Safra e Safrinha.
+- Área planejada baseada no Planejamento filtrado por `Classificação = Atividade` e `Atividade = PLANTIO SEM ADUBO`, evitando duplicação de hectares.
+- DAE por núcleo, cultura e data de plantio, respeitando o ciclo configurado.
 
 ### Calendarização e provisionamento
 
-- Intervalo de avaliação configurável a partir da data atual.
-- Demanda do período baseada no Planejamento.
-- Saldo por núcleo, trânsito, volume solicitado e apoio do armazém.
-- Status por linha: atende no núcleo, atende com armazém ou falta.
-- Detalhe micro de fazenda, armazém e trânsito sem multiplicar volume por lote.
-- Exportação Excel em abas de resumo e detalhes.
+- Data inicial e final de avaliação configuráveis.
+- Demanda baseada na data prevista do Planejamento.
+- Saldo de fazenda, trânsito, pedidos pendentes, armazém e sugestão de apoio entre núcleos.
+- Leitura micro por núcleo, material e localização, sem dividir volumes por lote.
+- Exportação Excel com visão executiva e detalhada.
 
 ### Acompanhamento
 
+- Agrupamento por princípio ativo com total de planejado, estoque, trânsito, aplicado, a entregar e solicitado.
 - Filtros por ciclo, grupo, subgrupo, cultura, núcleo e busca textual.
-- Agrupamento por princípio ativo e linha total por grupo.
-- Expansão: material padrão → material físico → localização.
-- Armazém apresentado como núcleo próprio, sem misturar saldo central e saldo de fazenda.
-- Excel com abas de acompanhamento, totais por ativo e detalhes.
+- Expansão progressiva: padrão → material em estoque → localização.
+- Identificação de saldo convertido e saldo físico do material quando há fator de conversão.
+- Armazém em linha própria com descrição de cidade/localização.
 
 ### Execução
 
-- Planejamento x consumo aplicado do CN52.
-- Área executada do ZPS007 vinculada por Diagrama/Rede e Operação.
-- Dose realizada comparada à dose planejada.
-- Impacto de volume causado por aumento ou redução de dose.
+- Comparação entre volumes planejados e aplicados.
+- Percentual por subgrupo e ciclo.
+- Dose usada ao lado da dose planejada, com impacto absoluto de volume.
+- Segmentação por cultura, ciclo, grupo e subgrupo.
 
-## Premissas como produto, não como nota de rodapé
+### Alertas e tarefas
 
-| Domínio | Exemplos |
+- Alertas para produto necessário em até 30 dias sem saldo na fazenda.
+- Priorização de repasse a partir de armazém, destacando a localização do saldo.
+- Detecção de aumento relevante de dose e itens vencidos.
+- Farol de pedidos com base em `DtRemPed`: demanda próxima, possível atraso, atenção e alerta.
+- Registro de ações com material/pedido vinculado, histórico paginado e exportação Excel.
+
+## Logística de carregamento
+
+O módulo **Logística** é administrativo e usa as fontes `Estoque webAgil` e `Relação de solicitação webAgil`.
+
+### Configuração rodoviária
+
+- Cadastro de motorista: nome completo, CPF e telefone opcional.
+- Cadastro de veículo: placa, modelo e capacidade em quilogramas.
+- Proteção contra excluir motorista ou veículo já vinculado a uma viagem.
+
+### Uma rota, várias solicitações
+
+Uma viagem não está limitada a uma única solicitação. O fluxo foi modelado para a rotina real de carregamento:
+
+```text
+Selecionar solicitação + material/lote
+        ↓
+Adicionar à carga da rota
+        ↓
+Trocar a solicitação e repetir quantas vezes for necessário
+        ↓
+Selecionar motorista, veículo e NF
+        ↓
+Emitir uma viagem única
+        ↓
+Vincular receita, se aplicável
+```
+
+Cada item da rota preserva sua solicitação, data, produto, código, lote, quantidade, origem e destino. A viagem concentra motorista, veículo, nota fiscal, data de emissão e receita. Assim, uma mesma NF pode transportar diversos materiais e solicitações sem perder rastreabilidade.
+
+O documento Excel é gerado com **uma linha por item da rota**, repetindo os dados gerais da viagem. Viagens legadas de uma única solicitação continuam compatíveis com o modelo novo.
+
+## Fechamentos comerciais
+
+O módulo **Fechamentos** também é exclusivo de administradores e cobre a sequência abaixo:
+
+```text
+Comercial repassa o fechamento
+        ↓
+Planejamento distribui por destino e mês
+        ↓
+Distribuição/calendarização é repassada à operação
+        ↓
+Pedido de compra é criado e vinculado posteriormente
+```
+
+### Distribuições carregadas
+
+As distribuições históricas do arquivo **Resumo fechamentos 26-27** foram carregadas diretamente na base central, sem criar uma nova opção de importação. Cada distribuição conserva fornecedor, vencimento, destino, local de entrega, cultura, princípio ativo, produto, unidade, preço, embalagem, total e volumes mensais.
+
+Os vínculos a pedido permanecem propositalmente vazios até que o administrativo relacione a distribuição ao pedido de compra correspondente. A carga é idempotente: identificadores estáveis impedem duplicação em novas aberturas da aplicação.
+
+### Perguntas respondidas
+
+- O que já foi fechado para determinado princípio ativo ou produto?
+- Qual fornecedor, preço, moeda e vencimento de pagamento?
+- Para onde a entrega foi planejada?
+- Em qual mês o volume está calendarizado?
+- Quanto foi fornecido pelo pedido vinculado e quanto ainda falta fechar?
+- Quais observações comerciais, fiscais ou de faturamento acompanham o fechamento?
+
+## Segurança, perfis e persistência
+
+### Autenticação
+
+- Senhas não são armazenadas em texto puro: o backend utiliza `scrypt` com salt aleatório.
+- O token de sessão é aleatório, armazenado apenas como hash no banco e expira em 12 horas.
+- O navegador recebe cookie `HttpOnly`, `Secure`, `SameSite=Lax`.
+- Não há credenciais operacionais no repositório.
+
+### Perfis
+
+| Perfil | Acesso |
 | --- | --- |
-| Regras operacionais | Tolerância, amostra mínima, horizonte de demanda e status excluído. |
-| Material | Nome físico → material agregado, princípio ativo, grupo e subgrupo. |
-| Centro/Fazenda | Centro ou fazenda → núcleo responsável. |
-| Cultura | Cultura → ciclo Safra ou Safrinha. |
-| Conversão | Material padrão + apresentação física → fator. |
+| Administrador | Importações, dimensões, configurações, usuários, logística, fechamentos, edição de premissas e gestão completa. |
+| Operador | Leitura restrita ao núcleo definido para visão geral, alertas, calendarização e execução; acompanhamento permanece disponível de forma ampliada. |
 
-As premissas deixam de ficar escondidas em fórmulas. A tela de Premissas oferece uma visão tabulada de todos os valores em uso, e mudanças manuais entram no mesmo motor de conciliação.
+O administrador pode criar, editar e excluir usuários. A aplicação impede remover o próprio usuário logado ou eliminar o último administrador.
 
-## Privacidade e postura de dados
+### Persistência e desempenho
 
-- Arquivos operacionais não são enviados automaticamente para serviços externos na versão publicada em Vercel.
-- A carga atual é processada e persistida no IndexedDB do navegador do usuário.
-- Dados de exemplo e arquivos SAP reais não fazem parte do repositório.
-- A evolução central proposta preserva versionamento, metadados e trilha de auditoria no desenho de banco.
+- Dados operacionais são persistidos na base central e compartilhados entre usuários autorizados.
+- O payload é compactado antes de ser gravado e descompactado em worker no navegador.
+- A API compacta cargas antigas automaticamente quando identifica o formato anterior.
+- A tela de carregamento existe para aguardar dados sem bloquear a interface durante parsing, reconciliação e renderização.
+- Tarefas, histórico, motoristas, veículos, viagens, fechamentos e anotações permanecem no mesmo workspace central.
 
 ## Como executar localmente
 
@@ -334,62 +405,92 @@ As premissas deixam de ficar escondidas em fórmulas. A tela de Premissas oferec
 
 - Node.js `>= 22.13.0`
 - npm
+- Uma URL PostgreSQL compatível com Neon Serverless para testar as APIs centrais
 
-### Instalação e desenvolvimento
+### Instalação
 
 ```powershell
+git clone https://github.com/FortunatoE/Agronexus-360.git
+cd Agronexus-360
 npm install
-npm run dev
 ```
 
-### Verificações
+### Variáveis de ambiente
+
+Crie `.env.local` sem incluir dados sensíveis no Git:
+
+```dotenv
+DATABASE_URL=postgresql://...
+```
+
+`DATABASE_URL` é necessária para login, usuários e workspace central. O schema é criado de forma idempotente pela própria camada de API quando a conexão estiver disponível.
+
+### Desenvolvimento e validação
 
 ```powershell
+# desenvolvimento
+npm run dev
+
+# validação de lint
 npm run lint
+
+# build completo local
+npm run build
+
+# artefato SPA usado pela Vercel
 npm run build:vercel
 ```
 
-### Alvos de publicação
+### Checks auxiliares
 
-| Alvo | Comando | Observação |
-| --- | --- | --- |
-| Vercel | `npm run build:vercel` | Gera a SPA em `dist-vercel/`. |
-| Worker local | `npm run build` e `npm run start` | Exercita o caminho Cloudflare/Vinext. |
+Os scripts em `scripts/` existem para diagnósticos administrativos e de volume do workspace, por exemplo:
 
-O `vite.vercel.config.ts` isola a SPA para produção, enquanto `vite.config.ts` preserva a configuração de Worker e conectores da evolução Cloudflare.
-
-## Modelo de dados preparado para evolução central
-
-```mermaid
-erDiagram
-    IMPORT_VERSIONS ||--o{ IMPORT_FILES : contem
-    IMPORT_VERSIONS ||--o{ OPERATIONAL_RECORDS : normaliza
-    PREMISE_SETS ||--o{ PREMISE_ITEMS : possui
-    TASKS ||--o{ TASK_HISTORY : registra
+```powershell
+node scripts/check-db.mjs
+node scripts/check-workspace-size.mjs
+node scripts/compact-central-workspace.mjs
+node scripts/verify-compact-workspace.mts
 ```
 
-O schema Drizzle já separa responsabilidades de versões, arquivos, registros normalizados, premissas, tarefas e auditoria. Esse desenho permite evoluir para:
+Use-os apenas em ambiente autorizado e com `DATABASE_URL` configurada.
 
-- Cargas versionadas e ativação controlada.
-- Auditoria de arquivos e registros normalizados.
-- Premissas com vigência.
-- Tarefas e histórico de ações.
-- Integração futura com autenticação, banco central e colaboração entre times.
+## Operação e publicação
 
-## Evolução planejada
+### Vercel
+
+A produção usa build Vite dedicado:
+
+```powershell
+npm run build:vercel
+vercel --prod
+```
+
+O arquivo `vercel.json` define `npm run build:vercel`, publica `dist-vercel/` e preserva o fallback de SPA. As APIs em `api/` são detectadas como funções serverless.
+
+### Checklist de uma atualização operacional
+
+1. Conferir se as dimensões refletem materiais, centros, núcleos, culturas e fatores atuais.
+2. Importar as fontes operacionais atualizadas.
+3. Ler o indicador de frescor e o relatório de conciliação.
+4. Validar uma amostra material → núcleo → estoque → execução.
+5. Rodar calendarização para a janela de interesse.
+6. Revisar alertas, tarefas e apoio de armazém/outros núcleos.
+7. Registrar ações e compartilhar os documentos necessários com a operação.
+
+## Roadmap técnico
 
 | Horizonte | Evolução | Valor esperado |
 | --- | --- | --- |
-| Curto prazo | Refinar relatório de exceções, exportações e regras de dimensões. | Menos correção manual e maior confiança no dado. |
-| Médio prazo | Persistência central com D1/R2 ou banco relacional gerenciado. | Versões compartilhadas e histórico de cargas. |
-| Médio prazo | Autenticação e perfis de acesso. | Governança entre gestor, analista e equipe de campo. |
-| Médio prazo | Alertas proativos por D-15, ruptura e atraso de atualização. | Antecipação de compra, transferência e aplicação. |
-| Longo prazo | Integração automatizada com SAP e eventos de logística. | Menos arquivos manuais e operação próxima do tempo real. |
-| Longo prazo | Simulações de cenário por dose, janela e movimentação. | Planejamento mais robusto frente a desvios de execução. |
+| Curto prazo | Aumentar cobertura de testes do motor de conciliação e contratos de importação. | Mais segurança ao evoluir regras críticas. |
+| Curto prazo | Versionamento explícito por carga e comparação entre versões. | Auditoria de alterações de saldo, plano e premissas. |
+| Médio prazo | Filas para importação pesada e processamento assíncrono de alertas. | Menor tempo de resposta e maior resiliência. |
+| Médio prazo | Integração de e-mail por domínio validado e agenda de notificações. | Alertas rastreáveis sem depender do cliente de e-mail. |
+| Médio prazo | Integração mais direta com SAP/webAgil. | Menos manipulação manual de arquivos. |
+| Longo prazo | Simulação de cenário de dose, janela, transferência e compra. | Antecipação de risco e decisões de abastecimento mais robustas. |
 
 ## Narrativa profissional
 
-> “O AgroNexus 360° nasceu de uma necessidade real do meu trabalho como Analista de Planejamento: transformar relatórios e planilhas operacionais em decisões rápidas, confiáveis e explicáveis. O projeto combina conhecimento de agronegócio, SAP, Excel, modelagem de dados, UX e desenvolvimento de software. Mais do que visualizar indicadores, ele estrutura regras de negócio que antes dependiam de interpretação manual e cria uma base para uma gestão de insumos orientada por dados.”
+> “O AgroNexus 360° nasceu de uma necessidade real do meu trabalho como Analista de Planejamento: transformar relatórios e planilhas operacionais em decisões rápidas, confiáveis e explicáveis. O projeto combina agronegócio, SAP, Excel, modelagem de dados, UX e desenvolvimento full-stack. Mais do que visualizar indicadores, ele organiza regras que antes dependiam de interpretação manual e cria uma base compartilhada para gerir insumos, abastecimento, logística e fechamentos comerciais.”
 
 ## Autor
 

@@ -1,7 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
-import * as XLSX from "xlsx";
+import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { DimensionUpload } from "@/components/dimension-upload";
 import { emptyDimensionBundle, normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
 import {
@@ -28,21 +27,74 @@ import {
 import {
   AlertTriangle, BarChart3, Bell, CalendarDays, CheckCircle2, ChevronDown,
   ClipboardCheck, Download, FileUp, LayoutDashboard, Moon, PackageSearch,
-  Search, Settings, ShieldCheck, SlidersHorizontal, Sprout, Sun, Upload,
-  UsersRound, X,
+  Menu, Search, Settings, ShieldCheck, SlidersHorizontal, Sprout, Sun, Upload,
+  Truck, UsersRound, X,
 } from "lucide-react";
 
 type Row = OperationalRow;
-type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito" | "pedidos";
+type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito" | "pedidos" | "estoqueWeb" | "solicitacoesWeb" | "pedidosCompra";
 type ImportKey = SourceKey | "dimensoes";
 type Datasets = Record<SourceKey, Row[]>;
 type ImportSummary = { fileName: string; fileModifiedAt: string; importedAt: string; rows: number; sheets: string[] };
+type ImportHistoryItem = ImportSummary & { id: string; source: SourceKey; version: number; previousRows: number; warnings: number };
+type AuditEvent = { id: string; actor: string; detail: string; kind: "import" | "premise" | "task" | "workspace"; createdAt: string };
 type Premises = { tolerance: string; sample: string; horizon: string; excludedStatus: string };
 type DimensionPremise = { domain: string; key: string; value: string };
 type EmailSettings = { defaultCopy: string; nucleusRecipients: Record<string, string> };
 type DashboardSettings = { daeCycle: "Safra" | "Safrinha" | "Ambos" };
+type AppUser = { id: string; username: string; name: string; role: "admin" | "viewer" | string; nucleus?: string };
+type ManagedUser = AppUser & { createdAt: string };
+type UserDraft = { id?: string; name: string; nucleus: string; password: string; role: "admin" | "viewer"; username: string };
 type TaskAction = { id: string; note: string; createdAt: string };
-type TaskItem = { id: string; pendingId: string; material?: string; nucleus?: string; title: string; createdAt: string; actions: TaskAction[] };
+type TaskStatus = "Aberta" | "Em andamento" | "Aguardando" | "Concluída";
+type TaskItem = { id: string; pendingId: string; material?: string; nucleus?: string; title: string; createdAt: string; actions: TaskAction[]; owner?: string; dueDate?: string; evidence?: string; status?: TaskStatus; updatedAt?: string };
+type RoadDriver = { id: string; fullName: string; cpf: string; phone?: string; createdAt: string };
+type RoadVehicle = { id: string; plate: string; capacity: number; model: string; createdAt: string };
+type TripRecipe = { culture: string; target: string; dose: string };
+type LogisticsTripItem = {
+  id: string; requestId: string; requestDate: string; product: string; productCode: string; lot: string;
+  quantity: number; unit: string; sourceWarehouse: string; destination: string; destinationCode: string;
+};
+type LogisticsTrip = {
+  id: string; requestId: string; requestDate: string; product: string; productCode: string; lot: string;
+  quantity: number; unit: string; sourceWarehouse: string; destination: string; destinationCode: string;
+  driverId: string; vehicleId: string; invoiceNumber: string; createdAt: string; recipe?: TripRecipe; items?: LogisticsTripItem[];
+};
+type LogisticsState = { drivers: RoadDriver[]; trips: LogisticsTrip[]; vehicles: RoadVehicle[] };
+type ClosingDistribution = Record<string, number>;
+type CommercialCurrency = "" | "BRL" | "USD";
+type CommercialClosing = {
+  id: string;
+  supplier: string;
+  paymentDue: string;
+  destination: string;
+  deliveryLocation: string;
+  cycle: "Safra" | "Safrinha";
+  culture: string;
+  active: string;
+  product: string;
+  unit: string;
+  currency: CommercialCurrency;
+  unitPrice: number;
+  packaging: string;
+  totalVolume: number;
+  distribution: ClosingDistribution;
+  orderKey: string;
+  orderNumber: string;
+  createdAt: string;
+  updatedAt: string;
+};
+type ClosingAnnotation = {
+  id: string;
+  closingId: string;
+  materialSent: string;
+  purchaseVolume: number | null;
+  invoicedVolume: number | null;
+  note: string;
+  resolved: boolean;
+  createdAt: string;
+};
+type CommercialClosingsState = { annotations: ClosingAnnotation[]; closings: CommercialClosing[] };
 type PersistedWorkspace = {
   bundle: DimensionBundle;
   datasets: Datasets;
@@ -52,6 +104,10 @@ type PersistedWorkspace = {
   tasks: TaskItem[] | string[];
   emailSettings?: EmailSettings;
   dashboardSettings?: DashboardSettings;
+  importHistory?: ImportHistoryItem[];
+  auditEvents?: AuditEvent[];
+  logistics?: LogisticsState;
+  commercialClosings?: CommercialClosingsState;
 };
 type ReconciliationIssue = { action: string; code: string; count: number; detail: string; material: string; source: string };
 type PremiseSection = {
@@ -79,15 +135,28 @@ type OperationalAlert = {
   title: string;
   detail: string;
   metric: string;
+  warehouseBalances?: ReconciliationRow["locations"];
 };
 
 const workspaceDatabase = "agronexus-360";
 const workspaceStore = "workspace";
 const workspaceRecord = "current";
-const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [], pedidos: [] };
+const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], estoque: [], estoqueMb52: [], transito: [], pedidos: [], estoqueWeb: [], solicitacoesWeb: [], pedidosCompra: [] };
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
 const initialEmailSettings: EmailSettings = { defaultCopy: "", nucleusRecipients: {} };
 const initialDashboardSettings: DashboardSettings = { daeCycle: "Safra" };
+const initialLogistics: LogisticsState = { drivers: [], trips: [], vehicles: [] };
+const initialCommercialClosings: CommercialClosingsState = { annotations: [], closings: [] };
+const emptyUserDraft: UserDraft = { name: "", nucleus: "", password: "", role: "viewer", username: "" };
+function logisticsTripItems(trip: LogisticsTrip): LogisticsTripItem[] {
+  return trip.items?.length ? trip.items : [{
+    id: `legado-${trip.id}`, requestId: trip.requestId, requestDate: trip.requestDate, product: trip.product,
+    productCode: trip.productCode, lot: trip.lot, quantity: trip.quantity, unit: trip.unit,
+    sourceWarehouse: trip.sourceWarehouse, destination: trip.destination, destinationCode: trip.destinationCode,
+  }];
+}
+let xlsxLoader: Promise<typeof import("xlsx")> | null = null;
+function loadXlsx() { xlsxLoader ??= import("xlsx"); return xlsxLoader; }
 const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header: number }> = [
   { key: "planejamento", title: "Planejamento", hint: "PLANEJAMENTO.xlsx", header: 0 },
   { key: "execucao", title: "Execução SAP", hint: "ZPS007.xlsx", header: 1 },
@@ -96,11 +165,14 @@ const sourceConfig: Array<{ key: SourceKey; title: string; hint: string; header:
   { key: "estoqueMb52", title: "Estoque complementar", hint: "MB52.xlsx — somente materiais ausentes na BATCH", header: 1 },
   { key: "transito", title: "Materiais em trânsito", hint: "MB5T.xlsx", header: 1 },
   { key: "pedidos", title: "Pedidos pendentes", hint: "PEDIDOS PENDENTES.xlsx", header: 0 },
+  { key: "estoqueWeb", title: "Estoque webAgil", hint: "Estoque webAgil.xlsx", header: 0 },
+  { key: "solicitacoesWeb", title: "Solicitações webAgil", hint: "Relação de solicitação webAgil.xlsx", header: 0 },
+  { key: "pedidosCompra", title: "Pedidos de compra", hint: "PEDIDOS COMPRA.xlsx", header: 1 },
 ];
 const nav = [
   ["Visão geral", LayoutDashboard], ["Calendarização", CalendarDays],
   ["Acompanhamento", ClipboardCheck], ["Execução", PackageSearch],
-  ["Importações", FileUp], ["Alertas", Bell], ["Tarefas", ClipboardCheck],
+  ["Importações", FileUp], ["Logística", Truck], ["Fechamentos", BarChart3], ["Alertas", Bell], ["Tarefas", ClipboardCheck],
   ["Usuários", UsersRound], ["Configurações", Settings],
 ] as const;
 const crops = [
@@ -112,6 +184,7 @@ const crops = [
 
 function cn(...values: Array<string | false | undefined>) { return values.filter(Boolean).join(" "); }
 function formatNumber(value: number) { return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 1 }).format(value || 0); }
+function formatCurrency(value: number, currency: CommercialCurrency) { return currency ? new Intl.NumberFormat("pt-BR", { style: "currency", currency, maximumFractionDigits: 2 }).format(value || 0) : `${formatNumber(value)} · moeda pendente`; }
 function formatDose(value: number | null) { return value === null ? "n.a." : new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value); }
 function amountToDeliver(row: Pick<ReconciliationRow, "farmBalance" | "warehouseBalance" | "applied" | "transit" | "planned">) {
   return row.farmBalance + row.warehouseBalance + row.applied + row.transit - row.planned;
@@ -126,6 +199,11 @@ function rawPercent(value: number, total: number) { return total ? value * 100 /
 function percentageText(value: number, total: number) { return total > 0 ? rawPercent(value, total).toFixed(1) + "%" : "n.a."; }
 function signedNumber(value: number | null) { return value === null ? "n.a." : (value > 0 ? "+" : "") + formatNumber(value); }
 function dateKey(date: Date) { return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-"); }
+function monthKey(date: Date) { return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0")].join("-"); }
+function formatMonth(value: string) {
+  const [year, month] = value.split("-").map(Number);
+  return Number.isFinite(year) && Number.isFinite(month) ? new Intl.DateTimeFormat("pt-BR", { month: "short", year: "numeric" }).format(new Date(year, month - 1, 1)) : value;
+}
 function formatDateTime(value?: string) {
   if (!value) return "—";
   const date = new Date(value);
@@ -175,6 +253,11 @@ function persistedTasks(value: unknown): TaskItem[] {
       nucleus: candidate.nucleus || "",
       title: candidate.title || "Ação sem título",
       createdAt: candidate.createdAt || new Date().toISOString(),
+      owner: candidate.owner || "Não atribuído",
+      dueDate: candidate.dueDate || "",
+      evidence: candidate.evidence || "",
+      status: candidate.status === "Concluída" || candidate.status === "Em andamento" || candidate.status === "Aguardando" ? candidate.status : "Aberta",
+      updatedAt: candidate.updatedAt || candidate.createdAt || new Date().toISOString(),
       actions: Array.isArray(candidate.actions) ? candidate.actions.filter((action): action is TaskAction => Boolean(action?.note)).map((action, actionIndex) => ({
         id: action.id || `acao-${index}-${actionIndex}`,
         note: action.note,
@@ -211,14 +294,72 @@ async function saveWorkspace(workspace: PersistedWorkspace) {
     transaction.oncomplete = () => resolve();
   }).finally(() => database.close());
 }
+function localWorkspaceSnapshot(workspace: PersistedWorkspace): PersistedWorkspace {
+  // A fonte operacional é central. Manter planilhas completas no IndexedDB
+  // duplicava dezenas de MB e podia travar a aba depois de uma importação.
+  // Localmente ficam apenas configurações, dimensões e histórico de tarefas.
+  return { ...workspace, datasets: { ...emptyDatasets } };
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let output = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) output += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  return window.btoa(output);
+}
+function base64ToBytes(value: string) {
+  const binary = window.atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+function workspaceCodec<T>(action: "decode" | "encode", value: unknown) {
+  if (typeof Worker === "undefined") return Promise.reject(new Error("Worker indisponível"));
+  return new Promise<T>((resolve, reject) => {
+    const worker = new Worker(new URL("../workers/workspace-codec.worker.ts", import.meta.url), { type: "module" });
+    const id = `workspace-${action}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const cleanup = () => worker.terminate();
+    worker.onerror = () => { cleanup(); reject(new Error("Não foi possível processar a base central em segundo plano.")); };
+    worker.onmessage = ({ data }: MessageEvent<{ error?: string; id: string; value?: T }>) => {
+      if (data.id !== id) return;
+      cleanup();
+      if (data.error) { reject(new Error(data.error)); return; }
+      resolve(data.value as T);
+    };
+    worker.postMessage({ action, id, value });
+  });
+}
+async function encodeRemoteWorkspace(workspace: PersistedWorkspace) {
+  try {
+    return await workspaceCodec<{ encoding: "gzip-base64" | "json"; data: unknown }>("encode", workspace);
+  } catch {
+    const bytes = new TextEncoder().encode(JSON.stringify(workspace));
+    if (!("CompressionStream" in window)) return { encoding: "json", data: workspace };
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+    const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+    return { encoding: "gzip-base64", data: bytesToBase64(compressed) };
+  }
+}
+async function decodeRemoteWorkspace(payload: unknown): Promise<PersistedWorkspace | null> {
+  if (!payload || typeof payload !== "object") return null;
+  const stored = payload as { encoding?: string; data?: unknown };
+  try {
+    return await workspaceCodec<PersistedWorkspace | null>("decode", stored);
+  } catch {
+    if (stored.encoding === "json") return stored.data as PersistedWorkspace;
+    if (stored.encoding !== "gzip-base64" || typeof stored.data !== "string" || !("DecompressionStream" in window)) return null;
+    const stream = new Blob([base64ToBytes(stored.data)]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text()) as PersistedWorkspace;
+  }
+}
 
 function dateFromPlan(value: unknown) {
   if (value instanceof Date && !Number.isNaN(value.getTime())) return value;
   const raw = String(value ?? "").trim();
   const serial = Number(raw.replace(",", "."));
   if (Number.isFinite(serial) && serial > 20000 && serial < 80000) {
-    const parsed = XLSX.SSF.parse_date_code(serial);
-    return parsed ? new Date(parsed.y, parsed.m - 1, parsed.d) : null;
+    // Excel conta dias desde 30/12/1899. A conversão local evita carregar a
+    // biblioteca de planilhas apenas para interpretar uma data de planejamento.
+    const date = new Date(1899, 11, 30);
+    date.setDate(date.getDate() + Math.floor(serial));
+    return date;
   }
   const match = /^(\d{1,2})[/.\\-](\d{1,2})[/.\\-](\d{2,4})$/.exec(raw);
   if (match) {
@@ -229,21 +370,33 @@ function dateFromPlan(value: unknown) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function stockHeaderRow(sheet: XLSX.WorkSheet) {
-  const preview = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: "" }).slice(0, 8);
-  const index = preview.findIndex((row) => {
-    const headers = row.map(headerKey);
-    return (headers.includes("CENTRO") || headers.includes("CEN"))
-      && headers.includes(headerKey("Texto breve material"))
-      && headers.includes(headerKey("Utilização livre"));
+async function parseImportFile(file: File, source: (typeof sourceConfig)[number]) {
+  const buffer = await file.arrayBuffer();
+  return new Promise<{ rows: Row[]; rowCount: number; sheets: string[] }>((resolve, reject) => {
+    const worker = new Worker(new URL("../workers/import-worker.ts", import.meta.url), { type: "module" });
+    const id = `${source.key}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const cleanup = () => worker.terminate();
+    worker.onerror = () => { cleanup(); reject(new Error(`Não foi possível processar ${file.name}.`)); };
+    worker.onmessage = ({ data }: MessageEvent<{ error?: string; id: string; rowCount?: number; rows?: Row[]; sheets?: string[] }>) => {
+      if (data.id !== id) return;
+      cleanup();
+      if (data.error || !data.rows) { reject(new Error(data.error || `Não foi possível processar ${file.name}.`)); return; }
+      resolve({ rows: data.rows, rowCount: data.rowCount || data.rows.length, sheets: data.sheets || [] });
+    };
+    worker.postMessage({ buffer, header: source.header, id, key: source.key }, [buffer]);
   });
-  return index >= 0 ? index : 0;
 }
-function rowsFrom(workbook: XLSX.WorkBook, source: (typeof sourceConfig)[number]) {
-  if (source.key === "pedidos") return pendingRowsFrom(workbook);
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const header = source.key === "estoque" || source.key === "estoqueMb52" ? stockHeaderRow(sheet) : source.header;
-  return XLSX.utils.sheet_to_json<Row>(sheet, { range: header, defval: "" });
+function importWarnings(rows: Row[], source: SourceKey) {
+  const materialRequired = source !== "planejamento" && source !== "execucao";
+  let missingMaterial = 0;
+  let missingQuantity = 0;
+  rows.forEach((row) => {
+    const material = readText(row, "Produto", "Texto breve material", "Descrição Material", "Descricao Material", "Descrição Produto", "Descricao Produto", "Texto material");
+    const quantity = readText(row, "Quantidade", "Qt. Solicitada", "Qt Solicitada", "Saldo", "Util.livre", "Saldo Forn", "Qtd.pedido", "Qtde. talhão", "Qtd.retirada");
+    if (materialRequired && !material) missingMaterial += 1;
+    if (material && !quantity) missingQuantity += 1;
+  });
+  return { missingMaterial, missingQuantity, total: missingMaterial + missingQuantity };
 }
 function statusExcluded(row: Row, status: string) {
   return headerKey(readText(row, "Status", "Situação", "Situacao")) === headerKey(status);
@@ -252,24 +405,6 @@ function planningProduct(row: Row, excluded: string) {
   if (statusExcluded(row, excluded)) return false;
   const classification = readText(row, "Classificação", "Classificacao", "Classificac�o", "Tipo");
   return !classification || headerKey(classification).includes("PRODUTO");
-}
-function pendingHeaderRow(sheet: XLSX.WorkSheet) {
-  const preview = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: "" }).slice(0, 15);
-  return preview.findIndex((row) => {
-    const headers = row.map(headerKey);
-    return headers.includes(headerKey("Descrição Material"))
-      && (headers.includes(headerKey("Saldo Forn")) || headers.includes(headerKey("Qtd.pedido")));
-  });
-}
-function pendingRowsFrom(workbook: XLSX.WorkBook) {
-  for (const name of workbook.SheetNames) {
-    const header = pendingHeaderRow(workbook.Sheets[name]);
-    if (header < 0) continue;
-    return XLSX.utils.sheet_to_json<Row>(workbook.Sheets[name], { range: header, defval: "" })
-      .filter((row) => Boolean(readText(row, "Descrição Material", "Descricao Material", "Produto solicitado")))
-      .filter((row) => !["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Eliminado", "Cancelado"))));
-  }
-  throw new Error("Não localizei Descrição Material e Saldo Forn no arquivo de pedidos pendentes.");
 }
 
 function mergePremises(bundle: DimensionBundle, items: DimensionPremise[]): DimensionBundle {
@@ -316,20 +451,26 @@ function mergePremises(bundle: DimensionBundle, items: DimensionPremise[]): Dime
 }
 
 function Card({ label, value, note, tone = "slate" }: { label: string; value: ReactNode; note?: ReactNode; tone?: "slate" | "amber" | "rose" | "emerald" }) {
-  const color = { slate: "border-slate-200 bg-white", amber: "border-amber-100 bg-amber-50/60", rose: "border-rose-100 bg-rose-50/60", emerald: "border-emerald-100 bg-emerald-50/60" }[tone];
-  return <div className={cn("rounded-2xl border p-4", color)}><p className="text-xs font-medium text-slate-500">{label}</p><p className="mt-2 text-2xl font-bold tracking-tight">{value}</p>{note ? <p className="mt-1 text-xs text-slate-500">{note}</p> : null}</div>;
+  const color = { slate: "border-slate-200 bg-white", amber: "border-amber-200 bg-amber-50/70", rose: "border-rose-200 bg-rose-50/70", emerald: "border-emerald-200 bg-emerald-50/70" }[tone];
+  return <div className={cn("metric-card rounded-2xl border p-4", color)}><p className="text-xs font-semibold text-slate-600">{label}</p><p className="mt-2 text-2xl font-bold tracking-tight tabular-nums">{value}</p>{note ? <p className="mt-1.5 text-xs leading-relaxed text-slate-500">{note}</p> : null}</div>;
 }
 function Progress({ value }: { value: number }) {
   return <div className="h-2 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-emerald-600" style={{ width: String(Math.max(0, Math.min(100, value))) + "%" }} /></div>;
 }
 function Table({ headers, rows, empty = "Nenhum dado no recorte." }: { headers: string[]; rows: ReactNode[][]; empty?: string }) {
-  return <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white"><table className="w-full min-w-max text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{headers.map((head) => <th className="whitespace-nowrap px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{rows.length ? rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td className="px-3 py-3 align-top" key={cellIndex}>{cell}</td>)}</tr>) : <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={headers.length}>{empty}</td></tr>}</tbody></table></div>;
+  return <div className="data-table overflow-x-auto border-y border-slate-200"><table className="w-full min-w-max text-left text-sm"><thead className="bg-emerald-950 text-[11px] uppercase tracking-wide text-emerald-100"><tr>{headers.map((head) => <th className="whitespace-nowrap px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-200 bg-white">{rows.length ? rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td className="px-3 py-3 align-top" key={cellIndex}>{cell}</td>)}</tr>) : <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={headers.length}>{empty}</td></tr>}</tbody></table></div>;
 }
-function Empty({ title, description }: { title: string; description: string }) {
-  return <div className="grid min-h-[240px] place-items-center rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center"><div><PackageSearch className="mx-auto h-7 w-7 text-emerald-700" /><h2 className="mt-3 font-semibold">{title}</h2><p className="mx-auto mt-2 max-w-md text-sm text-slate-500">{description}</p></div></div>;
+function Empty({ title, description, actionLabel, onAction }: { title: string; description: string; actionLabel?: string; onAction?: () => void }) {
+  return <div className="empty-state grid min-h-[280px] place-items-center rounded-2xl border border-dashed border-emerald-200 bg-white p-8 text-center"><div><div className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-emerald-950 text-emerald-100"><PackageSearch className="h-6 w-6" /></div><h2 className="mt-5 text-xl font-bold tracking-tight">{title}</h2><p className="mx-auto mt-2 max-w-lg text-sm leading-relaxed text-slate-600">{description}</p>{actionLabel && onAction ? <button className="mt-6 inline-flex items-center gap-2 rounded-xl bg-emerald-800 px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-emerald-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700" onClick={onAction} type="button"><FileUp className="h-4 w-4" />{actionLabel}</button> : null}</div></div>;
+}
+function ContentLoading({ detail = "Lendo arquivos, conciliando materiais e atualizando os visuais." }: { detail?: string }) {
+  return <section aria-busy="true" aria-live="polite" className="content-loading grid min-h-[min(68vh,620px)] place-items-center rounded-3xl p-5" role="status"><div className="content-loading-card w-full max-w-sm rounded-3xl p-8 text-center shadow-2xl"><div aria-hidden="true" className="pacman-scene mx-auto"><svg className="pacman-loader" viewBox="0 0 64 64"><path d="M52 12 A28 28 0 1 0 52 52 L32 32 Z" /></svg><span className="pacman-dot pacman-dot-one" /><span className="pacman-dot pacman-dot-two" /><span className="pacman-dot pacman-dot-three" /></div><p className="mt-7 text-[11px] font-bold uppercase tracking-[.18em] text-emerald-300">AgroNexus 360°</p><h2 className="mt-2 text-2xl font-bold tracking-tight text-white">Carregando conteúdo</h2><p className="mt-3 text-sm leading-relaxed text-emerald-100">{detail}</p></div></section>;
+}
+function LoginScreen({ error, loading, onPasswordChange, onSubmit, onUsernameChange, password, username }: { error: string; loading: boolean; onPasswordChange: (value: string) => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onUsernameChange: (value: string) => void; password: string; username: string }) {
+  return <main className="login-screen grid min-h-screen place-items-center p-5"><form className="login-card w-full max-w-md rounded-3xl p-7 shadow-2xl sm:p-9" onSubmit={onSubmit}><div className="grid h-12 w-12 place-items-center rounded-2xl bg-emerald-300 text-emerald-950"><Sprout className="h-6 w-6" /></div><p className="mt-7 text-[11px] font-bold uppercase tracking-[.18em] text-emerald-300">Planejamento agrícola 360°</p><h1 className="mt-2 text-3xl font-bold tracking-tight text-white">Bem-vindo ao AgroNexus</h1><p className="mt-3 text-sm leading-relaxed text-emerald-100">Entre para acessar a base central de planejamento, insumos e tarefas.</p><div className="mt-7 grid gap-4"><label className="grid gap-1.5 text-sm font-semibold text-emerald-50">Login<input autoComplete="username" className="rounded-xl border border-emerald-700/80 bg-emerald-950/50 px-3 py-3 text-base font-normal text-white outline-none placeholder:text-emerald-200/50 focus:border-emerald-300" onChange={(event) => onUsernameChange(event.target.value)} placeholder="seu.login" required value={username} /></label><label className="grid gap-1.5 text-sm font-semibold text-emerald-50">Senha<input autoComplete="current-password" className="rounded-xl border border-emerald-700/80 bg-emerald-950/50 px-3 py-3 text-base font-normal text-white outline-none placeholder:text-emerald-200/50 focus:border-emerald-300" onChange={(event) => onPasswordChange(event.target.value)} placeholder="Sua senha" required type="password" value={password} /></label>{error ? <p className="rounded-xl border border-rose-400/30 bg-rose-950/30 px-3 py-2 text-sm text-rose-100">{error}</p> : null}<button className="mt-2 rounded-xl bg-emerald-300 px-4 py-3 text-sm font-bold text-emerald-950 transition hover:bg-emerald-200 disabled:cursor-wait disabled:opacity-70" disabled={loading} type="submit">{loading ? "Entrando..." : "Entrar na plataforma"}</button></div><p className="mt-6 text-center text-xs leading-relaxed text-emerald-200/80">A carga operacional, as tarefas e os históricos são protegidos em uma base central.</p></form></main>;
 }
 function Navigation({ active, alertCount, lastUpdatedAt, onSelect }: { active: string; alertCount: number; lastUpdatedAt?: string; onSelect: (value: string) => void }) {
-  return <aside className="fixed inset-y-0 left-0 z-20 hidden w-[248px] border-r border-slate-200 bg-white px-4 py-5 lg:block"><div className="px-3 pb-7"><div className="flex items-center gap-3"><div className="grid h-9 w-9 place-items-center rounded-xl bg-emerald-700 text-white"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold">AgroNexus</p><p className="text-[10px] font-semibold uppercase tracking-[.15em] text-emerald-700">Planejamento 360°</p></div></div><div className="mt-4 rounded-xl bg-slate-50 px-3 py-2"><p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">Última atualização</p><p className="mt-0.5 text-xs font-semibold text-slate-700">{formatDateTime(lastUpdatedAt)}</p></div></div><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-1 pt-4 text-[10px] font-bold uppercase tracking-[.14em] text-slate-400">Gestão</p> : null}<button className={cn("flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium", active === label ? "bg-emerald-50 text-emerald-800" : "text-slate-600 hover:bg-slate-50")} onClick={() => onSelect(label)} type="button"><span className="flex items-center gap-3"><Icon className="h-4 w-4" />{label}</span>{label === "Alertas" && alertCount ? <span className="rounded-full bg-rose-600 px-2 py-0.5 text-[10px] font-bold text-white">{alertCount > 99 ? "99+" : alertCount}</span> : null}</button></Fragment>)}</div><div className="absolute bottom-5 left-4 right-4 rounded-2xl bg-slate-900 p-4 text-white"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-semibold">Conciliação por nomes</p><p className="mt-1 text-[11px] leading-relaxed text-slate-300">Códigos SAP são somente diagnósticos; a chave operacional é o nome do material.</p></div></aside>;
+  return <aside className="command-sidebar fixed inset-y-0 left-0 z-20 hidden w-[264px] flex-col border-r border-emerald-950 bg-emerald-950 px-4 py-5 text-emerald-50 lg:flex"><div className="px-3 pb-6"><div className="flex items-center gap-3"><div className="grid h-10 w-10 place-items-center rounded-xl bg-emerald-300 text-emerald-950"><Sprout className="h-5 w-5" /></div><div><p className="text-sm font-bold tracking-tight">AgroNexus</p><p className="text-[10px] font-semibold tracking-[.12em] text-emerald-300">PLANEJAMENTO 360°</p></div></div><div className="mt-5 border-t border-emerald-800 pt-4"><p className="text-[10px] font-semibold tracking-[.1em] text-emerald-300">BASE OPERACIONAL</p><p className="mt-1 text-xs font-semibold text-emerald-50">{lastUpdatedAt ? `Atualizada ${formatDateTime(lastUpdatedAt)}` : "Aguardando primeira importação"}</p></div></div><div className="min-h-0 flex-1 overflow-y-auto pr-1"><p className="px-3 pb-2 text-[10px] font-bold tracking-[.12em] text-emerald-300">ANÁLISE</p><div className="space-y-1">{nav.map(([label, Icon], index) => <Fragment key={label}>{index === 4 ? <p className="px-3 pb-2 pt-6 text-[10px] font-bold tracking-[.12em] text-emerald-300">GESTÃO</p> : null}<button className={cn("flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-semibold transition", active === label ? "bg-emerald-300 text-emerald-950 shadow-sm" : "text-emerald-100 hover:bg-emerald-900")} onClick={() => onSelect(label)} type="button"><span className="flex items-center gap-3"><Icon className="h-4 w-4" />{label}</span>{label === "Alertas" && alertCount ? <span className="rounded-full bg-rose-500 px-2 py-0.5 text-[10px] font-bold text-white">{alertCount > 99 ? "99+" : alertCount}</span> : null}</button></Fragment>)}</div></div><div className="mt-5 rounded-2xl border border-emerald-800 bg-emerald-900/70 p-4"><ShieldCheck className="h-5 w-5 text-emerald-300" /><p className="mt-3 text-xs font-bold text-white">Conciliação pelo material</p><p className="mt-1 text-[11px] leading-relaxed text-emerald-100">A decisão usa o nome do material; códigos SAP servem somente ao diagnóstico.</p></div></aside>;
 }
 
 type AnalysisFiltersProps = {
@@ -357,33 +498,33 @@ function AnalysisFilters({
   onCultureChange, onCycleChange, onGroupChange, onNucleusChange, onQueryChange, onSubgroupChange,
   nuclei, nucleusFilter, query, subgroupFilter, subgroups,
 }: AnalysisFiltersProps) {
-  return <div className={cn("grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2", nuclei ? "xl:grid-cols-6" : "xl:grid-cols-5")}>
-    <label className="grid gap-1 text-xs font-semibold text-slate-600">Ciclo
+  return <div className={cn("filter-bar grid gap-3 rounded-2xl border border-slate-200 bg-white p-3 sm:grid-cols-2", nuclei ? "xl:grid-cols-6" : "xl:grid-cols-5")}>
+    <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Ciclo
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onCycleChange(event.target.value)} value={cycleFilter}>
         {cycles.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label>
-    <label className="grid gap-1 text-xs font-semibold text-slate-600">Grupo
+    <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Grupo
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onGroupChange(event.target.value)} value={groupFilter}>
         {groups.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label>
-    <label className="grid gap-1 text-xs font-semibold text-slate-600">Subgrupo
+    <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Subgrupo
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onSubgroupChange(event.target.value)} value={subgroupFilter}>
         {subgroups.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label>
-    <label className="grid gap-1 text-xs font-semibold text-slate-600">Cultura
+    <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Cultura
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onCultureChange(event.target.value)} value={cultureFilter}>
         {cultures.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label>
-    {nuclei && nucleusFilter !== undefined && onNucleusChange ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Núcleo
+    {nuclei && nucleusFilter !== undefined && onNucleusChange ? <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Núcleo
       <select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => onNucleusChange(event.target.value)} value={nucleusFilter}>
         {nuclei.map((item) => <option key={item}>{item}</option>)}
       </select>
     </label> : null}
-    <label className="grid gap-1 text-xs font-semibold text-slate-600">Buscar
+    <label className="grid min-w-0 gap-1 rounded-xl border border-slate-100 bg-slate-50/80 p-2 text-xs font-semibold text-slate-600">Buscar
       <span className="relative"><Search className="absolute left-2 top-2.5 h-4 w-4 text-slate-400" /><input className="w-full rounded-lg border border-slate-200 py-2 pl-8 pr-2 text-sm font-normal" onChange={(event) => onQueryChange(event.target.value)} placeholder="Produto ou princípio ativo" value={query} /></span>
     </label>
   </div>;
@@ -435,6 +576,12 @@ function taskKey(row: Row) {
 function planningArea(row: Row) {
   return readNumber(row, "Área executar (HA)", "Area executar (HA)", "HA_plantio", "HA plantio", "HA_talhao", "HA talhão");
 }
+function isPlantingWithoutFertilizer(row: Row, excludedStatus: string) {
+  if (statusExcluded(row, excludedStatus)) return false;
+  const classification = headerKey(readText(row, "Classificação", "Classificacao", "Classificac�o", "Tipo"));
+  const activity = headerKey(readText(row, "Atividade", "Operação", "Operacao", "Operações", "Operacoes", "Descr. Operação", "Descr Operação", "Tar."));
+  return classification.includes("ATIVIDADE") && activity.includes("PLANTIOSEMADUBO");
+}
 
 /**
  * Rateia o estoque central apenas uma vez para cada material agregado. Sem
@@ -485,6 +632,41 @@ function consolidateLocations(locations: ReconciliationRow["locations"]) {
   return [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location) || left.type.localeCompare(right.type));
 }
 
+// Para o aviso, lote e apresentação física não devem fragmentar o saldo:
+// a decisão de repasse é feita pelo total disponível em cada armazém.
+function consolidateWarehouseBalances(locations: ReconciliationRow["locations"]) {
+  const consolidated = new Map<string, ReconciliationRow["locations"][number]>();
+  locations.filter((location) => location.type === "Armazém" && location.amount > 0).forEach((location) => {
+    const key = normalizeMaterial(location.location);
+    const current = consolidated.get(key);
+    consolidated.set(key, current ? { ...current, amount: current.amount + location.amount } : { ...location });
+  });
+  return [...consolidated.values()].sort((left, right) => left.location.localeCompare(right.location));
+}
+
+/**
+ * Saldo transferível é uma sugestão: só considera o que sobra na fazenda de
+ * outro núcleo depois da demanda da própria janela, sem prometer o mesmo saldo
+ * para duas solicitações. O armazém continua sendo a primeira alternativa.
+ */
+function supportFromOtherNuclei(row: DemandRow, demands: DemandRow[]) {
+  const locations = demands
+    .filter((candidate) => candidate.canonicalKey === row.canonicalKey && candidate.nucleus !== row.nucleus)
+    .flatMap((candidate) => {
+      const transferable = Math.max(0, Math.min(candidate.farmBalance, candidate.local - candidate.demand));
+      if (!transferable || !candidate.farmBalance) return [];
+      const factor = transferable / candidate.farmBalance;
+      return candidate.locations
+        .filter((location) => location.type === "Fazenda" && location.amount > 0)
+        .map((location) => ({
+          ...location,
+          amount: location.amount * factor,
+          location: `Apoio sugerido — ${candidate.nucleus} — ${location.location}`,
+        }));
+    });
+  return consolidateLocations(locations);
+}
+
 function stockDetailKey(rowId: string, location: ReconciliationRow["locations"][number]) {
   return [rowId, normalizeMaterial(location.material), location.type, location.location].join("\u0000");
 }
@@ -525,11 +707,15 @@ function StockDetails({ row, physicalBalances }: { row: MonitoringRow; physicalB
 
 export default function Home() {
   const [active, setActive] = useState("Visão geral");
+  const [showMobileNav, setShowMobileNav] = useState(false);
   const [datasets, setDatasets] = useState<Datasets>(emptyDatasets);
   const [uploads, setUploads] = useState<Partial<Record<SourceKey, File>>>({});
   const [imports, setImports] = useState<Partial<Record<ImportKey, ImportSummary>>>({});
+  const [importHistory, setImportHistory] = useState<ImportHistoryItem[]>([]);
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [message, setMessage] = useState("");
   const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState("");
   const [bundle, setBundle] = useState<DimensionBundle>(emptyDimensionBundle);
   const [premises, setPremises] = useState<Premises>(initialPremises);
   const [emailSettings, setEmailSettings] = useState<EmailSettings>(initialEmailSettings);
@@ -554,20 +740,60 @@ export default function Home() {
   const [taskNote, setTaskNote] = useState("");
   const [taskActionDrafts, setTaskActionDrafts] = useState<Record<string, string>>({});
   const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [logistics, setLogistics] = useState<LogisticsState>(initialLogistics);
+  const [commercialClosings, setCommercialClosings] = useState<CommercialClosingsState>(initialCommercialClosings);
+  const [closingTab, setClosingTab] = useState<"painel" | "distribuicoes" | "anotacoes">("painel");
+  const [closingDraft, setClosingDraft] = useState({
+    supplier: "", paymentDue: "", destination: "", deliveryLocation: "", cycle: "Safra" as CommercialClosing["cycle"],
+    culture: "", active: "", product: "", unit: "", currency: "BRL" as CommercialClosing["currency"], unitPrice: "", packaging: "", totalVolume: "", orderKey: "",
+  });
+  const [closingDistributionDraft, setClosingDistributionDraft] = useState<ClosingDistribution>({});
+  const [editingClosingId, setEditingClosingId] = useState("");
+  const [closingAnnotationDraft, setClosingAnnotationDraft] = useState({ closingId: "", materialSent: "", purchaseVolume: "", invoicedVolume: "", note: "", resolved: false });
+  const [closingCycleFilter, setClosingCycleFilter] = useState("Todos");
+  const [closingQuery, setClosingQuery] = useState("");
+  const [closingMessage, setClosingMessage] = useState("");
+  const [logisticsTab, setLogisticsTab] = useState<"emissao" | "viagens" | "rodoviaria">("emissao");
+  const [driverDraft, setDriverDraft] = useState({ cpf: "", fullName: "", phone: "" });
+  const [vehicleDraft, setVehicleDraft] = useState({ capacity: "", model: "", plate: "" });
+  const [tripRequestId, setTripRequestId] = useState("");
+  const [tripMaterialKey, setTripMaterialKey] = useState("");
+  const [routeItems, setRouteItems] = useState<LogisticsTripItem[]>([]);
+  const [tripDriverId, setTripDriverId] = useState("");
+  const [tripVehicleId, setTripVehicleId] = useState("");
+  const [tripInvoiceNumber, setTripInvoiceNumber] = useState("");
+  const [recipeTripId, setRecipeTripId] = useState("");
+  const [recipeDraft, setRecipeDraft] = useState<TripRecipe>({ culture: "", dose: "", target: "" });
+  const [logisticsMessage, setLogisticsMessage] = useState("");
+  const [taskHistorySize, setTaskHistorySize] = useState(10);
+  const [taskHistoryPage, setTaskHistoryPage] = useState(0);
   const [taskSignalFilter, setTaskSignalFilter] = useState("Todos");
   const [taskOrderFilter, setTaskOrderFilter] = useState("Todos");
   const [taskNucleusFilter, setTaskNucleusFilter] = useState("Todos");
   const [taskMaterialFilter, setTaskMaterialFilter] = useState("");
+  const [alertNucleusFilter, setAlertNucleusFilter] = useState("Todos");
+  const [alertMaterialFilter, setAlertMaterialFilter] = useState("");
+  const [alertGroupFilter, setAlertGroupFilter] = useState("Todos");
+  const [alertSubgroupFilter, setAlertSubgroupFilter] = useState("Todos");
   const [showNotification, setShowNotification] = useState(false);
   const [notificationNucleus, setNotificationNucleus] = useState("Todos");
   const [notificationDays, setNotificationDays] = useState("5");
   const [notificationTo, setNotificationTo] = useState("");
   const [notificationCc, setNotificationCc] = useState("");
   const [notificationMessage, setNotificationMessage] = useState("");
-  const [sendingNotification, setSendingNotification] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"premissas" | "email">("premissas");
   const [storageReady, setStorageReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
+  const [authReady, setAuthReady] = useState(false);
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  const [loginUsername, setLoginUsername] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loggingIn, setLoggingIn] = useState(false);
+  const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([]);
+  const [userDraft, setUserDraft] = useState<UserDraft>(emptyUserDraft);
+  const [userManagerLoading, setUserManagerLoading] = useState(false);
+  const [userManagerMessage, setUserManagerMessage] = useState("");
   const [clock, setClock] = useState(() => Date.now());
   const [evaluationDate, setEvaluationDate] = useState(() => dateKey(new Date()));
   const [provisionUntil, setProvisionUntil] = useState(() => {
@@ -575,48 +801,192 @@ export default function Home() {
     end.setDate(end.getDate() + 15);
     return dateKey(end);
   });
+  // Perfis operacionais nunca podem cair no consolidado por ausência de cadastro.
+  // O valor sentinela não existe em nenhuma fonte e, portanto, resulta em visão vazia
+  // até que o administrador defina o núcleo do usuário.
+  const isOperator = Boolean(currentUser && currentUser.role !== "admin");
+  const operatorNucleus = isOperator ? currentUser?.nucleus?.trim() || "__NUCLEO_NAO_DEFINIDO__" : "";
+  const operatorHasNucleus = !isOperator || operatorNucleus !== "__NUCLEO_NAO_DEFINIDO__";
+
+  function applyWorkspace(workspace: PersistedWorkspace | null) {
+    if (!workspace) return;
+    setBundle(workspace.bundle || emptyDimensionBundle);
+    setDatasets({ ...emptyDatasets, ...(workspace.datasets || {}) });
+    setDimensionPremises(workspace.dimensionPremises || []);
+    setImports(workspace.imports || {});
+    setImportHistory(workspace.importHistory || []);
+    setAuditEvents(workspace.auditEvents || []);
+    setPremises({ ...initialPremises, ...(workspace.premises || {}) });
+    setEmailSettings({ ...initialEmailSettings, ...(workspace.emailSettings || {}), nucleusRecipients: workspace.emailSettings?.nucleusRecipients || {} });
+    setDashboardSettings({ ...initialDashboardSettings, ...(workspace.dashboardSettings || {}) });
+    setTasks(persistedTasks(workspace.tasks));
+    setLogistics({ ...initialLogistics, ...(workspace.logistics || {}), drivers: workspace.logistics?.drivers || [], trips: workspace.logistics?.trips || [], vehicles: workspace.logistics?.vehicles || [] });
+    setCommercialClosings({ ...initialCommercialClosings, ...(workspace.commercialClosings || {}), annotations: workspace.commercialClosings?.annotations || [], closings: workspace.commercialClosings?.closings || [] });
+  }
+
+  function recordAudit(kind: AuditEvent["kind"], detail: string) {
+    const actor = currentUser?.name || "Sistema";
+    setAuditEvents((current) => [{ id: taskId("audit"), actor, detail, kind, createdAt: new Date().toISOString() }, ...current].slice(0, 120));
+  }
+
+  async function hydrateCentralWorkspace() {
+    const response = await fetch("/api/workspace", { credentials: "include" });
+    if (!response.ok) throw new Error("Não foi possível recuperar a carga central.");
+    const result = await response.json() as { workspace?: unknown };
+    const central = await decodeRemoteWorkspace(result.workspace);
+    const workspace = central || await loadWorkspace();
+    applyWorkspace(workspace);
+  }
 
   useEffect(() => {
     let active = true;
-    let readyTimer: number | undefined;
-    void loadWorkspace().then((workspace) => {
-      if (!active || !workspace) return;
-      setBundle(workspace.bundle || emptyDimensionBundle);
-      setDatasets({ ...emptyDatasets, ...(workspace.datasets || {}) });
-      setDimensionPremises(workspace.dimensionPremises || []);
-      setImports(workspace.imports || {});
-      setPremises({ ...initialPremises, ...(workspace.premises || {}) });
-      setEmailSettings({ ...initialEmailSettings, ...(workspace.emailSettings || {}), nucleusRecipients: workspace.emailSettings?.nucleusRecipients || {} });
-      setDashboardSettings({ ...initialDashboardSettings, ...(workspace.dashboardSettings || {}) });
-      setTasks(persistedTasks(workspace.tasks));
-    }).catch(() => {
-      if (active) setPersistenceError("Não foi possível recuperar os dados salvos neste navegador.");
-    }).finally(() => {
-      if (active) readyTimer = window.setTimeout(() => { if (active) setStorageReady(true); }, 0);
-    });
-    return () => { active = false; if (readyTimer) window.clearTimeout(readyTimer); };
+    void (async () => {
+      try {
+        const response = await fetch("/api/auth", { credentials: "include" });
+        if (!response.ok) throw new Error("Não foi possível validar a sessão.");
+        const result = await response.json() as { user?: AppUser | null };
+        if (result.user) {
+          setCurrentUser(result.user);
+          await hydrateCentralWorkspace();
+        }
+      } catch (error) {
+        if (active) setPersistenceError(error instanceof Error ? error.message : "Não foi possível iniciar a base central.");
+      } finally {
+        if (active) { setStorageReady(true); setAuthReady(true); }
+      }
+    })();
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
-    if (!storageReady) return;
-    void saveWorkspace({ bundle, datasets, dimensionPremises, imports, premises, tasks, emailSettings, dashboardSettings }).catch(() => {
-      setPersistenceError("Não foi possível salvar esta carga neste navegador.");
-    });
-  }, [bundle, dashboardSettings, datasets, dimensionPremises, emailSettings, imports, premises, storageReady, tasks]);
+    if (!storageReady || !currentUser) return;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const payload = await encodeRemoteWorkspace({ bundle, datasets, dimensionPremises, imports, importHistory, auditEvents, premises, tasks, logistics, commercialClosings, emailSettings, dashboardSettings });
+          const response = await fetch("/api/workspace", { method: "PUT", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ payload }) });
+          if (!response.ok) throw new Error("Não foi possível salvar a carga central.");
+          await saveWorkspace(localWorkspaceSnapshot({ bundle, datasets, dimensionPremises, imports, importHistory, auditEvents, premises, tasks, logistics, commercialClosings, emailSettings, dashboardSettings }));
+        } catch (error) {
+          setPersistenceError(error instanceof Error ? error.message : "Não foi possível salvar a carga central.");
+        }
+      })();
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [auditEvents, bundle, commercialClosings, currentUser, dashboardSettings, datasets, dimensionPremises, emailSettings, importHistory, imports, logistics, premises, storageReady, tasks]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    if (!isOperator) return;
+    // Operadores trabalham no próprio núcleo. Acompanhamento permanece geral
+    // para preservar a comparação de materiais entre todos os núcleos.
+    setNucleusFilter(active === "Acompanhamento" ? "Todos" : operatorNucleus);
+    setAlertNucleusFilter(operatorNucleus);
+    setTaskNucleusFilter(operatorNucleus);
+  }, [active, isOperator, operatorNucleus]);
+
   const toggleTheme = () => setDark((current) => {
     window.localStorage.setItem("agronexus-theme", current ? "light" : "dark");
     return !current;
   });
 
+  async function signIn(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setLoggingIn(true);
+    setLoginError("");
+    try {
+      const response = await fetch("/api/auth", { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: loginUsername, password: loginPassword }) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.user) throw new Error(result.error || "Não foi possível entrar.");
+      setStorageReady(false);
+      setCurrentUser(result.user as AppUser);
+      await hydrateCentralWorkspace();
+      setLoginPassword("");
+      setStorageReady(true);
+    } catch (error) {
+      setCurrentUser(null);
+      setLoginError(error instanceof Error ? error.message : "Não foi possível entrar.");
+      setStorageReady(true);
+    } finally {
+      setLoggingIn(false);
+    }
+  }
+
+  async function loadManagedUsers() {
+    if (currentUser?.role !== "admin") return;
+    setUserManagerLoading(true);
+    try {
+      const response = await fetch("/api/users", { credentials: "include" });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Não foi possível carregar os usuários.");
+      setManagedUsers(Array.isArray(result.users) ? result.users : []);
+    } catch (error) {
+      setUserManagerMessage(error instanceof Error ? error.message : "Não foi possível carregar os usuários.");
+    } finally {
+      setUserManagerLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (active === "Usuários" && currentUser?.role === "admin") void loadManagedUsers();
+  }, [active, currentUser?.id, currentUser?.role]);
+
+  async function saveManagedUser(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setUserManagerMessage("");
+    if (!userDraft.id && !userDraft.password.trim()) {
+      setUserManagerMessage("Informe uma senha para a nova conta.");
+      return;
+    }
+    setUserManagerLoading(true);
+    try {
+      const response = await fetch("/api/users", {
+        method: userDraft.id ? "PATCH" : "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...userDraft, nucleus: userDraft.role === "admin" ? "" : userDraft.nucleus }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Não foi possível salvar o usuário.");
+      setUserDraft(emptyUserDraft);
+      setUserManagerMessage(userDraft.id ? "Usuário atualizado." : "Usuário criado.");
+      await loadManagedUsers();
+    } catch (error) {
+      setUserManagerMessage(error instanceof Error ? error.message : "Não foi possível salvar o usuário.");
+      setUserManagerLoading(false);
+    }
+  }
+
+  function editManagedUser(user: ManagedUser) {
+    setUserManagerMessage("");
+    setUserDraft({ id: user.id, name: user.name, nucleus: user.nucleus || "", password: "", role: user.role === "admin" ? "admin" : "viewer", username: user.username });
+  }
+
+  async function removeManagedUser(user: ManagedUser) {
+    if (!window.confirm(`Excluir a conta de ${user.name}? Esta ação não pode ser desfeita.`)) return;
+    setUserManagerMessage("");
+    setUserManagerLoading(true);
+    try {
+      const response = await fetch("/api/users", { method: "DELETE", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: user.id }) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || "Não foi possível excluir o usuário.");
+      if (userDraft.id === user.id) setUserDraft(emptyUserDraft);
+      setUserManagerMessage("Usuário excluído.");
+      await loadManagedUsers();
+    } catch (error) {
+      setUserManagerMessage(error instanceof Error ? error.message : "Não foi possível excluir o usuário.");
+      setUserManagerLoading(false);
+    }
+  }
+
   const dimensions = useMemo(() => mergePremises(bundle, dimensionPremises), [bundle, dimensionPremises]);
   const pendingOrders = datasets.pedidos;
   const plans = useMemo(() => datasets.planejamento.filter((row) => planningProduct(row, premises.excludedStatus)), [datasets.planejamento, premises.excludedStatus]);
+  const plantingAreaRows = useMemo(() => datasets.planejamento.filter((row) => isPlantingWithoutFertilizer(row, premises.excludedStatus)), [datasets.planejamento, premises.excludedStatus]);
   const farmToNucleus = useMemo(() => buildFarmToNucleus([...plans, ...datasets.execucao], dimensions, plans), [plans, datasets.execucao, dimensions]);
   const stockRows = useMemo(() => {
     // A BATCH é a fonte prioritária. A MB52 completa somente apresentações
@@ -670,6 +1040,110 @@ export default function Home() {
     consumptionRows: datasets.consumo, pendingRows: pendingOrders, farmToNucleus,
   }), [dimensions, plans, stockRows, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
 
+  const commercialOrders = useMemo(() => datasets.pedidosCompra
+    .filter((row) => !["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Eliminado", "Cancelado"))))
+    .map((row, index) => {
+      const orderNumber = readText(row, "Doc.compra", "Documento de compra", "Pedido");
+      const item = readText(row, "Item") || String(index + 1);
+      const product = readText(row, "Descrição Material", "Descricao Material", "Produto");
+      const dimension = dimensions.materials[normalizeMaterial(product)];
+      return {
+        key: `${orderNumber}|${item}|${normalizeMaterial(product)}`,
+        orderNumber,
+        item,
+        product,
+        standardProduct: dimension?.aggregateMaterial || product,
+        active: dimension?.principleActive || "Não conciliado",
+        supplier: readText(row, "Nome Fornecedor", "Fornecedor"),
+        dueDate: readText(row, "Vencimento"),
+        unit: readText(row, "UMP", "Unidade") || "—",
+        currency: headerKey(readText(row, "Moeda")) === "USD" ? "USD" as const : "BRL" as const,
+        unitPrice: readNumber(row, "Preco Brut", "Preço líq.", "Preco liq."),
+        ordered: readNumber(row, "Qtd.pedido", "Qtd pedido", "Quantidade pedido"),
+        supplied: readNumber(row, "Qtde. Forn", "Qtde. Fornecida", "Quantidade fornecida"),
+        balance: readNumber(row, "Saldo Forn", "Saldo fornecer", "Saldo fornecedor"),
+        center: readText(row, "Centro"),
+        status: readText(row, "Código de", "Codigo de", "Status", "Aprovador(es)"),
+      };
+    })
+    .filter((order) => Boolean(order.orderNumber && order.product)), [datasets.pedidosCompra, dimensions]);
+
+  const commercialMaterialOptions = useMemo(() => {
+    const entries = new Map<string, { active: string; product: string }>();
+    Object.values(dimensions.materials).forEach((material) => {
+      const product = material.aggregateMaterial || material.material;
+      const key = normalizeMaterial(product);
+      if (!entries.has(key)) entries.set(key, { active: material.principleActive, product });
+    });
+    return [...entries.values()].sort((left, right) => left.product.localeCompare(right.product));
+  }, [dimensions]);
+
+  const planningDistribution = useMemo(() => {
+    type PlanningSchedule = { active: string; cycle: string; culture: string; months: Record<string, number>; planned: number; product: string };
+    const values = new Map<string, PlanningSchedule>();
+    plans.forEach((row) => {
+      const product = productFor(row, "planning", dimensions);
+      const cycle = cycleFor(row, dimensions);
+      const culture = cultureFor(row);
+      const key = `${product.canonicalKey}|${cycle}`;
+      const current = values.get(key) || { active: product.active, cycle, culture, months: {}, planned: 0, product: product.canonicalName };
+      const amount = standardQuantity(row, "planning", product, dimensions);
+      current.planned += amount;
+      const scheduledAt = dateFromPlan(readText(row, "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data"));
+      if (scheduledAt) current.months[monthKey(scheduledAt)] = (current.months[monthKey(scheduledAt)] || 0) + amount;
+      values.set(key, current);
+    });
+    return values;
+  }, [dimensions, plans]);
+
+  const selectedClosingSchedule = useMemo(() => planningDistribution.get(`${normalizeMaterial(closingDraft.product)}|${closingDraft.cycle}`), [closingDraft.cycle, closingDraft.product, planningDistribution]);
+  const closingMonths = useMemo(() => {
+    const values = new Set<string>();
+    planningDistribution.forEach((schedule) => Object.keys(schedule.months).forEach((month) => values.add(month)));
+    Object.values(commercialClosings.closings).forEach((closing) => Object.keys(closing.distribution).forEach((month) => values.add(month)));
+    return [...values].sort();
+  }, [commercialClosings.closings, planningDistribution]);
+
+  const commercialGapByProduct = useMemo(() => {
+    const closed = new Map<string, number>();
+    commercialClosings.closings.forEach((closing) => {
+      const key = `${normalizeMaterial(closing.product)}|${closing.cycle}`;
+      closed.set(key, (closed.get(key) || 0) + closing.totalVolume);
+    });
+    const values = new Map<string, { active: string; closed: number; cycle: string; product: string; planned: number; remaining: number }>();
+    planningDistribution.forEach((schedule, key) => {
+      const totalClosed = closed.get(key) || 0;
+      values.set(key, { active: schedule.active, closed: totalClosed, cycle: schedule.cycle, product: schedule.product, planned: schedule.planned, remaining: Math.max(0, schedule.planned - totalClosed) });
+    });
+    commercialClosings.closings.forEach((closing) => {
+      const key = `${normalizeMaterial(closing.product)}|${closing.cycle}`;
+      if (values.has(key)) return;
+      values.set(key, { active: closing.active || "Não informado", closed: closing.totalVolume, cycle: closing.cycle, product: closing.product, planned: 0, remaining: 0 });
+    });
+    return values;
+  }, [commercialClosings.closings, planningDistribution]);
+
+  const filteredCommercialClosings = useMemo(() => {
+    const normalizedQuery = normalizeMaterial(closingQuery);
+    return commercialClosings.closings.filter((closing) => {
+      if (closingCycleFilter !== "Todos" && closing.cycle !== closingCycleFilter) return false;
+      if (!normalizedQuery) return true;
+      return [closing.active, closing.product, closing.supplier, closing.destination, closing.orderNumber].some((value) => normalizeMaterial(value).includes(normalizedQuery));
+    }).sort((left, right) => left.product.localeCompare(right.product) || left.supplier.localeCompare(right.supplier));
+  }, [closingCycleFilter, closingQuery, commercialClosings.closings]);
+
+  const commercialCalendar = useMemo(() => {
+    const values = new Map<string, { amount: number; count: number }>();
+    filteredCommercialClosings.forEach((closing) => Object.entries(closing.distribution).forEach(([month, amount]) => {
+      if (!amount) return;
+      const current = values.get(month) || { amount: 0, count: 0 };
+      current.amount += amount;
+      current.count += 1;
+      values.set(month, current);
+    }));
+    return [...values.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([month, value]) => ({ month, ...value }));
+  }, [filteredCommercialClosings]);
+
   const materialResolution = useMemo(() => {
     const input: Array<[Row[], "stock" | "transit" | "consumption"]> = [[stockRows, "stock"], [datasets.transito, "transit"], [datasets.consumo, "consumption"]];
     let described = 0;
@@ -689,6 +1163,9 @@ export default function Home() {
     .sort((left, right) => new Date(right).getTime() - new Date(left).getTime())[0], [imports]);
 
   const oldestSource = useMemo(() => Object.entries(imports)
+    // Planejamento e Dimensões são referências de premissa. A defasagem
+    // operacional passa a refletir somente fontes que mudam no dia a dia.
+    .filter(([key]) => key !== "planejamento" && key !== "dimensoes")
     .filter((entry): entry is [ImportKey, ImportSummary] => Boolean(entry[1]?.fileModifiedAt))
     .sort(([, left], [, right]) => new Date(left.fileModifiedAt).getTime() - new Date(right.fileModifiedAt).getTime())[0], [imports]);
   const dataFreshness = freshnessStatus(oldestSource?.[1].fileModifiedAt, clock);
@@ -774,10 +1251,12 @@ export default function Home() {
       return value;
     };
     plans.forEach((row) => {
+      if (isOperator && planningNucleusFor(row, dimensions, farmToNucleus) !== operatorNucleus) return;
       const product = productFor(row, "planning", dimensions);
       ensure(cycleFor(row, dimensions), product.merchandiseGroup, product.subgroup).planned += standardQuantity(row, "planning", product, dimensions);
     });
     datasets.consumo.forEach((row) => {
+      if (isOperator && consumptionNucleusFor(row, dimensions, farmToNucleus) !== operatorNucleus) return;
       const product = productFor(row, "consumption", dimensions);
       ensure(cycleFor(row, dimensions), product.merchandiseGroup, product.subgroup).applied += standardQuantity(row, "consumption", product, dimensions);
     });
@@ -785,19 +1264,20 @@ export default function Home() {
       cycle,
       rows: [...values.entries()].filter(([key]) => key.startsWith(cycle + "|")).map(([, value]) => value).sort((left, right) => right.planned - left.planned),
     }));
-  }, [plans, datasets.consumo, dimensions]);
+  }, [plans, datasets.consumo, dimensions, farmToNucleus, isOperator, operatorNucleus]);
 
   const macroCrop = useMemo(() => crops.map((crop) => ({
     ...crop,
     applied: datasets.execucao
-      .filter((row) => headerKey(readText(row, "Cultura", "WBS element", "WBS")).includes(crop.code))
+      .filter((row) => headerKey(readText(row, "Cultura", "WBS element", "WBS")).includes(crop.code)
+        && (!isOperator || nucleusFor(row, dimensions, farmToNucleus) === operatorNucleus))
       .reduce((sum, row) => sum + readNumber(row, "Área Executada", "Area Executada", "Qtde. executada"), 0),
-  })), [datasets.execucao]);
+  })), [datasets.execucao, dimensions, farmToNucleus, isOperator, operatorNucleus]);
 
   const daeByNucleus = useMemo(() => {
     type DaeGroup = { nucleus: string; culture: string; cycle: string; totalArea: number; dates: Map<string, { area: number; date: Date }> };
     const groups = new Map<string, DaeGroup>();
-    plans.forEach((row) => {
+    plantingAreaRows.forEach((row) => {
       const cycle = cycleFor(row, dimensions);
       if (dashboardSettings.daeCycle !== "Ambos" && cycle !== dashboardSettings.daeCycle) return;
       const culture = cultureFor(row);
@@ -828,11 +1308,12 @@ export default function Home() {
       });
       nucleusGroups.set(group.nucleus, entries);
     }));
-    return [...nucleusGroups.entries()].map(([nucleus, entries]) => ({
+    const result = [...nucleusGroups.entries()].map(([nucleus, entries]) => ({
       nucleus,
       entries: entries.sort((left, right) => right.days - left.days || right.area - left.area),
     })).sort((left, right) => left.nucleus.localeCompare(right.nucleus));
-  }, [clock, dashboardSettings.daeCycle, dimensions, farmToNucleus, plans]);
+    return isOperator ? result.filter((group) => group.nucleus === operatorNucleus) : result;
+  }, [clock, dashboardSettings.daeCycle, dimensions, farmToNucleus, isOperator, operatorNucleus, plantingAreaRows]);
 
   const filters = useMemo(() => ({
     cycles: ["Todos", ...new Set(ledger.flatMap((row) => row.cycles))],
@@ -1050,9 +1531,10 @@ export default function Home() {
         && (groupFilter === "Todos" || row.merchandiseGroup === groupFilter)
         && (subgroupFilter === "Todos" || row.subgroup === subgroupFilter)
         && (cultureFilter === "Todos" || row.cultures.includes(cultureFilter))
+        && (!isOperator || row.nucleus === operatorNucleus)
         && (!search || line.includes(search));
     });
-  }, [executionPerformance, cycleFilter, groupFilter, subgroupFilter, cultureFilter, query]);
+  }, [executionPerformance, cycleFilter, groupFilter, subgroupFilter, cultureFilter, isOperator, operatorNucleus, query]);
 
   const performanceSummary = useMemo(() => {
     const planned = performanceRows.reduce((sum, row) => sum + row.plannedVolume, 0);
@@ -1087,6 +1569,8 @@ export default function Home() {
     const allocation = allocateCentralWarehouse(demands, windowLedger);
     const rows = demands.map((row) => {
       const warehouse = allocation.allocations.get(row.id) || { allocated: 0, locations: [] };
+      const nucleusSupportLocations = supportFromOtherNuclei(row, demands);
+      const nucleusSupport = nucleusSupportLocations.reduce((sum, location) => sum + location.amount, 0);
       const balance = row.local + warehouse.allocated - row.demand;
       const status = row.demand <= row.local ? "Atende no núcleo" : balance >= 0 ? "Atende com armazém" : "Falta";
       // A BATCH possui uma linha por lote. A calendarização é operacional,
@@ -1094,21 +1578,25 @@ export default function Home() {
       return {
         ...row,
         balance,
-        locations: consolidateLocations(row.locations),
+        locations: consolidateLocations([...row.locations, ...nucleusSupportLocations]),
         status,
         warehouseLocations: consolidateLocations(warehouse.locations),
         warehouseSupport: warehouse.allocated,
+        nucleusSupport,
+        nucleusSupportLocations,
       };
     }).sort((left, right) => left.balance - right.balance || right.demand - left.demand);
+    const scopedRows = isOperator ? rows.filter((row) => row.nucleus === operatorNucleus) : rows;
     return {
-      dated: scheduled.length > 0, rows,
-      demand: rows.reduce((sum, row) => sum + row.demand, 0),
-      farm: rows.reduce((sum, row) => sum + row.farmBalance, 0),
-      pendingOrder: rows.reduce((sum, row) => sum + row.pendingOrder, 0),
-      transit: rows.reduce((sum, row) => sum + row.transit, 0),
+      dated: scheduled.length > 0, rows: scopedRows,
+      demand: scopedRows.reduce((sum, row) => sum + row.demand, 0),
+      farm: scopedRows.reduce((sum, row) => sum + row.farmBalance, 0),
+      pendingOrder: scopedRows.reduce((sum, row) => sum + row.pendingOrder, 0),
+      transit: scopedRows.reduce((sum, row) => sum + row.transit, 0),
       warehouse: allocation.totalAvailable,
+      nucleusSupport: scopedRows.reduce((sum, row) => sum + row.nucleusSupport, 0),
     };
-  }, [evaluationDate, provisionUntil, plans, dimensions, stockRows, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus]);
+  }, [evaluationDate, provisionUntil, plans, dimensions, stockRows, datasets.transito, datasets.consumo, pendingOrders, farmToNucleus, isOperator, operatorNucleus]);
 
   const consolidatedSupply = useMemo(() => {
     const demands: DemandRow[] = ledger.filter((row) => row.planned > 0).map((row) => ({
@@ -1146,25 +1634,98 @@ export default function Home() {
     };
   }).sort((left, right) => (left.daysUntil ?? Number.MAX_SAFE_INTEGER) - (right.daysUntil ?? Number.MAX_SAFE_INTEGER)), [clock, dimensions, farmToNucleus, pendingOrders]);
 
-  const farol = useMemo(() => ({
-    demand: pendingSignals.filter((signal) => signal.status === "Demanda próxima").length,
-    delay: pendingSignals.filter((signal) => signal.status === "Possível atraso").length,
-    attention: pendingSignals.filter((signal) => signal.status === "Ponto de atenção").length,
-    alert: pendingSignals.filter((signal) => signal.status === "Alerta").length,
-  }), [pendingSignals]);
+  const logisticsRequests = useMemo(() => {
+    type LogisticsRequestLine = { id: string; lot: string; product: string; productCode: string; quantity: number; unit: string };
+    type LogisticsRequest = { date: string; destination: string; destinationCode: string; id: string; sourceWarehouse: string; status: string; lines: LogisticsRequestLine[] };
+    const values = new Map<string, LogisticsRequest>();
+    datasets.solicitacoesWeb.forEach((row, index) => {
+      const id = readText(row, "Nº Solicitação", "N° Solicitação", "Numero Solicitação", "Numero Solicitacao", "Solicitação", "Solicitacao");
+      const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto");
+      const status = readText(row, "St. do Atendimento");
+      const shippingStatus = readText(row, "Situação de Envio ao Rodopar", "Situacao de Envio ao Rodopar");
+      if (!id || !product || headerKey(status).includes("CANCEL") || headerKey(shippingStatus).includes("CANCEL")) return;
+      const current = values.get(id) || {
+        date: readText(row, "Data Atendimento", "Data"),
+        destination: readText(row, "Nome do Tomador", "Nome do Responsável", "Nome do Responsavel"),
+        destinationCode: readText(row, "Cód. Cliente Ind.", "Cod. Cliente Ind.", "Cód. Cliente Destino", "Cod. Cliente Destino"),
+        id,
+        sourceWarehouse: readText(row, "Apelido Op. Logístico", "Apelido Op. Logistico", "Nome Op. Logístico", "Nome Op. Logistico"),
+        status: status || "Sem status",
+        lines: [],
+      };
+      current.lines.push({
+        id: `${id}|${index}|${normalizeMaterial(product)}|${normalizeMaterial(readText(row, "Lote"))}`,
+        lot: readText(row, "Lote"),
+        product,
+        productCode: readText(row, "Cód. Prod. Indústria", "Cod. Prod. Industria", "Cód. Prod. Operador", "Cod. Prod. Operador"),
+        quantity: readNumber(row, "Qt. Solicitada", "Qt Solicitada", "Quantidade solicitada", "Quantidade"),
+        unit: readText(row, "UMB", "Und", "Unidade") || "UN",
+      });
+      values.set(id, current);
+    });
+    return [...values.values()].sort((left, right) => right.id.localeCompare(left.id, "pt-BR", { numeric: true }));
+  }, [datasets.solicitacoesWeb]);
+  const selectedLogisticsRequest = logisticsRequests.find((request) => request.id === tripRequestId) || null;
+  const selectedLogisticsLine = selectedLogisticsRequest?.lines.find((line) => line.id === tripMaterialKey) || null;
+  const selectedLogisticsStock = useMemo(() => {
+    if (!selectedLogisticsLine) return { balance: 0, pallets: 0, warehouses: [] as string[] };
+    const productKey = normalizeMaterial(selectedLogisticsLine.product);
+    const lotKey = normalizeMaterial(selectedLogisticsLine.lot);
+    const matches = datasets.estoqueWeb.filter((row) => {
+      const product = normalizeMaterial(readText(row, "Descrição Produto", "Descricao Produto", "Produto"));
+      const lot = normalizeMaterial(readText(row, "Lote"));
+      return product === productKey && (!lotKey || lot === lotKey);
+    });
+    return {
+      balance: matches.reduce((sum, row) => sum + readNumber(row, "Saldo"), 0),
+      pallets: matches.reduce((sum, row) => sum + readNumber(row, "Qt Paletes", "Qtd Paletes"), 0),
+      warehouses: [...new Set(matches.map((row) => readText(row, "Nome Op. Logístico", "Nome Op. Logistico", "Armazém", "Armazem")).filter(Boolean))],
+    };
+  }, [datasets.estoqueWeb, selectedLogisticsLine]);
+  const selectedRouteItem = useMemo<LogisticsTripItem | null>(() => {
+    if (!selectedLogisticsRequest || !selectedLogisticsLine) return null;
+    return {
+      id: selectedLogisticsLine.id,
+      requestId: selectedLogisticsRequest.id,
+      requestDate: selectedLogisticsRequest.date,
+      product: selectedLogisticsLine.product,
+      productCode: selectedLogisticsLine.productCode,
+      lot: selectedLogisticsLine.lot,
+      quantity: selectedLogisticsLine.quantity,
+      unit: selectedLogisticsLine.unit,
+      sourceWarehouse: selectedLogisticsStock.warehouses.join(", ") || selectedLogisticsRequest.sourceWarehouse || "Armazém não identificado",
+      destination: selectedLogisticsRequest.destination || "Destino não identificado",
+      destinationCode: selectedLogisticsRequest.destinationCode,
+    };
+  }, [selectedLogisticsLine, selectedLogisticsRequest, selectedLogisticsStock]);
 
-  const taskNuclei = useMemo(() => ["Todos", ...[...new Set(pendingSignals.map((signal) => signal.nucleus).filter(Boolean))].sort()], [pendingSignals]);
-  const taskOrders = useMemo(() => ["Todos", ...[...new Set(pendingSignals.map((signal) => signal.reference).filter(Boolean))].sort()], [pendingSignals]);
+  const scopedPendingSignals = useMemo(() => isOperator
+    ? pendingSignals.filter((signal) => signal.nucleus === operatorNucleus)
+    : pendingSignals, [isOperator, operatorNucleus, pendingSignals]);
+  const farol = useMemo(() => ({
+    demand: scopedPendingSignals.filter((signal) => signal.status === "Demanda próxima").length,
+    delay: scopedPendingSignals.filter((signal) => signal.status === "Possível atraso").length,
+    attention: scopedPendingSignals.filter((signal) => signal.status === "Ponto de atenção").length,
+    alert: scopedPendingSignals.filter((signal) => signal.status === "Alerta").length,
+  }), [scopedPendingSignals]);
+
+  const taskNuclei = useMemo(() => ["Todos", ...[...new Set(scopedPendingSignals.map((signal) => signal.nucleus).filter(Boolean))].sort()], [scopedPendingSignals]);
+  const taskOrders = useMemo(() => ["Todos", ...[...new Set(scopedPendingSignals.map((signal) => signal.reference).filter(Boolean))].sort()], [scopedPendingSignals]);
+  const taskMaterialOptions = useMemo(() => [...new Set([
+    ...ledger.map((row) => row.standardMaterial),
+    ...ledger.flatMap((row) => row.stockMaterials),
+    ...scopedPendingSignals.map((signal) => signal.material),
+  ].filter(Boolean))].sort(), [ledger, scopedPendingSignals]);
   const filteredPendingSignals = useMemo(() => {
     const materialSearch = normalizeMaterial(taskMaterialFilter);
-    return pendingSignals.filter((signal) => (taskSignalFilter === "Todos" || signal.status === taskSignalFilter)
+    return scopedPendingSignals.filter((signal) => (taskSignalFilter === "Todos" || signal.status === taskSignalFilter)
       && (taskOrderFilter === "Todos" || signal.reference === taskOrderFilter)
       && (taskNucleusFilter === "Todos" || signal.nucleus === taskNucleusFilter)
       && (!materialSearch || normalizeMaterial(signal.material).includes(materialSearch)));
-  }, [pendingSignals, taskMaterialFilter, taskNucleusFilter, taskOrderFilter, taskSignalFilter]);
-  const notificationCandidates = useMemo(() => pendingSignals.filter((signal) => signal.daysUntil !== null
+  }, [scopedPendingSignals, taskMaterialFilter, taskNucleusFilter, taskOrderFilter, taskSignalFilter]);
+  const notificationCandidates = useMemo(() => scopedPendingSignals.filter((signal) => signal.daysUntil !== null
     && signal.daysUntil <= -Number(notificationDays || 0)
-    && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus)), [notificationDays, notificationNucleus, pendingSignals]);
+    && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus)), [notificationDays, notificationNucleus, scopedPendingSignals]);
 
   const supplyAlerts = useMemo<OperationalAlert[]>(() => {
     const start = startOfDay(new Date(clock));
@@ -1192,6 +1753,11 @@ export default function Home() {
     return demands.filter((row) => row.demand > 0 && row.farmBalance <= 0).map((row) => {
       const support = allocation.allocations.get(row.id) || { allocated: 0, locations: [] };
       const locations = consolidateLocations(support.locations);
+      // O rateio indica o apoio possível; o aviso também expõe o saldo físico
+      // completo por armazém para o gestor avaliar a origem do repasse.
+      const warehouseBalances = consolidateWarehouseBalances(windowLedger
+        .filter((candidate) => candidate.canonicalKey === row.canonicalKey)
+        .flatMap((candidate) => candidate.locations));
       const place = locations.map((location) => location.location).join(", ");
       const fromCuiaba = locations.some((location) => normalizeMaterial(location.location).includes("CUIABA"));
       const dueDate = dueDates.get(row.id);
@@ -1205,6 +1771,7 @@ export default function Home() {
         title: `${row.standardMaterial} — ${row.nucleus}`,
         detail: `Uso previsto ${dueDate ? new Intl.DateTimeFormat("pt-BR").format(dueDate) : "nos próximos 30 dias"}; a fazenda não possui saldo. Demanda restante: ${formatNumber(row.demand)}.${warehouseDetail}`,
         metric: `${formatNumber(row.demand)} necessários`,
+        warehouseBalances,
       };
     });
   }, [clock, datasets.consumo, datasets.transito, dimensions, farmToNucleus, pendingOrders, plans, stockRows]);
@@ -1250,46 +1817,318 @@ export default function Home() {
   }, [clock, dimensions, farmToNucleus, stockRows]);
 
   const operationalAlerts = useMemo(() => [...supplyAlerts, ...doseIncreaseAlerts, ...expiredStockAlerts], [doseIncreaseAlerts, expiredStockAlerts, supplyAlerts]);
+  const scopedOperationalAlerts = useMemo(() => {
+    if (!isOperator) return operationalAlerts;
+    const normalizedNucleus = normalizeMaterial(operatorNucleus);
+    return operationalAlerts.filter((alert) => normalizeMaterial(`${alert.title} ${alert.detail}`).includes(normalizedNucleus));
+  }, [isOperator, operationalAlerts, operatorNucleus]);
+  const scopedAlertCounts = useMemo(() => ({
+    dose: scopedOperationalAlerts.filter((alert) => alert.category === "Aumento de dose na execução").length,
+    expired: scopedOperationalAlerts.filter((alert) => alert.category === "Estoque vencido").length,
+    supply: scopedOperationalAlerts.filter((alert) => alert.category === "Repasse em até 30 dias").length,
+  }), [scopedOperationalAlerts]);
+  const alertNuclei = useMemo(() => {
+    if (isOperator) return operatorHasNucleus ? [operatorNucleus] : [];
+    return ["Todos", ...[...new Set(ledger.map((row) => row.nucleus).filter(Boolean))].sort()];
+  }, [isOperator, ledger, operatorHasNucleus, operatorNucleus]);
+  const alertGroups = useMemo(() => ["Todos", ...[...new Set(ledger.map((row) => row.merchandiseGroup).filter(Boolean))].sort()], [ledger]);
+  const alertSubgroups = useMemo(() => ["Todos", ...[...new Set(ledger.map((row) => row.subgroup).filter(Boolean))].sort()], [ledger]);
+  const filteredOperationalAlerts = useMemo(() => {
+    const material = normalizeMaterial(alertMaterialFilter);
+    const enforcedNucleus = isOperator ? operatorNucleus : alertNucleusFilter;
+    const baseAlerts = isOperator ? scopedOperationalAlerts : operationalAlerts;
+    const hasFilter = enforcedNucleus !== "Todos" || Boolean(material) || alertGroupFilter !== "Todos" || alertSubgroupFilter !== "Todos";
+    if (!hasFilter) return baseAlerts;
+    const rowsInScope = ledger.filter((row) => (enforcedNucleus === "Todos" || row.nucleus === enforcedNucleus)
+      && (alertGroupFilter === "Todos" || row.merchandiseGroup === alertGroupFilter)
+      && (alertSubgroupFilter === "Todos" || row.subgroup === alertSubgroupFilter)
+      && (!material || normalizeMaterial([row.standardMaterial, ...row.stockMaterials].join(" ")).includes(material)));
+    return baseAlerts.filter((alert) => {
+      const searchable = normalizeMaterial(`${alert.title} ${alert.detail}`);
+      return rowsInScope.some((row) => [row.nucleus, row.active, row.standardMaterial, ...row.stockMaterials]
+        .filter(Boolean)
+        .some((value) => searchable.includes(normalizeMaterial(value))));
+    });
+  }, [alertGroupFilter, alertMaterialFilter, alertNucleusFilter, alertSubgroupFilter, isOperator, ledger, operatorNucleus, operationalAlerts, scopedOperationalAlerts]);
+  const warehouseStockRelations = useMemo(() => {
+    const values = new Map<string, { active: string; group: string; subgroup: string; material: string; standardMaterial: string; warehouse: string; balance: number }>();
+    ledger.forEach((row) => row.locations.filter((location) => location.type === "Armazém" && location.amount > 0).forEach((location) => {
+      const key = [row.canonicalKey, location.material, location.location].join("\u0000");
+      const current = values.get(key);
+      values.set(key, current ? { ...current, balance: current.balance + location.amount } : {
+        active: row.active,
+        group: row.merchandiseGroup,
+        subgroup: row.subgroup,
+        material: location.material,
+        standardMaterial: row.standardMaterial,
+        warehouse: location.location,
+        balance: location.amount,
+      });
+    }));
+    const material = normalizeMaterial(alertMaterialFilter);
+    return [...values.values()].filter((row) => (alertGroupFilter === "Todos" || row.group === alertGroupFilter)
+      && (alertSubgroupFilter === "Todos" || row.subgroup === alertSubgroupFilter)
+      && (!material || normalizeMaterial([row.active, row.standardMaterial, row.material].join(" ")).includes(material)))
+      .sort((left, right) => left.warehouse.localeCompare(right.warehouse) || left.material.localeCompare(right.material));
+  }, [alertGroupFilter, alertMaterialFilter, alertSubgroupFilter, ledger]);
 
   async function importFiles() {
+    if (currentUser?.role !== "admin") { setMessage("Somente administradores podem importar ou substituir arquivos operacionais."); return; }
     const selected = sourceConfig.filter((source) => uploads[source.key]);
     if (!selected.length) { setMessage("Selecione ao menos uma fonte antes de importar."); return; }
     setImporting(true);
     setMessage("");
     try {
-      const loaded = await Promise.all(selected.map(async (source) => {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const loaded: Array<{ key: SourceKey; rows: Row[]; summary: ImportSummary; warnings: number }> = [];
+      for (const source of selected) {
         const file = uploads[source.key]!;
-        const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
-        const rows = rowsFrom(workbook, source);
-        return {
+        setImportProgress(`Lendo ${source.title} em segundo plano (${loaded.length + 1} de ${selected.length})...`);
+        const parsed = await parseImportFile(file, source);
+        loaded.push({
           key: source.key,
-          rows,
+          rows: parsed.rows,
           summary: {
             fileName: file.name,
             fileModifiedAt: new Date(file.lastModified || Date.now()).toISOString(),
             importedAt: new Date().toISOString(),
-            rows: rows.length,
-            sheets: workbook.SheetNames,
+            rows: parsed.rowCount,
+            sheets: parsed.sheets,
           },
-        };
-      }));
-      setDatasets((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.rows])) }));
-      setImports((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.summary])) }));
+          warnings: importWarnings(parsed.rows, source.key).total,
+        });
+      }
+      setImportProgress("Aplicando a carga conciliada aos visuais...");
+      startTransition(() => {
+        setDatasets((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.rows])) }));
+        setImports((current) => ({ ...current, ...Object.fromEntries(loaded.map((item) => [item.key, item.summary])) }));
+        setImportHistory((current) => {
+          const entries = loaded.map((item) => ({
+            ...item.summary,
+            id: taskId("import"),
+            source: item.key,
+            version: current.filter((entry) => entry.source === item.key).length + 1,
+            previousRows: imports[item.key]?.rows || 0,
+            warnings: item.warnings,
+          }));
+          return [...entries, ...current].slice(0, 80);
+        });
+      });
+      loaded.forEach((item) => recordAudit("import", `${sourceConfig.find((source) => source.key === item.key)?.title || item.key}: ${item.summary.rows} linhas importadas${item.warnings ? `; ${item.warnings} validações pendentes` : ""}.`));
       setUploads({});
-      setMessage("Carga validada e salva neste navegador. Os visuais já usam as fontes importadas.");
+      const warnings = loaded.reduce((sum, item) => sum + item.warnings, 0);
+      setMessage(`Carga validada e salva na base central. ${warnings ? `${warnings} validação(ões) precisa(m) de revisão no histórico.` : "Os visuais já usam as fontes importadas."}`);
       setActive("Visão geral");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Não foi possível ler um dos arquivos.");
     } finally {
       setImporting(false);
+      setImportProgress("");
     }
+  }
+  function addRoadDriver() {
+    if (currentUser?.role !== "admin") return;
+    const fullName = driverDraft.fullName.trim();
+    const cpf = driverDraft.cpf.replace(/\D/g, "");
+    if (!fullName || cpf.length !== 11) { setLogisticsMessage("Informe o nome completo e um CPF com 11 dígitos."); return; }
+    if (logistics.drivers.some((driver) => driver.cpf === cpf)) { setLogisticsMessage("Já existe um motorista cadastrado com este CPF."); return; }
+    setLogistics((current) => ({ ...current, drivers: [...current.drivers, { id: taskId("motorista"), fullName, cpf, phone: driverDraft.phone.trim(), createdAt: new Date().toISOString() }] }));
+    setDriverDraft({ cpf: "", fullName: "", phone: "" });
+    setLogisticsMessage("Motorista cadastrado para a configuração rodoviária.");
+    recordAudit("workspace", `Motorista cadastrado: ${fullName}.`);
+  }
+  function addRoadVehicle() {
+    if (currentUser?.role !== "admin") return;
+    const plate = vehicleDraft.plate.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const capacity = Number(vehicleDraft.capacity.replace(",", "."));
+    const model = vehicleDraft.model.trim();
+    if (plate.length < 7 || !Number.isFinite(capacity) || capacity <= 0 || !model) { setLogisticsMessage("Informe placa, modelo e capacidade válida do veículo."); return; }
+    if (logistics.vehicles.some((vehicle) => vehicle.plate === plate)) { setLogisticsMessage("Já existe um veículo cadastrado com esta placa."); return; }
+    setLogistics((current) => ({ ...current, vehicles: [...current.vehicles, { id: taskId("veiculo"), plate, capacity, model, createdAt: new Date().toISOString() }] }));
+    setVehicleDraft({ capacity: "", model: "", plate: "" });
+    setLogisticsMessage("Veículo cadastrado para a configuração rodoviária.");
+    recordAudit("workspace", `Veículo cadastrado: ${plate}.`);
+  }
+  function removeRoadDriver(driver: RoadDriver) {
+    if (currentUser?.role !== "admin") return;
+    if (logistics.trips.some((trip) => trip.driverId === driver.id)) { setLogisticsMessage("Este motorista já está vinculado a uma viagem e não pode ser excluído."); return; }
+    setLogistics((current) => ({ ...current, drivers: current.drivers.filter((item) => item.id !== driver.id) }));
+    recordAudit("workspace", `Motorista removido: ${driver.fullName}.`);
+  }
+  function removeRoadVehicle(vehicle: RoadVehicle) {
+    if (currentUser?.role !== "admin") return;
+    if (logistics.trips.some((trip) => trip.vehicleId === vehicle.id)) { setLogisticsMessage("Este veículo já está vinculado a uma viagem e não pode ser excluído."); return; }
+    setLogistics((current) => ({ ...current, vehicles: current.vehicles.filter((item) => item.id !== vehicle.id) }));
+    recordAudit("workspace", `Veículo removido: ${vehicle.plate}.`);
+  }
+  function addRouteItem() {
+    if (!selectedRouteItem) { setLogisticsMessage("Selecione uma solicitação e um material para adicionar à rota."); return; }
+    if (routeItems.some((item) => item.id === selectedRouteItem.id)) { setLogisticsMessage("Este material já foi adicionado à rota."); return; }
+    setRouteItems((current) => [...current, selectedRouteItem]);
+    setTripMaterialKey("");
+    setLogisticsMessage(`${selectedRouteItem.product} adicionado à rota.`);
+  }
+  function removeRouteItem(id: string) {
+    setRouteItems((current) => current.filter((item) => item.id !== id));
+  }
+  function createLogisticsTrip() {
+    if (currentUser?.role !== "admin") return;
+    const driver = logistics.drivers.find((item) => item.id === tripDriverId);
+    const vehicle = logistics.vehicles.find((item) => item.id === tripVehicleId);
+    const invoiceNumber = tripInvoiceNumber.trim();
+    const primary = routeItems[0];
+    if (!primary || !driver || !vehicle || !invoiceNumber) { setLogisticsMessage("Adicione ao menos um material à rota e informe motorista, veículo e nota fiscal."); return; }
+    const sourceWarehouses = [...new Set(routeItems.map((item) => item.sourceWarehouse).filter(Boolean))];
+    const destinations = [...new Set(routeItems.map((item) => item.destination).filter(Boolean))];
+    const trip: LogisticsTrip = {
+      id: taskId("viagem"),
+      requestId: primary.requestId, requestDate: primary.requestDate, product: primary.product, productCode: primary.productCode,
+      lot: primary.lot, quantity: primary.quantity, unit: primary.unit,
+      sourceWarehouse: sourceWarehouses.join(" · "), destination: destinations.join(" · "), destinationCode: primary.destinationCode,
+      driverId: driver.id, vehicleId: vehicle.id, invoiceNumber, createdAt: new Date().toISOString(), items: routeItems,
+    };
+    setLogistics((current) => ({ ...current, trips: [trip, ...current.trips] }));
+    setRecipeTripId(trip.id);
+    setTripRequestId("");
+    setTripMaterialKey("");
+    setRouteItems([]);
+    setTripInvoiceNumber("");
+    setLogisticsMessage(`Viagem ${trip.id.replace("viagem-", "")} emitida com ${routeItems.length} material(is) de ${new Set(routeItems.map((item) => item.requestId)).size} solicitação(ões). Agora vincule a receita, se aplicável.`);
+    recordAudit("workspace", `Viagem emitida com ${routeItems.length} material(is) para ${new Set(routeItems.map((item) => item.requestId)).size} solicitação(ões).`);
+  }
+  function attachTripRecipe() {
+    if (currentUser?.role !== "admin") return;
+    const trip = logistics.trips.find((item) => item.id === recipeTripId);
+    if (!trip || !recipeDraft.culture.trim() || !recipeDraft.target.trim() || !recipeDraft.dose.trim()) { setLogisticsMessage("Informe cultura, alvo e dose para vincular a receita."); return; }
+    setLogistics((current) => ({ ...current, trips: current.trips.map((item) => item.id === trip.id ? { ...item, recipe: { culture: recipeDraft.culture.trim(), target: recipeDraft.target.trim(), dose: recipeDraft.dose.trim() } } : item) }));
+    setRecipeDraft({ culture: "", dose: "", target: "" });
+    setLogisticsMessage("Receita vinculada à viagem emitida.");
+    recordAudit("workspace", `Receita vinculada à viagem ${trip.id.replace("viagem-", "")}.`);
+  }
+  function removeLogisticsTrip(trip: LogisticsTrip) {
+    if (currentUser?.role !== "admin") return;
+    const items = logisticsTripItems(trip);
+    if (!window.confirm(`Excluir a viagem com ${items.length} material(is) de ${new Set(items.map((item) => item.requestId)).size} solicitação(ões)?`)) return;
+    setLogistics((current) => ({ ...current, trips: current.trips.filter((item) => item.id !== trip.id) }));
+    if (recipeTripId === trip.id) setRecipeTripId("");
+    recordAudit("workspace", `Viagem excluída: ${items.length} material(is) e ${new Set(items.map((item) => item.requestId)).size} solicitação(ões).`);
+  }
+  async function exportLogisticsDocument(trip: LogisticsTrip) {
+    const XLSX = await loadXlsx();
+    const driver = logistics.drivers.find((item) => item.id === trip.driverId);
+    const vehicle = logistics.vehicles.find((item) => item.id === trip.vehicleId);
+    const rows = [
+      ["Viagem", "Solicitação", "Data solicitação", "Armazém", "Cód. material", "Insumo web", "Lote", "Unidade", "Quantidade", "Destino", "Cód. destino", "Motorista", "CPF", "Placa", "Modelo", "Capacidade", "Nota fiscal", "Cultura", "Alvo", "Dose"],
+      ...logisticsTripItems(trip).map((item) => [trip.id.replace("viagem-", ""), item.requestId, item.requestDate, item.sourceWarehouse, item.productCode, item.product, item.lot, item.unit, item.quantity, item.destination, item.destinationCode, driver?.fullName || "Motorista removido", driver?.cpf || "", vehicle?.plate || "Veículo removido", vehicle?.model || "", vehicle?.capacity || "", trip.invoiceNumber, trip.recipe?.culture || "", trip.recipe?.target || "", trip.recipe?.dose || ""]),
+    ];
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "Emissão de doc");
+    XLSX.writeFile(workbook, `emissao_logistica_${trip.id.replace("viagem-", "")}.xlsx`, { bookType: "xlsx" });
+  }
+  function resetClosingDraft() {
+    setEditingClosingId("");
+    setClosingDraft({ supplier: "", paymentDue: "", destination: "", deliveryLocation: "", cycle: "Safra", culture: "", active: "", product: "", unit: "", currency: "BRL", unitPrice: "", packaging: "", totalVolume: "", orderKey: "" });
+    setClosingDistributionDraft({});
+  }
+  function applyClosingOrder(orderKey: string) {
+    const order = commercialOrders.find((item) => item.key === orderKey);
+    setClosingDraft((current) => ({
+      ...current,
+      orderKey,
+      supplier: order?.supplier || current.supplier,
+      paymentDue: order?.dueDate ? (dateFromPlan(order.dueDate) ? dateKey(dateFromPlan(order.dueDate)!) : current.paymentDue) : current.paymentDue,
+      active: order?.active !== "Não conciliado" ? order.active : current.active,
+      product: order?.standardProduct || current.product,
+      unit: order?.unit || current.unit,
+      currency: order?.currency || current.currency,
+      unitPrice: order?.unitPrice ? String(order.unitPrice) : current.unitPrice,
+    }));
+  }
+  function applyPlanningDistribution() {
+    const volume = numberFrom(closingDraft.totalVolume);
+    if (!selectedClosingSchedule?.planned || !volume) { setClosingMessage("Informe o produto e o volume para usar a sugestão baseada no planejamento."); return; }
+    const distribution = Object.fromEntries(Object.entries(selectedClosingSchedule.months).map(([month, amount]) => [month, Number((volume * amount / selectedClosingSchedule.planned).toFixed(4))]));
+    setClosingDistributionDraft(distribution);
+    setClosingMessage("Distribuição sugerida pelo volume planejado em cada mês de aplicação.");
+  }
+  function saveCommercialClosing() {
+    if (currentUser?.role !== "admin") return;
+    const supplier = closingDraft.supplier.trim();
+    const product = closingDraft.product.trim();
+    const totalVolume = numberFrom(closingDraft.totalVolume);
+    const unitPrice = numberFrom(closingDraft.unitPrice);
+    const totalDistributed = Object.values(closingDistributionDraft).reduce((sum, amount) => sum + numberFrom(amount), 0);
+    if (!supplier || !product || totalVolume <= 0 || unitPrice < 0) { setClosingMessage("Informe fornecedor, produto, volume e valor unitário para salvar o fechamento."); return; }
+    if (Math.abs(totalDistributed - totalVolume) > 0.01) { setClosingMessage(`A distribuição mensal soma ${formatNumber(totalDistributed)} e precisa totalizar ${formatNumber(totalVolume)}.`); return; }
+    const selectedOrder = commercialOrders.find((order) => order.key === closingDraft.orderKey);
+    const now = new Date().toISOString();
+    const item: CommercialClosing = {
+      id: editingClosingId || taskId("fechamento"),
+      supplier,
+      paymentDue: closingDraft.paymentDue,
+      destination: closingDraft.destination.trim(),
+      deliveryLocation: closingDraft.deliveryLocation.trim(),
+      cycle: closingDraft.cycle,
+      culture: closingDraft.culture.trim(),
+      active: closingDraft.active.trim() || dimensions.materials[normalizeMaterial(product)]?.principleActive || "Não informado",
+      product,
+      unit: closingDraft.unit.trim() || selectedOrder?.unit || "UN",
+      currency: closingDraft.currency,
+      unitPrice,
+      packaging: closingDraft.packaging.trim(),
+      totalVolume,
+      distribution: Object.fromEntries(Object.entries(closingDistributionDraft).filter(([, amount]) => numberFrom(amount) !== 0).map(([month, amount]) => [month, numberFrom(amount)])),
+      orderKey: selectedOrder?.key || "",
+      orderNumber: selectedOrder?.orderNumber || "",
+      createdAt: commercialClosings.closings.find((closing) => closing.id === editingClosingId)?.createdAt || now,
+      updatedAt: now,
+    };
+    setCommercialClosings((current) => ({ ...current, closings: editingClosingId ? current.closings.map((closing) => closing.id === editingClosingId ? item : closing) : [item, ...current.closings] }));
+    recordAudit("workspace", `${editingClosingId ? "Fechamento atualizado" : "Fechamento comercial criado"}: ${item.product}.`);
+    setClosingMessage(editingClosingId ? "Fechamento atualizado e conciliado com a distribuição." : "Fechamento comercial salvo com a distribuição mensal.");
+    resetClosingDraft();
+    setClosingTab("distribuicoes");
+  }
+  function editCommercialClosing(closing: CommercialClosing) {
+    setEditingClosingId(closing.id);
+    setClosingDraft({ supplier: closing.supplier, paymentDue: closing.paymentDue, destination: closing.destination, deliveryLocation: closing.deliveryLocation, cycle: closing.cycle, culture: closing.culture, active: closing.active, product: closing.product, unit: closing.unit, currency: closing.currency, unitPrice: String(closing.unitPrice), packaging: closing.packaging, totalVolume: String(closing.totalVolume), orderKey: closing.orderKey });
+    setClosingDistributionDraft(closing.distribution);
+    setClosingMessage("");
+    setClosingTab("distribuicoes");
+  }
+  function removeCommercialClosing(closing: CommercialClosing) {
+    if (currentUser?.role !== "admin") return;
+    if (!window.confirm(`Excluir o fechamento de ${closing.product} com ${closing.supplier}?`)) return;
+    setCommercialClosings((current) => ({ ...current, closings: current.closings.filter((item) => item.id !== closing.id), annotations: current.annotations.filter((note) => note.closingId !== closing.id) }));
+    if (editingClosingId === closing.id) resetClosingDraft();
+    recordAudit("workspace", `Fechamento comercial excluído: ${closing.product}.`);
+  }
+  function saveClosingAnnotation() {
+    if (currentUser?.role !== "admin") return;
+    if (!closingAnnotationDraft.closingId || !closingAnnotationDraft.note.trim()) { setClosingMessage("Vincule a anotação a um fechamento e descreva o detalhe de faturamento ou observação."); return; }
+    const annotation: ClosingAnnotation = {
+      id: taskId("anotacao-fechamento"), closingId: closingAnnotationDraft.closingId, materialSent: closingAnnotationDraft.materialSent.trim(),
+      purchaseVolume: closingAnnotationDraft.purchaseVolume.trim() ? numberFrom(closingAnnotationDraft.purchaseVolume) : null,
+      invoicedVolume: closingAnnotationDraft.invoicedVolume.trim() ? numberFrom(closingAnnotationDraft.invoicedVolume) : null,
+      note: closingAnnotationDraft.note.trim(), resolved: closingAnnotationDraft.resolved, createdAt: new Date().toISOString(),
+    };
+    setCommercialClosings((current) => ({ ...current, annotations: [annotation, ...current.annotations] }));
+    setClosingAnnotationDraft({ closingId: "", materialSent: "", purchaseVolume: "", invoicedVolume: "", note: "", resolved: false });
+    setClosingMessage("Anotação vinculada ao fechamento comercial.");
+    recordAudit("workspace", "Anotação de faturamento incluída em um fechamento comercial.");
+  }
+  function removeClosingAnnotation(annotation: ClosingAnnotation) {
+    if (currentUser?.role !== "admin") return;
+    setCommercialClosings((current) => ({ ...current, annotations: current.annotations.filter((item) => item.id !== annotation.id) }));
   }
   function addPremise() {
     if (!draft.key.trim() || !draft.value.trim()) return;
     setDimensionPremises((current) => [...current, { ...draft, key: draft.key.trim(), value: draft.value.trim() }]);
+    recordAudit("premise", `Premissa incluída: ${draft.domain} — ${draft.key.trim()}.`);
     setDraft((current) => ({ ...current, key: "", value: "" }));
   }
-  function exportPremiseSection() {
+  async function exportPremiseSection() {
+    const XLSX = await loadXlsx();
     const section = selectedPremiseSection;
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([section.headers, ...section.rows]), section.title.slice(0, 31));
@@ -1308,8 +2147,14 @@ export default function Home() {
       nucleus,
       title: taskTitle.trim() || (material ? `Ação para ${material}${nucleus ? ` — ${nucleus}` : ""}` : "Ação operacional"),
       createdAt: now,
+      owner: currentUser?.name || "Não atribuído",
+      dueDate: dateKey(new Date(Date.now() + 3 * 86_400_000)),
+      evidence: "",
+      status: "Aberta",
+      updatedAt: now,
       actions: [{ id: taskId("acao"), note: taskNote.trim(), createdAt: now }],
     }]);
+    recordAudit("task", `Tarefa registrada: ${taskTitle.trim() || material || "Ação operacional"}.`);
     setTaskTitle("");
     setTaskNote("");
     setTaskPendingId("");
@@ -1321,8 +2166,19 @@ export default function Home() {
     setTasks((current) => current.map((task) => task.id === taskIdValue ? {
       ...task,
       actions: [...task.actions, { id: taskId("acao"), note, createdAt: new Date().toISOString() }],
+      updatedAt: new Date().toISOString(),
     } : task));
     setTaskActionDrafts((current) => ({ ...current, [taskIdValue]: "" }));
+  }
+  function updateTask(taskIdValue: string, patch: Partial<Pick<TaskItem, "owner" | "dueDate" | "evidence" | "status">>) {
+    setTasks((current) => current.map((task) => task.id === taskIdValue ? { ...task, ...patch, updatedAt: new Date().toISOString() } : task));
+    if (patch.status) recordAudit("task", `Tarefa atualizada para ${patch.status}.`);
+  }
+  function deleteTask(task: TaskItem) {
+    if (currentUser?.role !== "admin") return;
+    if (!window.confirm(`Excluir a tarefa “${task.title}” e todo o seu histórico?`)) return;
+    setTasks((current) => current.filter((item) => item.id !== task.id));
+    recordAudit("task", `Tarefa excluída: ${task.title}.`);
   }
   function openNotification() {
     const firstNucleus = taskNuclei.length > 1 ? taskNuclei[1] : "Todos";
@@ -1332,42 +2188,44 @@ export default function Home() {
     setNotificationMessage("");
     setShowNotification(true);
   }
-  async function sendNotification() {
+  function openOutlookDraft() {
     if (!notificationTo.trim() || !notificationCandidates.length) {
       setNotificationMessage("Informe o destinatário e selecione uma faixa que possua pedidos pendentes.");
       return;
     }
-    setSendingNotification(true);
     setNotificationMessage("");
-    try {
-      const response = await fetch("/api/send-alert", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          to: notificationTo,
-          cc: notificationCc,
-          nucleus: notificationNucleus,
-          threshold: notificationDays,
-          notices: notificationCandidates.map((signal) => ({
-            reference: signal.reference,
-            material: signal.material,
-            nucleus: signal.nucleus,
-            dueDate: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data",
-            delay: signal.daysUntil === null ? "Sem cálculo" : `${Math.abs(signal.daysUntil)} dia(s)`,
-            quantity: formatNumber(signal.quantity),
-          })),
-        }),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.error || "Não foi possível enviar a notificação.");
-      setNotificationMessage(`E-mail enviado com ${notificationCandidates.length} pedido(s) pendente(s).`);
-    } catch (error) {
-      setNotificationMessage(error instanceof Error ? error.message : "Não foi possível enviar a notificação.");
-    } finally {
-      setSendingNotification(false);
-    }
+    // Clientes MAPI, como o Outlook Classic, recebem o rascunho pelo protocolo
+    // MAILTO. Limitamos o texto para evitar que uma lista muito grande exceda
+    // o tamanho aceito pelo Windows e impeça a abertura do OUTLOOK.EXE.
+    const maxNotices = 25;
+    const notices = notificationCandidates.slice(0, maxNotices).map((signal) => [
+      `Pedido: ${signal.reference}`,
+      `Material: ${signal.material}`,
+      `Núcleo: ${signal.nucleus}`,
+      `Previsão: ${signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data"}`,
+      `Atraso: ${signal.daysUntil === null ? "Sem cálculo" : `${Math.abs(signal.daysUntil)} dia(s)`}`,
+      `Volume solicitado: ${formatNumber(signal.quantity)}`,
+    ].join("\n")).join("\n\n");
+    const remaining = notificationCandidates.length - maxNotices;
+    const params = new URLSearchParams({
+      subject: `AgroNexus | pedidos pendentes — ${notificationNucleus}`,
+      body: `Pedidos pendentes com atenção\n\nNúcleo: ${notificationNucleus}\nAtrasos a partir de: ${notificationDays} dia(s)\n\n${notices}${remaining > 0 ? `\n\n+ ${remaining} pedido(s) adicionais. Consulte a exportação da guia Tarefas para a relação completa.` : ""}\n\nMensagem preparada pelo AgroNexus 360.`,
+    });
+    if (notificationCc.trim()) params.set("cc", notificationCc.trim());
+    const recipients = notificationTo.trim().split(/[;,]/).map((item) => item.trim()).filter(Boolean).join(";");
+    const mailto = `mailto:${recipients}?${params.toString()}`;
+    // Um clique em âncora preserva o gesto do usuário e aciona o handler
+    // MAILTO do Windows — o caminho suportado para o Outlook Classic.
+    const launcher = document.createElement("a");
+    launcher.href = mailto;
+    launcher.style.display = "none";
+    document.body.appendChild(launcher);
+    launcher.click();
+    launcher.remove();
+    setNotificationMessage("Rascunho aberto pelo protocolo MAILTO no Outlook Classic. Revise e envie quando desejar.");
   }
-  function exportTasks() {
+  async function exportTasks() {
+    const XLSX = await loadXlsx();
     const farolRows = filteredPendingSignals.map((signal) => ({
       Farol: signal.status,
       Previsão: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data",
@@ -1379,26 +2237,30 @@ export default function Home() {
     }));
     const history = tasks.flatMap((task) => task.actions.map((action) => {
       const linked = pendingSignals.find((signal) => signal.id === task.pendingId);
-      return { Tarefa: task.title, Pedido: linked?.reference || "", Material: linked?.material || "", Núcleo: linked?.nucleus || "", Ação: action.note, "Registrada em": formatDateTime(action.createdAt) };
+      return { Tarefa: task.title, Status: task.status || "Aberta", Responsável: task.owner || "Não atribuído", Prazo: task.dueDate || "", Evidência: task.evidence || "", Pedido: linked?.reference || "", Material: linked?.material || task.material || "", Núcleo: linked?.nucleus || task.nucleus || "", Ação: action.note, "Registrada em": formatDateTime(action.createdAt) };
     }));
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(farolRows), "Farol de pedidos");
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(history), "Histórico de ações");
     XLSX.writeFile(workbook, `tarefas_e_farol_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
   }
-  function exportAlerts() {
-    const alerts = operationalAlerts.map((alert) => ({ Categoria: alert.category, Prioridade: alert.severity === "critical" ? "Crítico" : alert.severity === "attention" ? "Atenção" : "Informativo", Título: alert.title, Detalhe: alert.detail, Indicador: alert.metric }));
+  async function exportAlerts() {
+    const XLSX = await loadXlsx();
+    const alerts = filteredOperationalAlerts.map((alert) => ({ Categoria: alert.category, Prioridade: alert.severity === "critical" ? "Crítico" : alert.severity === "attention" ? "Atenção" : "Informativo", Título: alert.title, Detalhe: alert.detail, "Saldo armazém": alert.warehouseBalances?.map((location) => `${location.location}: ${formatNumber(location.amount)}`).join(" | ") || "—", Indicador: alert.metric }));
     const farolRows = pendingSignals.filter((signal) => signal.status !== "Programado" && signal.status !== "Sem data").map((signal) => ({ Farol: signal.status, Pedido: signal.reference, Material: signal.material, Núcleo: signal.nucleus, Previsão: signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", "Volume solicitado": signal.quantity }));
+    const warehouseRows = warehouseStockRelations.map((row) => ({ "Princípio ativo": row.active, Grupo: row.group, Subgrupo: row.subgroup, "Material padrão": row.standardMaterial, Material: row.material, Armazém: row.warehouse, Saldo: row.balance }));
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(alerts), "Alertas operacionais");
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(farolRows), "Farol de pedidos");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(warehouseRows), "Saldo em armazém");
     XLSX.writeFile(workbook, `alertas_operacionais_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
   }
-  function exportProvision() {
+  async function exportProvision() {
+    const XLSX = await loadXlsx();
     const summary = provision.rows.map((row) => ({
       "Núcleo": row.nucleus, "Princípio ativo": row.active, Grupo: row.merchandiseGroup, Subgrupo: row.subgroup,
       "Material padrão": row.standardMaterial, "Demanda da janela": row.demand, "Saldo do núcleo": row.farmBalance,
-      Trânsito: row.transit, "Apoio do armazém": row.warehouseSupport, "Saldo após atendimento": row.balance,
+      Trânsito: row.transit, "Apoio do armazém": row.warehouseSupport, "Apoio de outros núcleos": row.nucleusSupport, "Saldo após atendimento": row.balance,
       "Volume solicitado": row.pendingOrder, Situação: row.status,
     }));
     const details = provision.rows.flatMap((row) => [
@@ -1408,13 +2270,17 @@ export default function Home() {
       ...row.warehouseLocations.map((location) => ({
         "Núcleo": row.nucleus, "Material padrão": row.standardMaterial, Material: location.material, Tipo: "Armazém", Local: location.location, "Saldo / trânsito": location.amount,
       })),
+      ...row.nucleusSupportLocations.map((location) => ({
+        "Núcleo": row.nucleus, "Material padrão": row.standardMaterial, Material: location.material, Tipo: "Apoio de outro núcleo", Local: location.location, "Saldo / trânsito": location.amount,
+      })),
     ]);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summary), "Resumo");
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
     XLSX.writeFile(workbook, "provisionamento_" + evaluationDate + "_" + provisionUntil + ".xlsx", { bookType: "xlsx" });
   }
-  function exportMonitoring() {
+  async function exportMonitoring() {
+    const XLSX = await loadXlsx();
     const totalsByActive = monitoringGroups.map((group) => ({
       "Princípio ativo": group.active,
       "Qtd. planejada": group.totals.planned,
@@ -1436,7 +2302,7 @@ export default function Home() {
         "Material padrão": row.standardMaterial,
         "Material em estoque": row.stockMaterials.join(", "),
         "Qtd. planejada": row.planned,
-        "Saldo convertido": row.farmBalance + row.warehouseBalance,
+        Estoque: row.farmBalance + row.warehouseBalance,
         "Saldo físico sem conversão": conversion?.hasConversion ? conversion.physical : "",
         Trânsito: row.transit,
         Aplicado: row.applied,
@@ -1459,7 +2325,8 @@ export default function Home() {
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(details), "Detalhes");
     XLSX.writeFile(workbook, "acompanhamento_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
   }
-  function exportReconciliationReport() {
+  async function exportReconciliationReport() {
+    const XLSX = await loadXlsx();
     const rows = reconciliationIssues.map((issue) => ({
       Fonte: issue.source,
       Material: issue.material,
@@ -1473,25 +2340,65 @@ export default function Home() {
     XLSX.writeFile(workbook, "relatorio_conciliacao_" + dateKey(new Date()) + ".xlsx", { bookType: "xlsx" });
   }
 
-  const totalPlanned = ledger.reduce((sum, row) => sum + row.planned, 0);
-  const totalApplied = ledger.reduce((sum, row) => sum + row.applied, 0);
-  const shortage = consolidatedSupply.shortage;
+  const dashboardLedger = operatorNucleus ? ledger.filter((row) => row.nucleus === operatorNucleus) : ledger;
+  const totalPlanned = dashboardLedger.reduce((sum, row) => sum + row.planned, 0);
+  const totalApplied = dashboardLedger.reduce((sum, row) => sum + row.applied, 0);
+  const shortage = isOperator ? dashboardLedger.reduce((sum, row) => sum + row.shortage, 0) : consolidatedSupply.shortage;
   const hasData = sourceConfig.some((source) => Boolean(imports[source.key]));
+  const scopedTasks = isOperator
+    ? tasks.filter((task) => task.nucleus === operatorNucleus || scopedPendingSignals.some((signal) => signal.id === task.pendingId))
+    : tasks;
+  const openTasks = scopedTasks.filter((task) => task.status !== "Concluída");
+  const overdueTasks = openTasks.filter((task) => task.dueDate && task.dueDate < dateKey(new Date(clock))).length;
+  const taskHistory = scopedTasks.flatMap((task) => task.actions.map((action) => ({ ...action, task }))).sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+  const taskHistoryPages = Math.max(1, Math.ceil(taskHistory.length / taskHistorySize));
+  const safeTaskHistoryPage = Math.min(taskHistoryPage, taskHistoryPages - 1);
+  const paginatedTaskHistory = taskHistory.slice(safeTaskHistoryPage * taskHistorySize, (safeTaskHistoryPage + 1) * taskHistorySize);
+  const qualityWarnings = importHistory.reduce((sum, item) => sum + item.warnings, 0);
+  const qualityPending = reconciliationIssues.length + qualityWarnings;
+  const dashboardQualityPending = isOperator ? 0 : qualityPending;
+  const dailyPriorities = [
+    ...scopedOperationalAlerts.filter((alert) => alert.severity === "critical").slice(0, 4).map((alert) => ({ id: alert.id, level: "Crítico", title: alert.title, detail: alert.detail, tone: "rose" })),
+    ...scopedPendingSignals.filter((signal) => signal.status === "Alerta" || signal.status === "Ponto de atenção").slice(0, 4).map((signal) => ({ id: signal.id, level: signal.status, title: `${signal.material} — ${signal.nucleus}`, detail: `${signal.reference} · ${signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "sem data"}`, tone: signal.tone === "rose" ? "rose" : "amber" })),
+    ...openTasks.filter((task) => task.dueDate && task.dueDate <= dateKey(new Date(clock))).slice(0, 3).map((task) => ({ id: task.id, level: "Tarefa", title: task.title, detail: `${task.owner || "Não atribuído"} · prazo ${task.dueDate ? new Intl.DateTimeFormat("pt-BR").format(new Date(task.dueDate + "T00:00:00")) : "não definido"}`, tone: "amber" })),
+  ].slice(0, 8);
+
+  async function exportExecutiveReport() {
+    const XLSX = await loadXlsx();
+    const workbook = XLSX.utils.book_new();
+    const overview = [
+      { Indicador: "Execução de materiais", Valor: `${percent(totalApplied, totalPlanned).toFixed(1)}%`, Detalhe: `${formatNumber(totalApplied)} de ${formatNumber(totalPlanned)} planejados` },
+      { Indicador: "Saldo com atenção", Valor: shortage, Detalhe: "Necessidade após rateio e apoios" },
+      { Indicador: "Pendências de qualidade", Valor: qualityPending, Detalhe: `${reconciliationIssues.length} de conciliação e ${qualityWarnings} de importação` },
+      { Indicador: "Tarefas abertas", Valor: openTasks.length, Detalhe: `${overdueTasks} em atraso` },
+    ];
+    const supply = provision.rows.map((row) => ({ Núcleo: row.nucleus, Material: row.standardMaterial, Demanda: row.demand, Fazenda: row.farmBalance, Trânsito: row.transit, Armazém: row.warehouseSupport, "Outros núcleos": row.nucleusSupport, Situação: row.status }));
+    const taskRows = scopedTasks.map((task) => ({ Tarefa: task.title, Status: task.status || "Aberta", Responsável: task.owner || "Não atribuído", Prazo: task.dueDate || "", Material: task.material || "", Núcleo: task.nucleus || "", Atualizada: formatDateTime(task.updatedAt || task.createdAt) }));
+    const daeRows = daeByNucleus.flatMap(({ nucleus, entries }) => entries.map((entry) => ({ Núcleo: nucleus, Cultura: entry.culture, Ciclo: entry.cycle, DAE: entry.days, "Data de plantio": new Intl.DateTimeFormat("pt-BR").format(entry.plantedAt), Área: entry.area, "% da área": entry.share })));
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(overview), "Resumo executivo");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(dailyPriorities), "Prioridades do dia");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(supply), "Simulação logística");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(taskRows), "Tarefas");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(daeRows), "DAE por núcleo");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(reconciliationIssues), "Qualidade da base");
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(importHistory), "Histórico de importação");
+    XLSX.writeFile(workbook, `relatorio_executivo_${dateKey(new Date())}.xlsx`, { bookType: "xlsx" });
+  }
 
   let content: ReactNode;
   if (active === "Visão geral") {
     content = hasData ? <section className="space-y-6">
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 md:grid-cols-3">
         <Card label="Execução de materiais" value={percent(totalApplied, totalPlanned).toFixed(1) + "%"} note={formatNumber(totalApplied) + " de " + formatNumber(totalPlanned) + " planejados"} tone="emerald" />
         <Card label="Saldo com atenção" value={formatNumber(shortage)} note="Necessidade após rateio do armazém" tone={shortage ? "amber" : "slate"} />
         <Card label="Pedidos pendentes" value={formatNumber(pendingOrders.reduce((sum, row) => sum + standardQuantity(row, "pending", productFor(row, "pending", dimensions), dimensions), 0))} note={pendingOrders.length ? String(pendingOrders.length) + " linhas de pedido" : "Importe na guia Importações"} />
-        <Card label="Vínculos de material" value={materialResolution.described ? String(materialResolution.resolved) + "/" + String(materialResolution.described) : "—"} note="Descrições conciliadas pela dimensão" tone={materialResolution.described > materialResolution.resolved ? "amber" : "slate"} />
       </div>
+      <p className={cn("-mt-2 text-xs", materialResolution.described > materialResolution.resolved ? "text-amber-800" : "text-slate-500")}>Conciliação de materiais: {materialResolution.described ? `${materialResolution.resolved}/${materialResolution.described} descrições vinculadas pelas dimensões.` : "aguardando descrições importadas."}</p>
       <div className="grid gap-5 xl:grid-cols-2">{groupedProgress.map((group) => <div className="rounded-2xl border border-slate-200 bg-white p-5" key={group.cycle}><div className="mb-4 flex items-center justify-between"><div><h2 className="font-semibold">Execução por subgrupo — {group.cycle}</h2><p className="mt-1 text-xs text-slate-500">Planejado x aplicado, separado por grupo e subgrupo.</p></div><BarChart3 className="h-5 w-5 text-emerald-700" /></div><div className="space-y-4">{group.rows.length ? group.rows.map((row) => <div key={row.group + "|" + row.subgroup}><div className="mb-1.5 flex items-end justify-between gap-3"><p className="text-sm font-medium">{row.subgroup} <span className="text-xs font-normal text-slate-500">{row.group}</span></p><p className="text-xs font-semibold text-slate-700">{percent(row.applied, row.planned).toFixed(1)}%</p></div><Progress value={percent(row.applied, row.planned)} /><p className="mt-1 text-xs text-slate-500">{formatNumber(row.applied)} aplicado de {formatNumber(row.planned)} planejado</p></div>) : <p className="py-8 text-center text-sm text-slate-500">Sem linhas conciliadas para este ciclo.</p>}</div></div>)}</div>
-      <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4"><h2 className="font-semibold">Macro por cultura</h2><p className="mt-1 text-xs text-slate-500">Área executada registrada no ZPS007, por safra e safrinha.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{macroCrop.map((crop) => <div className="rounded-xl bg-slate-50 p-4" key={crop.code}><p className="text-xs font-semibold text-emerald-700">{crop.cycle}</p><p className="mt-1 font-semibold">{crop.name}</p><p className="mt-3 text-lg font-bold">{formatNumber(crop.applied)}</p><p className="text-xs text-slate-500">área executada registrada</p></div>)}</div></div>
-      {daeByNucleus.length ? <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">DAE por núcleo</h2><p className="mt-1 text-xs text-slate-500">Idade desde a data de plantio registrada no planejamento, por cultura e núcleo.</p></div><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-800">Ciclo: {dashboardSettings.daeCycle}</span></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{daeByNucleus.map(({ nucleus, entries }) => <article className="rounded-xl border border-slate-200 bg-slate-50 p-4" key={nucleus}><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Núcleo</p><h3 className="mt-1 font-semibold">{nucleus}</h3></div><div className="rounded-lg bg-white px-3 py-2 text-right shadow-sm"><p className="text-xl font-bold text-emerald-800">{entries[0]?.days} DAE</p><p className="text-[10px] text-slate-500">mais antigo</p></div></div><div className="mt-4 space-y-3">{entries.slice(0, 4).map((entry) => <div className="border-t border-slate-200 pt-3" key={[entry.culture, entry.cycle, dateKey(entry.plantedAt)].join("|")}><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{entry.culture}</p><p className="text-xs text-slate-500">{entry.cycle} · plantio em {new Intl.DateTimeFormat("pt-BR").format(entry.plantedAt)}</p></div><p className="text-right text-sm font-bold text-slate-800">{entry.days} DAE<br /><span className="text-xs font-normal text-slate-500">{formatNumber(entry.area)} ha · {entry.share.toFixed(1)}%</span></p></div></div>)}{entries.length > 4 ? <p className="text-xs text-slate-500">+ {entries.length - 4} datas de plantio neste núcleo</p> : null}</div></article>)}</div></div> : <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-5 text-sm text-slate-500">A visão DAE será ativada quando o Planejamento contiver a data de plantio reconhecida para o ciclo selecionado.</div>}
+      <section className="border-t border-slate-200 pt-6"><div className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><h2 className="text-lg font-bold tracking-tight">Execução por cultura</h2><p className="mt-1 text-xs text-slate-500">Área registrada no ZPS007, por safra e safrinha.</p></div><p className="text-xs font-semibold text-slate-500">Leitura macro</p></div><div className="grid divide-y divide-slate-200 border-y border-slate-200 sm:grid-cols-2 sm:divide-x sm:divide-y-0 xl:grid-cols-4">{macroCrop.map((crop) => <div className="px-0 py-4 sm:px-4 sm:first:pl-0 xl:first:pl-0" key={crop.code}><p className="text-xs font-semibold text-emerald-800">{crop.cycle}</p><div className="mt-2 flex items-end justify-between gap-3"><p className="font-bold text-slate-800">{crop.name}</p><p className="text-lg font-bold tabular-nums text-emerald-950">{formatNumber(crop.applied)}</p></div><p className="mt-1 text-xs text-slate-500">área executada registrada</p></div>)}</div></section>
+      {daeByNucleus.length ? <div className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">DAE por núcleo</h2><p className="mt-1 text-xs text-slate-500">Idade desde o plantio. A área considera somente Planejamento: Classificação Atividade e Atividade Plantio sem adubo.</p></div><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-800">Ciclo: {dashboardSettings.daeCycle}</span></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{daeByNucleus.map(({ nucleus, entries }) => <article className="rounded-xl border border-slate-200 bg-slate-50 p-4" key={nucleus}><div className="flex items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Núcleo</p><h3 className="mt-1 font-semibold">{nucleus}</h3></div><div className="rounded-lg bg-white px-3 py-2 text-right shadow-sm"><p className="text-xl font-bold text-emerald-800">{entries[0]?.days} DAE</p><p className="text-[10px] text-slate-500">mais antigo</p></div></div><div className="mt-4 space-y-3">{entries.slice(0, 4).map((entry) => <div className="border-t border-slate-200 pt-3" key={[entry.culture, entry.cycle, dateKey(entry.plantedAt)].join("|")}><div className="flex items-start justify-between gap-3"><div><p className="text-sm font-semibold">{entry.culture}</p><p className="text-xs text-slate-500">{entry.cycle} · plantio em {new Intl.DateTimeFormat("pt-BR").format(entry.plantedAt)}</p></div><p className="text-right text-sm font-bold text-slate-800">{entry.days} DAE<br /><span className="text-xs font-normal text-slate-500">{formatNumber(entry.area)} ha · {entry.share.toFixed(1)}%</span></p></div></div>)}{entries.length > 4 ? <p className="text-xs text-slate-500">+ {entries.length - 4} datas de plantio neste núcleo</p> : null}</div></article>)}</div></div> : <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-5 text-sm text-slate-500">A visão DAE será ativada quando o Planejamento contiver a data de plantio reconhecida para o ciclo selecionado.</div>}
       {materialResolution.described > materialResolution.resolved ? <div className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" /><p><strong>Conciliação incompleta:</strong> {materialResolution.described - materialResolution.resolved} descrições não estão nas dimensões. Elas são identificadas, mas nunca viram uma chave pelo código SAP.</p></div> : null}
-    </section> : <Empty title="Comece pela importação" description="Carregue Planejamento, CN52, ZMM_BATCH, MB52 e MB5T. Depois envie Dimensões para conciliar materiais pelo nome." />;
+    </section> : <Empty actionLabel="Abrir central de importações" description="Carregue Planejamento, CN52, ZMM_BATCH, MB52 e MB5T. Depois envie Dimensões para conciliar materiais pelo nome." onAction={() => setActive("Importações")} title="Prepare a base para a conciliação" />;
   } else if (active === "Calendarização") {
     content = <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-end justify-between gap-4"><div><h2 className="font-semibold">Calendarização e provisionamento</h2><p className="mt-1 max-w-2xl text-sm text-slate-500">A janela compara demanda planejada, saldo por núcleo, trânsito e apoio do armazém para o mesmo material.</p></div><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={!plans.length} onClick={() => setShowProvision(true)} type="button"><CalendarDays className="h-4 w-4" />Rodar provisionamento</button></div><div className="mt-6 grid gap-3 sm:grid-cols-3"><Card label="Data de avaliação" value={new Intl.DateTimeFormat("pt-BR").format(new Date(evaluationDate + "T00:00:00"))} note="Valor inicial editável" /><Card label="Horizonte padrão" value={premises.horizon} note="dias definidos nas premissas" /><Card label="Materiais com falta" value={consolidatedSupply.failures.length} note="após rateio do armazém" tone="amber" /></div></section>;
   } else if (active === "Acompanhamento") {
@@ -1523,7 +2430,7 @@ export default function Home() {
       <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
         <table className="w-full min-w-[1300px] text-left text-sm">
           <thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
-            <tr>{["", "Princípio ativo", "Ciclo / cultura", "Núcleo", "Material padrão", "Material em estoque", "Qtd. planejada", "Saldo convertido", "Trânsito", "Aplicado", "A entregar", "V. solicitado"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr>
+            <tr>{["", "Princípio ativo", "Ciclo / cultura", "Núcleo", "Material padrão", "Material em estoque", "Qtd. planejada", "Estoque", "Trânsito", "Aplicado", "A entregar", "V. solicitado"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {monitoringGroups.map((group) => <Fragment key={group.active}>
@@ -1588,9 +2495,8 @@ export default function Home() {
         subgroupFilter={subgroupFilter}
         subgroups={filters.subgroups}
       />
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <div className="grid gap-3 md:grid-cols-3">
         <Card label="% do planejamento executado" value={percentageText(performanceSummary.applied, performanceSummary.planned)} note={formatNumber(performanceSummary.applied) + " executado de " + formatNumber(performanceSummary.planned) + " planejado"} tone="emerald" />
-        <Card label="Volumes" value={formatNumber(performanceSummary.planned) + " / " + formatNumber(performanceSummary.applied)} note="planejado / executado" />
         <Card label="Dose utilizada" value={formatDose(performanceSummary.appliedDose)} note={performanceSummary.plannedDose === null ? "Área ainda não conciliada" : "Planejado: " + formatDose(performanceSummary.plannedDose)} tone="emerald" />
         <Card label="Impacto da mudança de dose" value={signedNumber(performanceSummary.impact)} note={performanceSummary.impact > 0 ? "volume adicional na área executada" : performanceSummary.impact < 0 ? "volume abaixo do planejado" : "sem variação nas áreas conciliadas"} tone={performanceSummary.impact > 0 ? "amber" : "slate"} />
       </div>
@@ -1620,19 +2526,23 @@ export default function Home() {
       <p className="rounded-xl bg-slate-50 px-4 py-3 text-xs text-slate-600">Impacto de volume = volume executado − (dose planejada × área executada). Quando não houver correspondência de área, a dose fica indisponível em vez de assumir zero.</p>
     </section> : <Empty title="Sem dados de execução" description="Importe Planejamento, CN52 e ZPS007 para calcular volumes, área e dose." />;
   } else if (active === "Importações") {
+    if (importing) {
+      content = <ContentLoading detail={importProgress || "Preparando a importação em segundo plano."} />;
+    } else {
     content = <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-      <div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Central de importações</h2><p className="mt-1 text-xs text-slate-500">As fontes são lidas e guardadas neste navegador para permanecerem disponíveis nas próximas aberturas.</p></div>
+      <div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Central de importações</h2><p className="mt-1 text-xs text-slate-500">As fontes são conciliadas e salvas na base central vinculada à sua conta. Este navegador mantém somente as preferências locais; os dados operacionais vêm da base central.</p></div>
       <div className="p-6">
         <div className={cn("rounded-2xl border p-5", dataFreshness.tone === "emerald" ? "border-emerald-200 bg-emerald-50/60" : dataFreshness.tone === "amber" ? "border-amber-200 bg-amber-50/60" : dataFreshness.tone === "rose" ? "border-rose-200 bg-rose-50/60" : "border-slate-200 bg-slate-50")}>
-          <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">Atualização dos dados</p><p className="mt-1 text-2xl font-bold">{oldestSource ? `Este visual está ${elapsedLabel(oldestSource[1].fileModifiedAt, clock)} sem atualização.` : "Aguardando a primeira importação."}</p><p className="mt-1 text-xs text-slate-600">Considera o arquivo operacional mais antigo: {oldestSource ? `${oldestSource[0] === "dimensoes" ? "Dimensões" : sourceConfig.find((source) => source.key === oldestSource[0])?.title} — ${formatDateTime(oldestSource[1].fileModifiedAt)}` : "importe as fontes para iniciar a avaliação"}.</p></div><span className={cn("rounded-full px-3 py-1 text-xs font-bold", dataFreshness.tone === "emerald" ? "bg-emerald-700 text-white" : dataFreshness.tone === "amber" ? "bg-amber-500 text-amber-950" : dataFreshness.tone === "rose" ? "bg-rose-700 text-white" : "bg-slate-200 text-slate-700")}>{dataFreshness.label}</span></div>
+          <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold">Atualização dos dados</p><p className="mt-1 text-2xl font-bold">{oldestSource ? `Este visual está ${elapsedLabel(oldestSource[1].fileModifiedAt, clock)} sem atualização.` : "Aguardando a primeira fonte operacional."}</p><p className="mt-1 text-xs text-slate-600">Considera o arquivo operacional mais antigo: {oldestSource ? `${sourceConfig.find((source) => source.key === oldestSource[0])?.title} — ${formatDateTime(oldestSource[1].fileModifiedAt)}` : "importe as fontes operacionais para iniciar a avaliação"}. Planejamento e dimensões não entram no critério de atraso.</p></div><span className={cn("rounded-full px-3 py-1 text-xs font-bold", dataFreshness.tone === "emerald" ? "bg-emerald-700 text-white" : dataFreshness.tone === "amber" ? "bg-amber-500 text-amber-950" : dataFreshness.tone === "rose" ? "bg-rose-700 text-white" : "bg-slate-200 text-slate-700")}>{dataFreshness.label}</span></div>
           <p className="mt-3 text-xs text-slate-600">Até 12 horas: OK · de 12 horas a 2 dias: Em atenção · acima de 2 dias: Necessita atualizar.</p>
         </div>
       </div>
-      <div className="grid gap-3 px-6 pb-6 md:grid-cols-2">{sourceConfig.map((source) => <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-200 p-4 hover:border-emerald-300" key={source.key}><input accept=".xlsx,.xls" className="sr-only" onChange={(event) => setUploads((current) => ({ ...current, [source.key]: event.target.files?.[0] }))} type="file" /><div className="flex items-center gap-3"><FileUp className="h-5 w-5 text-emerald-700" /><div><p className="text-sm font-semibold">{source.title}</p><p className="text-xs text-slate-500">{imports[source.key]?.fileName || uploads[source.key]?.name || source.hint}</p>{imports[source.key] ? <p className="mt-1 text-[11px] text-slate-500">Modificado: {formatDateTime(imports[source.key]?.fileModifiedAt)}</p> : null}</div></div><span className="text-xs font-semibold text-emerald-700">{imports[source.key] ? "Importado" : uploads[source.key] ? "Selecionado" : "Selecionar"}</span></label>)}<DimensionUpload count={Object.keys(bundle.materials).length} label={imports.dimensoes?.fileName || "Dimensões.xlsx (opcional)"} onLoaded={(loaded, summary) => { setBundle(loaded); setImports((current) => ({ ...current, dimensoes: summary })); setMessage("Dimensões aplicadas e salvas neste navegador."); }} /></div>
-      <div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-slate-600">{persistenceError || message || (storageReady ? "Cada fonte importada alimenta os visuais e permanece salva neste navegador." : "Recuperando dados salvos neste navegador...")}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={importing} onClick={importFiles} type="button"><Upload className="mr-2 inline h-4 w-4" />{importing ? "Importando..." : "Validar e importar"}</button></div>
+        <div className="grid gap-3 px-6 pb-6 md:grid-cols-2">{sourceConfig.map((source) => <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-200 p-4 hover:border-emerald-300" key={source.key}><input accept=".xlsx,.xls" className="sr-only" onChange={(event) => setUploads((current) => ({ ...current, [source.key]: event.target.files?.[0] }))} type="file" /><div className="flex items-center gap-3"><FileUp className="h-5 w-5 text-emerald-700" /><div><p className="text-sm font-semibold">{source.title}</p><p className="text-xs text-slate-500">{imports[source.key]?.fileName || uploads[source.key]?.name || source.hint}</p>{imports[source.key] ? <p className="mt-1 text-[11px] text-slate-500">Modificado: {formatDateTime(imports[source.key]?.fileModifiedAt)}</p> : null}</div></div><span className="text-xs font-semibold text-emerald-700">{imports[source.key] ? "Importado" : uploads[source.key] ? "Selecionado" : "Selecionar"}</span></label>)}<DimensionUpload count={Object.keys(bundle.materials).length} label={imports.dimensoes?.fileName || "Dimensões.xlsx (opcional)"} onLoaded={(loaded, summary) => { setBundle(loaded); setImports((current) => ({ ...current, dimensoes: summary })); setMessage("Dimensões aplicadas e salvas na base central."); }} /></div>
+      <div className="flex flex-col gap-3 border-t border-slate-100 bg-slate-50 px-6 py-4 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs text-slate-600">{persistenceError || message || (storageReady ? "Cada fonte importada alimenta os visuais e fica salva na base central." : "Recuperando dados salvos na base central...")}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-60" disabled={importing} onClick={importFiles} type="button"><Upload className="mr-2 inline h-4 w-4" />{importing ? "Importando..." : "Validar e importar"}</button></div>
       {Object.keys(imports).length ? <div className="border-t border-slate-100 p-6"><Table headers={["Fonte", "Arquivo", "Modificado em", "Importado em", "Linhas", "Abas"]} rows={[...sourceConfig.map((source) => [source.title, imports[source.key]?.fileName || "—", formatDateTime(imports[source.key]?.fileModifiedAt), formatDateTime(imports[source.key]?.importedAt), String(imports[source.key]?.rows ?? "—"), imports[source.key]?.sheets.join(", ") || "—"]), ["Dimensões / Princípio ativo", imports.dimensoes?.fileName || "—", formatDateTime(imports.dimensoes?.fileModifiedAt), formatDateTime(imports.dimensoes?.importedAt), String(imports.dimensoes?.rows ?? "—"), imports.dimensoes?.sheets.join(", ") || "—"]]} /></div> : null}
-      <div className="border-t border-slate-100 p-6"><div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">Relatório de conciliação</h3><p className="mt-1 text-xs text-slate-500">Mostra materiais, descrições e núcleos que não puderam ser conciliados, com a provável ação necessária.</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700 disabled:opacity-50" disabled={!reconciliationIssues.length} onClick={exportReconciliationReport} type="button"><Download className="h-4 w-4" />Exportar relatório</button></div><Table empty="Nenhuma pendência de conciliação encontrada nas fontes importadas." headers={["Fonte", "Material", "Código SAP", "Ocorrências", "Diagnóstico", "Ação sugerida"]} rows={reconciliationIssues.map((issue) => [issue.source, issue.material, issue.code, String(issue.count), issue.detail, issue.action])} /></div>
+      {Object.keys(imports).length ? <div className="border-t border-slate-100 p-6"><div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-sm font-semibold">Relatório de conciliação</h3><p className="mt-1 text-xs text-slate-500">Materiais, descrições e núcleos que precisam de ajuste nas dimensões.</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700 disabled:opacity-50" disabled={!reconciliationIssues.length} onClick={exportReconciliationReport} type="button"><Download className="h-4 w-4" />Exportar relatório</button></div><Table empty="Nenhuma pendência de conciliação nas fontes importadas." headers={["Fonte", "Material", "Código SAP", "Ocorrências", "Diagnóstico", "Ação sugerida"]} rows={reconciliationIssues.map((issue) => [issue.source, issue.material, issue.code, String(issue.count), issue.detail, issue.action])} /></div> : null}
     </section>;
+    }
   } else if (active === "Alertas") {
     const alertStyle = {
       attention: "border-amber-200 bg-amber-50 text-amber-950",
@@ -1643,12 +2553,18 @@ export default function Home() {
     content = <section className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Alertas operacionais</h2><p className="mt-1 text-sm text-slate-500">Prioridades calculadas a partir do planejamento, saldo por localização, execução e validade dos lotes.</p></div><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={exportAlerts} type="button"><Download className="h-4 w-4" />Exportar Excel</button></div>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <Card label="Repasse em até 30 dias" value={supplyAlerts.length} note="sem saldo na fazenda" tone={supplyAlerts.length ? "amber" : "slate"} />
-        <Card label="Aumento de dose > 5%" value={doseIncreaseAlerts.length} note="comparado ao planejado" tone={doseIncreaseAlerts.length ? "amber" : "slate"} />
-        <Card label="Estoque vencido" value={expiredStockAlerts.length} note="fazenda e armazém" tone={expiredStockAlerts.length ? "rose" : "slate"} />
+        <Card label="Repasse em até 30 dias" value={scopedAlertCounts.supply} note="sem saldo na fazenda" tone={scopedAlertCounts.supply ? "amber" : "slate"} />
+        <Card label="Aumento de dose > 5%" value={scopedAlertCounts.dose} note="comparado ao planejado" tone={scopedAlertCounts.dose ? "amber" : "slate"} />
+        <Card label="Estoque vencido" value={scopedAlertCounts.expired} note="fazenda e armazém" tone={scopedAlertCounts.expired ? "rose" : "slate"} />
         <Card label="Farol crítico" value={farol.alert} note="pedidos pendentes há mais de 5 dias" tone={farol.alert ? "rose" : "slate"} />
       </div>
-      {operationalAlerts.length ? <div className="grid gap-3">{operationalAlerts.map((alert) => <article className={cn("rounded-2xl border p-4", alertStyle[alert.severity])} key={alert.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide opacity-70">{alert.category}</p><h3 className="mt-1 font-semibold">{alert.title}</h3><p className="mt-2 max-w-4xl text-sm leading-relaxed">{alert.detail}</p></div><span className="rounded-full bg-white/80 px-3 py-1 text-xs font-bold">{alertLabel[alert.severity]} · {alert.metric}</span></div></article>)}</div> : <Empty title="Nenhum alerta operacional no momento" description="Com as fontes atualizadas, novos riscos de saldo, dose e validade aparecerão aqui automaticamente." />}
+      <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-4">
+        <label className="grid gap-1 text-xs font-semibold text-slate-600">Núcleo<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setAlertNucleusFilter(event.target.value)} value={alertNucleusFilter}>{alertNuclei.map((item) => <option key={item}>{item}</option>)}</select></label>
+        <label className="grid gap-1 text-xs font-semibold text-slate-600">Material<input className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setAlertMaterialFilter(event.target.value)} placeholder="Digite para filtrar" value={alertMaterialFilter} /></label>
+        <label className="grid gap-1 text-xs font-semibold text-slate-600">Grupo<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setAlertGroupFilter(event.target.value)} value={alertGroupFilter}>{alertGroups.map((item) => <option key={item}>{item}</option>)}</select></label>
+        <label className="grid gap-1 text-xs font-semibold text-slate-600">Subgrupo<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setAlertSubgroupFilter(event.target.value)} value={alertSubgroupFilter}>{alertSubgroups.map((item) => <option key={item}>{item}</option>)}</select></label>
+      </div>
+      {filteredOperationalAlerts.length ? <div className="grid gap-3">{filteredOperationalAlerts.map((alert) => <article className={cn("rounded-2xl border p-4", alertStyle[alert.severity])} key={alert.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide opacity-70">{alert.category}</p><h3 className="mt-1 font-semibold">{alert.title}</h3><p className="mt-2 max-w-4xl text-sm leading-relaxed">{alert.detail}</p>{alert.warehouseBalances?.length ? <div className="mt-4 max-w-4xl border-t border-current/15 pt-3"><p className="text-xs font-bold uppercase tracking-wide opacity-75">Saldo armazém</p><div className="mt-2 grid gap-1 text-sm font-semibold sm:grid-cols-2">{alert.warehouseBalances.map((location) => <p key={`${alert.id}|${location.location}`}>{location.location} <span className="tabular-nums">— {formatNumber(location.amount)}</span></p>)}</div></div> : null}</div><span className="rounded-full bg-white/80 px-3 py-1 text-xs font-bold">{alertLabel[alert.severity]} · {alert.metric}</span></div></article>)}</div> : <Empty title="Nenhum alerta atende aos filtros" description="Ajuste núcleo, material, grupo ou subgrupo para consultar outro recorte." />}
       <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600"><p className="font-semibold text-slate-800">Sinalização na plataforma</p><p className="mt-1">Os riscos acima ficam destacados neste painel e no menu lateral. Para notificar pedidos por núcleo, use a ação de e-mail na guia Tarefas.</p></div>
     </section>;
   } else if (active === "Tarefas") {
@@ -1659,16 +2575,105 @@ export default function Home() {
       <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Farol de pedidos pendentes</h2><p className="mt-1 text-sm text-slate-500">A data DtRemPed indica a previsão de utilização na fazenda e orienta a prioridade da equipe responsável.</p></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={exportTasks} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-3 py-2 text-sm font-semibold text-white" onClick={openNotification} type="button"><Bell className="h-4 w-4" />Notificar por e-mail</button></div></div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Card label="Demanda em até 3 dias" value={farol.demand} note="sinalização antecipada" tone={farol.demand ? "emerald" : "slate"} /><Card label="Possível atraso" value={farol.delay} note="vence hoje ou amanhã" tone={farol.delay ? "amber" : "slate"} /><Card label="Ponto de atenção" value={farol.attention} note="1 a 3 dias em atraso" tone={farol.attention ? "amber" : "slate"} /><Card label="Alerta" value={farol.alert} note="mais de 5 dias em atraso" tone={farol.alert ? "rose" : "slate"} /></div>
       <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-2 xl:grid-cols-4"><label className="grid gap-1 text-xs font-semibold text-slate-600">Farol<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskSignalFilter(event.target.value)} value={taskSignalFilter}>{["Todos", "Demanda próxima", "Possível atraso", "Ponto de atenção", "Alerta", "Programado", "Sem data"].map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskOrderFilter(event.target.value)} value={taskOrderFilter}>{taskOrders.map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Núcleo<select className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskNucleusFilter(event.target.value)} value={taskNucleusFilter}>{taskNuclei.map((item) => <option key={item}>{item}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Material<input className="rounded-lg border border-slate-200 px-2 py-2 text-sm font-normal" onChange={(event) => setTaskMaterialFilter(event.target.value)} placeholder="Digite para filtrar" value={taskMaterialFilter} /></label></div>
+      <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação a um pedido específico ou agrupe o acompanhamento por qualquer material conciliado.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-xs font-semibold text-slate-600">Vincular por<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskLinkMode(event.target.value as "pedido" | "material")} value={taskLinkMode}><option value="pedido">Pedido pendente</option><option value="material">Material</option></select></label>{taskLinkMode === "pedido" ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select></label> : <label className="grid gap-1 text-xs font-semibold text-slate-600">Material<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskMaterialLink(event.target.value)} value={taskMaterialLink}><option value="">Selecione o material</option>{taskMaterialOptions.map((material) => <option key={material}>{material}</option>)}</select></label>}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></div>
       <Table empty="Nenhum pedido atende aos filtros selecionados." headers={["Farol", "Previsão", "Pedido", "Material", "Núcleo", "Volume solicitado"]} rows={filteredPendingSignals.map((signal) => [<span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-bold", signalStyle[signal.tone])} key={signal.id}>{signal.status}</span>, signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", signal.reference, signal.material, signal.nucleus, formatNumber(signal.quantity)])} />
-      <div className="grid gap-5 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-        <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação a um pedido específico ou agrupe o acompanhamento por material.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-xs font-semibold text-slate-600">Vincular por<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskLinkMode(event.target.value as "pedido" | "material")} value={taskLinkMode}><option value="pedido">Pedido pendente</option><option value="material">Material</option></select></label>{taskLinkMode === "pedido" ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select></label> : <label className="grid gap-1 text-xs font-semibold text-slate-600">Material<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskMaterialLink(event.target.value)} value={taskMaterialLink}><option value="">Selecione o material</option>{[...new Set(pendingSignals.map((signal) => signal.material))].sort().map((material) => <option key={material}>{material}</option>)}</select></label>}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></div>
+      <div>
         <div className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Histórico de ações</h3><div className="mt-4 space-y-3">{tasks.length ? tasks.slice().reverse().map((item) => { const linked = pendingSignals.find((signal) => signal.id === item.pendingId); const reference = linked ? `${linked.reference} · ${linked.material} · ${linked.nucleus}` : item.material ? `${item.material}${item.nucleus ? ` · ${item.nucleus}` : ""}` : "Ação geral"; return <article className="rounded-xl bg-slate-50 p-4" key={item.id}><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-800">{item.title}</p><p className="mt-1 text-xs text-slate-500">{reference} · criado em {formatDateTime(item.createdAt)}</p></div><CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-700" /></div><div className="mt-3 space-y-2 border-l-2 border-emerald-200 pl-3">{item.actions.map((action) => <div key={action.id}><p className="text-sm text-slate-700">{action.note}</p><p className="mt-1 text-[11px] text-slate-500">{formatDateTime(action.createdAt)}</p></div>)}</div><div className="mt-3 flex gap-2"><input className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm" onChange={(event) => setTaskActionDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder="Adicionar atualização" value={taskActionDrafts[item.id] || ""} /><button className="rounded-lg border border-emerald-700 px-3 text-sm font-semibold text-emerald-700" onClick={() => appendTaskAction(item.id)} type="button">Salvar</button></div></article>; }) : <p className="py-10 text-center text-sm text-slate-500">Nenhuma ação registrada ainda.</p>}</div></div>
       </div>
     </section>;
+  } else if (active === "Fechamentos") {
+    const filteredOrderKeys = new Set(filteredCommercialClosings.map((closing) => closing.orderKey).filter(Boolean));
+    const suppliedByLinkedOrders = commercialOrders.filter((order) => filteredOrderKeys.has(order.key)).reduce((sum, order) => sum + order.supplied, 0);
+    const closedVolume = filteredCommercialClosings.reduce((sum, closing) => sum + closing.totalVolume, 0);
+    const commercialFinancial = (currency: CommercialClosing["currency"]) => filteredCommercialClosings.filter((closing) => closing.currency === currency).reduce((sum, closing) => sum + closing.totalVolume * closing.unitPrice, 0);
+    const filteredGaps = [...commercialGapByProduct.values()].filter((row) => closingCycleFilter === "Todos" || row.cycle === closingCycleFilter).sort((left, right) => right.remaining - left.remaining || left.product.localeCompare(right.product));
+    const selectedOrderForDraft = commercialOrders.find((order) => order.key === closingDraft.orderKey);
+    const draftDistributed = Object.values(closingDistributionDraft).reduce((sum, amount) => sum + numberFrom(amount), 0);
+    content = currentUser?.role === "admin" ? <section className="space-y-6">
+      <section className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5"><p className="text-xs font-bold uppercase tracking-[.12em] text-emerald-700">Comercial</p><div className="mt-2 flex flex-wrap items-end justify-between gap-3"><div><h2 className="text-xl font-bold text-emerald-950">Fechamentos comerciais</h2><p className="mt-1 max-w-3xl text-sm leading-relaxed text-emerald-900">Registre negociações, distribua o volume pelos meses da safra e acompanhe o fornecimento pelo pedido de compra vinculado.</p></div><span className="rounded-xl bg-white px-3 py-2 text-xs font-bold text-emerald-800">Acesso administrativo</span></div></section>
+      {!datasets.pedidosCompra.length ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><strong>Pedido de compra pendente.</strong> Importe <em>PEDIDOS COMPRA.xlsx</em> na Central de importações para vincular as distribuições e conciliar a quantidade fornecida.</div> : null}
+      {closingMessage ? <p className={cn("rounded-xl px-4 py-3 text-sm", /salvo|atualizado|sugerida|vinculada/i.test(closingMessage) ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-900")}>{closingMessage}</p> : null}
+      <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3"><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", closingTab === "painel" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setClosingTab("painel")} type="button">Visão comercial</button><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", closingTab === "distribuicoes" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setClosingTab("distribuicoes")} type="button">Distribuições</button><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", closingTab === "anotacoes" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setClosingTab("anotacoes")} type="button">Anotações</button></div>
+      <div className="grid gap-3 rounded-2xl border border-slate-200 bg-white p-4 md:grid-cols-[minmax(160px,.5fr)_minmax(260px,1fr)]"><label className="grid gap-1 text-xs font-semibold text-slate-600">Ciclo<select className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" onChange={(event) => setClosingCycleFilter(event.target.value)} value={closingCycleFilter}><option>Todos</option><option>Safra</option><option>Safrinha</option></select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Buscar produto, princípio ativo, fornecedor ou pedido<input className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" onChange={(event) => setClosingQuery(event.target.value)} placeholder="Digite para filtrar" value={closingQuery} /></label></div>
+      {closingTab === "painel" ? <section className="space-y-5"><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Card label="Volume fechado" value={formatNumber(closedVolume)} note={`${filteredCommercialClosings.length} distribuição(ões)`} tone="emerald" /><Card label="Quantidade fornecida" value={formatNumber(suppliedByLinkedOrders)} note="pedidos vinculados" tone={suppliedByLinkedOrders ? "sky" : "slate"} /><Card label="Fechado em BRL" value={formatCurrency(commercialFinancial("BRL"), "BRL")} note="volume × valor unitário" tone="slate" /><Card label="Fechado em USD" value={formatCurrency(commercialFinancial("USD"), "USD")} note="volume × valor unitário" tone="slate" /></div><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Quanto falta fechar</h3><p className="mt-1 text-xs text-slate-500">Planejamento menos as distribuições comerciais registradas, por material padrão e ciclo.</p></div><span className="text-xs font-semibold text-slate-500">Base: Planejamento conciliado</span></div><div className="mt-4 overflow-x-auto"><table className="w-full min-w-[760px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Ciclo", "Princípio ativo", "Produto", "Planejado", "Fechado", "Falta fechar"].map((head) => <th className="px-3 py-2.5 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{filteredGaps.map((row) => <tr key={`${row.cycle}|${row.product}`}><td className="px-3 py-3">{row.cycle}</td><td className="px-3 py-3">{row.active}</td><td className="px-3 py-3 font-semibold">{row.product}</td><td className="px-3 py-3">{formatNumber(row.planned)}</td><td className="px-3 py-3 text-emerald-700">{formatNumber(row.closed)}</td><td className={cn("px-3 py-3 font-bold", row.remaining > 0 ? "text-rose-700" : "text-emerald-700")}>{formatNumber(row.remaining)}</td></tr>)}{!filteredGaps.length ? <tr><td className="px-3 py-10 text-center text-slate-500" colSpan={6}>Importe o Planejamento para calcular o volume restante do ciclo.</td></tr> : null}</tbody></table></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><div><h3 className="font-semibold">Calendário de entrega</h3><p className="mt-1 text-xs text-slate-500">Volumes programados por mês nas distribuições filtradas.</p></div><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">{commercialCalendar.map((item) => <div className="rounded-xl border border-slate-200 bg-slate-50 p-3" key={item.month}><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">{formatMonth(item.month)}</p><p className="mt-2 text-lg font-bold text-slate-900">{formatNumber(item.amount)}</p><p className="text-xs text-slate-500">{item.count} distribuição(ões)</p></div>)}{!commercialCalendar.length ? <p className="text-sm text-slate-500">Nenhum mês de entrega programado para os filtros atuais.</p> : null}</div></section></section> : null}
+      {closingTab === "distribuicoes" ? <section className="space-y-5"><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="font-semibold">{editingClosingId ? "Editar distribuição" : "Nova distribuição comercial"}</h3><p className="mt-1 text-xs leading-relaxed text-slate-500">O calendário pode ser sugerido pelo planejamento, usando as datas previstas de aplicação derivadas do DAE.</p></div>{editingClosingId ? <button className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold text-slate-600" onClick={resetClosingDraft} type="button">Cancelar edição</button> : null}</div><div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4"><label className="grid gap-1 text-xs font-semibold text-slate-600">Fornecedor<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, supplier: event.target.value }))} value={closingDraft.supplier} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Vencimento para pagamento<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, paymentDue: event.target.value }))} type="date" value={closingDraft.paymentDue} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Destino<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, destination: event.target.value }))} placeholder="Ex.: 0714 ou núcleo" value={closingDraft.destination} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Local de entrega<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, deliveryLocation: event.target.value }))} placeholder="Fazenda ou armazém" value={closingDraft.deliveryLocation} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Ciclo<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, cycle: event.target.value as CommercialClosing["cycle"] }))} value={closingDraft.cycle}><option>Safra</option><option>Safrinha</option></select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Cultura<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, culture: event.target.value }))} placeholder="Ex.: Soja" value={closingDraft.culture} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Princípio ativo<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, active: event.target.value }))} value={closingDraft.active} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Produto<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" list="commercial-materials" onChange={(event) => { const product = event.target.value; const option = commercialMaterialOptions.find((item) => normalizeMaterial(item.product) === normalizeMaterial(product)); setClosingDraft((current) => ({ ...current, product, active: option?.active || current.active })); }} value={closingDraft.product} /><datalist id="commercial-materials">{commercialMaterialOptions.map((item) => <option key={item.product} value={item.product}>{item.active}</option>)}</datalist></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Moeda<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, currency: event.target.value as CommercialClosing["currency"] }))} value={closingDraft.currency}><option value="BRL">BRL</option><option value="USD">USD</option></select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Valor unitário<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDraft((current) => ({ ...current, unitPrice: event.target.value }))} value={closingDraft.unitPrice} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Embalagem<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, packaging: event.target.value }))} placeholder="Ex.: galão 20 L" value={closingDraft.packaging} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Volume total<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDraft((current) => ({ ...current, totalVolume: event.target.value }))} value={closingDraft.totalVolume} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Unidade<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingDraft((current) => ({ ...current, unit: event.target.value }))} placeholder="L, KG, UN" value={closingDraft.unit} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600 xl:col-span-2">Pedido de compra vinculado<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!commercialOrders.length} onChange={(event) => applyClosingOrder(event.target.value)} value={closingDraft.orderKey}><option value="">Vincular depois</option>{commercialOrders.map((order) => <option key={order.key} value={order.key}>{order.orderNumber} · item {order.item} · {order.product} · fornecido {formatNumber(order.supplied)} {order.unit}</option>)}</select></label></div>{selectedOrderForDraft ? <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-900">Pedido {selectedOrderForDraft.orderNumber}: {formatNumber(selectedOrderForDraft.ordered)} pedido, {formatNumber(selectedOrderForDraft.supplied)} fornecido e {formatNumber(selectedOrderForDraft.balance)} a fornecer.</p> : null}<div className="mt-5 border-t border-slate-100 pt-5"><div className="flex flex-wrap items-end justify-between gap-3"><div><h4 className="font-semibold">Distribuição mensal</h4><p className="mt-1 text-xs text-slate-500">Preencha os volumes por mês. Total distribuído: <strong>{formatNumber(draftDistributed)}</strong> de {formatNumber(numberFrom(closingDraft.totalVolume))}.</p></div><button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700" onClick={applyPlanningDistribution} type="button">Sugerir pelo planejamento</button></div><div className="mt-4 grid gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">{closingMonths.map((month) => <label className="grid gap-1 text-xs font-semibold text-slate-600" key={month}>{formatMonth(month)}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingDistributionDraft((current) => ({ ...current, [month]: numberFrom(event.target.value) }))} value={closingDistributionDraft[month] || ""} /></label>)}{!closingMonths.length ? <p className="text-sm text-amber-800">Ainda não há meses previstos no Planejamento para criar a distribuição.</p> : null}</div></div><div className="mt-5 flex justify-end"><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={saveCommercialClosing} type="button">{editingClosingId ? "Salvar alterações" : "Salvar fechamento"}</button></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Distribuições registradas</h3><div className="mt-4 overflow-x-auto"><table className="w-full min-w-[1200px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Fornecedor", "Ativo / produto", "Ciclo", "Preço", "Pagamento", "Entrega", "Programado", "Pedido", "Fornecido", "Ações"].map((head) => <th className="px-3 py-2.5 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{filteredCommercialClosings.map((closing) => { const order = commercialOrders.find((item) => item.key === closing.orderKey); return <tr key={closing.id}><td className="px-3 py-3">{closing.supplier}</td><td className="px-3 py-3"><strong>{closing.active}</strong><br /><span className="text-xs text-slate-500">{closing.product}</span></td><td className="px-3 py-3">{closing.cycle}<br /><span className="text-xs text-slate-500">{closing.culture || "—"}</span></td><td className="px-3 py-3">{formatCurrency(closing.unitPrice, closing.currency)}<br /><span className="text-xs text-slate-500">{closing.packaging || closing.unit}</span></td><td className="px-3 py-3">{closing.paymentDue ? new Intl.DateTimeFormat("pt-BR").format(new Date(closing.paymentDue + "T00:00:00")) : "—"}</td><td className="px-3 py-3">{closing.destination || "—"}<br /><span className="text-xs text-slate-500">{closing.deliveryLocation || "—"}</span></td><td className="px-3 py-3 font-semibold text-emerald-700">{formatNumber(closing.totalVolume)} {closing.unit}<br /><span className="text-xs font-normal text-slate-500">{Object.keys(closing.distribution).length} mês(es)</span></td><td className="px-3 py-3">{closing.orderNumber || "Não vinculado"}</td><td className="px-3 py-3">{order ? `${formatNumber(order.supplied)} ${order.unit}` : "—"}</td><td className="px-3 py-3"><div className="flex gap-2"><button className="text-xs font-bold text-emerald-700" onClick={() => editCommercialClosing(closing)} type="button">Editar</button><button className="text-xs font-bold text-rose-700" onClick={() => removeCommercialClosing(closing)} type="button">Excluir</button></div></td></tr>; })}{!filteredCommercialClosings.length ? <tr><td className="px-3 py-10 text-center text-slate-500" colSpan={10}>Nenhuma distribuição comercial registrada.</td></tr> : null}</tbody></table></div></section></section> : null}
+      {closingTab === "anotacoes" ? <section className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)]"><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Nova anotação</h3><p className="mt-1 text-xs text-slate-500">Registre condição de faturamento, volume enviado e observações do fornecedor.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-xs font-semibold text-slate-600">Fechamento<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, closingId: event.target.value }))} value={closingAnnotationDraft.closingId}><option value="">Selecione a distribuição</option>{commercialClosings.closings.map((closing) => <option key={closing.id} value={closing.id}>{closing.supplier} · {closing.product} · {formatNumber(closing.totalVolume)} {closing.unit}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Material enviado<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, materialSent: event.target.value }))} value={closingAnnotationDraft.materialSent} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-xs font-semibold text-slate-600">Compra<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, purchaseVolume: event.target.value }))} value={closingAnnotationDraft.purchaseVolume} /></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Faturamento<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, invoicedVolume: event.target.value }))} value={closingAnnotationDraft.invoicedVolume} /></label></div><label className="grid gap-1 text-xs font-semibold text-slate-600">Observação<textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, note: event.target.value }))} value={closingAnnotationDraft.note} /></label><label className="flex items-center gap-2 text-sm font-medium text-slate-700"><input checked={closingAnnotationDraft.resolved} onChange={(event) => setClosingAnnotationDraft((current) => ({ ...current, resolved: event.target.checked }))} type="checkbox" />Resolvida</label><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={saveClosingAnnotation} type="button">Salvar anotação</button></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><div><h3 className="font-semibold">Anotações de faturamento</h3><p className="mt-1 text-xs text-slate-500">Histórico vinculado ao fechamento para concentrar tratativas comerciais.</p></div><div className="mt-4 space-y-3">{commercialClosings.annotations.map((annotation) => { const closing = commercialClosings.closings.find((item) => item.id === annotation.closingId); return <article className="rounded-xl border border-slate-200 bg-slate-50 p-4" key={annotation.id}><div className="flex items-start justify-between gap-3"><div><p className="font-semibold text-slate-800">{closing ? `${closing.supplier} · ${closing.product}` : "Fechamento removido"}</p><p className="mt-1 text-xs text-slate-500">{annotation.materialSent || "Material não informado"} · criado em {formatDateTime(annotation.createdAt)}</p></div><div className="flex items-center gap-3"><span className={cn("rounded-full px-2.5 py-1 text-[11px] font-bold", annotation.resolved ? "bg-emerald-100 text-emerald-800" : "bg-amber-100 text-amber-900")}>{annotation.resolved ? "Resolvida" : "Em aberto"}</span><button className="text-xs font-bold text-rose-700" onClick={() => removeClosingAnnotation(annotation)} type="button">Excluir</button></div></div><p className="mt-3 text-sm text-slate-700">{annotation.note}</p><p className="mt-3 text-xs font-semibold text-slate-600">Compra: {annotation.purchaseVolume === null ? "—" : formatNumber(annotation.purchaseVolume)} · Faturamento: {annotation.invoicedVolume === null ? "—" : formatNumber(annotation.invoicedVolume)}</p></article>; })}{!commercialClosings.annotations.length ? <p className="py-10 text-center text-sm text-slate-500">Nenhuma anotação cadastrada.</p> : null}</div></section></section> : null}
+    </section> : <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><h2 className="font-semibold text-amber-950">Acesso restrito</h2><p className="mt-2 text-sm text-amber-900">Fechamentos comerciais, distribuições e anotações são funções exclusivas de administradores.</p></section>;
+  } else if (active === "Logística") {
+    const recipeTrip = logistics.trips.find((trip) => trip.id === recipeTripId) || null;
+    const selectedDriver = logistics.drivers.find((driver) => driver.id === tripDriverId);
+    const selectedVehicle = logistics.vehicles.find((vehicle) => vehicle.id === tripVehicleId);
+    content = currentUser?.role === "admin" ? <section className="space-y-6">
+      <section className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
+        <p className="text-xs font-bold uppercase tracking-[.12em] text-emerald-700">Logística de carregamento</p>
+        <div className="mt-2 flex flex-wrap items-end justify-between gap-3"><div><h2 className="text-xl font-bold text-emerald-950">Emissão e organização de viagens</h2><p className="mt-1 max-w-3xl text-sm leading-relaxed text-emerald-900">Monte a rota por solicitação, material, motorista, veículo e nota fiscal. Depois vincule a receita ao carregamento emitido.</p></div><span className="rounded-xl bg-white px-3 py-2 text-xs font-bold text-emerald-800">Acesso administrativo</span></div>
+      </section>
+
+      <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3"><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", logisticsTab === "emissao" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setLogisticsTab("emissao")} type="button">Emissão de viagem</button><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", logisticsTab === "viagens" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setLogisticsTab("viagens")} type="button">Viagens emitidas</button><button className={cn("rounded-xl px-4 py-2 text-sm font-bold", logisticsTab === "rodoviaria" ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100")} onClick={() => setLogisticsTab("rodoviaria")} type="button">Configuração rodoviária</button></div>
+
+      {!datasets.solicitacoesWeb.length || !datasets.estoqueWeb.length ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><strong>Fontes pendentes.</strong> Importe <em>Relação de solicitação webAgil</em> e <em>Estoque webAgil</em> na Central de importações para habilitar a emissão com saldo e lote.</div> : null}
+      {logisticsMessage ? <p className={cn("rounded-xl px-4 py-3 text-sm", /cadastrado|emitida|vinculada|adicionado/i.test(logisticsMessage) ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-900")}>{logisticsMessage}</p> : null}
+
+      {logisticsTab === "emissao" ? <section className="space-y-5">
+        <div className="grid gap-3 md:grid-cols-3"><Card label="Solicitações disponíveis" value={logisticsRequests.length} note="aceitas e não canceladas" /><Card label="Saldo do material" value={selectedLogisticsLine ? formatNumber(selectedLogisticsStock.balance) : "—"} note={selectedLogisticsLine ? `${selectedLogisticsStock.pallets} palete(s) no estoque web` : "selecione uma solicitação"} tone={selectedLogisticsLine && selectedLogisticsStock.balance < selectedLogisticsLine.quantity ? "amber" : "emerald"} /><Card label="Viagens emitidas" value={logistics.trips.length} note="salvas na base central" /></div>
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div><h3 className="font-semibold">Dados da rota e emissão</h3><p className="mt-1 text-xs text-slate-500">Inclua materiais de uma ou mais solicitações na mesma rota. O saldo considera produto e lote do Estoque webAgil.</p></div>
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Solicitação<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!logisticsRequests.length} onChange={(event) => { setTripRequestId(event.target.value); setTripMaterialKey(""); }} value={tripRequestId}><option value="">Selecione a solicitação</option>{logisticsRequests.map((request) => <option key={request.id} value={request.id}>{request.id} · {request.destination || "Destino não informado"} · {request.lines.length} material(is)</option>)}</select></label>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Material e lote<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!selectedLogisticsRequest} onChange={(event) => setTripMaterialKey(event.target.value)} value={tripMaterialKey}><option value="">Selecione o material</option>{selectedLogisticsRequest?.lines.map((line) => <option key={line.id} value={line.id}>{line.product} · lote {line.lot || "não informado"} · {formatNumber(line.quantity)} {line.unit}</option>)}</select></label>
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Origem</p><p className="mt-1 font-semibold text-slate-800">{selectedLogisticsStock.warehouses.join(", ") || selectedLogisticsRequest?.sourceWarehouse || "—"}</p><p className="mt-1 text-xs text-slate-500">Saldo localizado: {selectedLogisticsLine ? formatNumber(selectedLogisticsStock.balance) : "—"}</p></div>
+            <div className="flex items-end"><button className="w-full rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700 disabled:cursor-not-allowed disabled:opacity-50" disabled={!selectedRouteItem} onClick={addRouteItem} type="button">Adicionar material à rota</button></div>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Motorista<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripDriverId(event.target.value)} value={tripDriverId}><option value="">Selecione o motorista</option>{logistics.drivers.map((driver) => <option key={driver.id} value={driver.id}>{driver.fullName} · CPF {driver.cpf}</option>)}</select></label>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Veículo<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripVehicleId(event.target.value)} value={tripVehicleId}><option value="">Selecione a placa</option>{logistics.vehicles.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.plate} · {vehicle.model} · {formatNumber(vehicle.capacity)} kg</option>)}</select></label>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700 lg:col-span-2">Nota fiscal vinculada<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripInvoiceNumber(event.target.value)} placeholder="Digite a nota fiscal da viagem" value={tripInvoiceNumber} /></label>
+          </div>
+          <div className="mt-5 rounded-xl border border-emerald-100 bg-emerald-50/50 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="text-sm font-bold text-emerald-950">Carga da rota</h4><p className="mt-1 text-xs text-emerald-900">{routeItems.length} material(is) · {new Set(routeItems.map((item) => item.requestId)).size} solicitação(ões)</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-emerald-800">Uma viagem, várias solicitações</span></div>{routeItems.length ? <div className="mt-3 divide-y divide-emerald-100 rounded-lg bg-white">{routeItems.map((item) => <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 text-sm" key={item.id}><div><p className="font-semibold text-slate-800">{item.product} <span className="font-normal text-slate-500">· lote {item.lot || "não informado"}</span></p><p className="mt-0.5 text-xs text-slate-500">Solicitação {item.requestId} · {formatNumber(item.quantity)} {item.unit} · {item.sourceWarehouse} → {item.destination}</p></div><button className="text-xs font-bold text-rose-700" onClick={() => removeRouteItem(item.id)} type="button">Remover</button></div>)}</div> : <p className="mt-3 text-sm text-slate-600">Selecione uma solicitação e um material, depois use “Adicionar material à rota”. Você pode trocar a solicitação e repetir o processo.</p>}</div>
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4"><p className="text-xs text-slate-500">{selectedDriver && selectedVehicle ? `Rota pronta: ${selectedDriver.fullName} · ${selectedVehicle.plate}` : "Cadastre e selecione motorista e veículo para completar a rota."}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50" disabled={!routeItems.length || !tripDriverId || !tripVehicleId || !tripInvoiceNumber.trim()} onClick={createLogisticsTrip} type="button">Emitir viagem</button></div>
+        </section>
+        {recipeTrip ? <section className="rounded-2xl border border-sky-200 bg-sky-50 p-5"><div><h3 className="font-semibold text-sky-950">Vincular receita à viagem</h3><p className="mt-1 text-xs text-sky-900">{logisticsTripItems(recipeTrip).length} material(is) · {new Set(logisticsTripItems(recipeTrip).map((item) => item.requestId)).size} solicitação(ões) · NF {recipeTrip.invoiceNumber}</p></div><div className="mt-4 grid gap-3 md:grid-cols-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Cultura<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, culture: event.target.value }))} placeholder="Ex.: Soja" value={recipeDraft.culture} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Alvo<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, target: event.target.value }))} placeholder="Ex.: Mancha-alvo" value={recipeDraft.target} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Dose<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, dose: event.target.value }))} placeholder="Ex.: 0,50 L/ha" value={recipeDraft.dose} /></label></div><div className="mt-4 flex justify-end"><button className="rounded-xl border border-sky-700 bg-white px-4 py-2.5 text-sm font-bold text-sky-800" onClick={attachTripRecipe} type="button">Vincular receita</button></div></section> : null}
+      </section> : null}
+
+      {logisticsTab === "viagens" ? <section className="space-y-4"><div className="flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Viagens emitidas</h3><p className="mt-1 text-xs text-slate-500">Cada documento exportado lista todos os materiais e solicitações vinculados à rota.</p></div><span className="text-sm font-bold text-emerald-800">{logistics.trips.length} registro(s)</span></div><Table empty="Nenhuma viagem emitida." headers={["Solicitações", "Carga da rota", "Rota", "Motorista / placa", "NF", "Receita", "Ações"]} rows={logistics.trips.map((trip) => { const driver = logistics.drivers.find((item) => item.id === trip.driverId); const vehicle = logistics.vehicles.find((item) => item.id === trip.vehicleId); const items = logisticsTripItems(trip); const requests = [...new Set(items.map((item) => item.requestId))]; return [<span key={`${trip.id}-requests`} className="font-semibold">{requests.join(", ")}<br /><small className="font-normal text-slate-500">{requests.length} solicitação(ões)</small></span>, <span key={`${trip.id}-material`}>{items.slice(0, 2).map((item) => <span className="block" key={item.id}>{item.product} <small className="text-slate-500">· {formatNumber(item.quantity)} {item.unit}</small></span>)}{items.length > 2 ? <small className="text-slate-500">+ {items.length - 2} material(is)</small> : null}</span>, <span key={`${trip.id}-route`}>{trip.sourceWarehouse}<br /><small className="text-slate-500">→ {trip.destination}</small></span>, <span key={`${trip.id}-driver`}>{driver?.fullName || "Cadastro removido"}<br /><small className="text-slate-500">{vehicle?.plate || "Placa removida"}</small></span>, trip.invoiceNumber, trip.recipe ? <span className="font-semibold text-emerald-700">{trip.recipe.culture} · {trip.recipe.target}<br /><small>{trip.recipe.dose}</small></span> : <button className="text-xs font-bold text-sky-700" key={`${trip.id}-recipe`} onClick={() => { setRecipeTripId(trip.id); setLogisticsTab("emissao"); }} type="button">Vincular receita</button>, <span className="flex flex-wrap gap-2" key={`${trip.id}-actions`}><button className="rounded-lg border border-emerald-700 px-2.5 py-1.5 text-xs font-bold text-emerald-700" onClick={() => void exportLogisticsDocument(trip)} type="button">Exportar doc.</button><button className="rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-bold text-rose-700" onClick={() => removeLogisticsTrip(trip)} type="button">Excluir</button></span>]; })} /></section> : null}
+
+      {logisticsTab === "rodoviaria" ? <section className="grid gap-5 xl:grid-cols-2"><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Motoristas</h3><p className="mt-1 text-xs text-slate-500">Cadastre nome completo e CPF para vincular às viagens.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Nome completo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, fullName: event.target.value }))} value={driverDraft.fullName} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">CPF<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="numeric" onChange={(event) => setDriverDraft((current) => ({ ...current, cpf: event.target.value }))} placeholder="Somente números" value={driverDraft.cpf} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Telefone (opcional)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, phone: event.target.value }))} value={driverDraft.phone} /></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadDriver} type="button">Cadastrar motorista</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum motorista cadastrado." headers={["Motorista", "CPF", "Telefone", "Ação"]} rows={logistics.drivers.map((driver) => [driver.fullName, driver.cpf, driver.phone || "—", <button className="text-xs font-bold text-rose-700" key={driver.id} onClick={() => removeRoadDriver(driver)} type="button">Excluir</button>])} /></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Veículos</h3><p className="mt-1 text-xs text-slate-500">A capacidade é armazenada em kg para apoiar a separação de carga.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Placa<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal uppercase" onChange={(event) => setVehicleDraft((current) => ({ ...current, plate: event.target.value }))} placeholder="ABC1D23" value={vehicleDraft.plate} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">Modelo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, model: event.target.value }))} placeholder="Ex.: Bitruck" value={vehicleDraft.model} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Capacidade (kg)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="decimal" onChange={(event) => setVehicleDraft((current) => ({ ...current, capacity: event.target.value }))} placeholder="Ex.: 15000" value={vehicleDraft.capacity} /></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadVehicle} type="button">Cadastrar veículo</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum veículo cadastrado." headers={["Placa", "Modelo", "Capacidade", "Ação"]} rows={logistics.vehicles.map((vehicle) => [vehicle.plate, vehicle.model, `${formatNumber(vehicle.capacity)} kg`, <button className="text-xs font-bold text-rose-700" key={vehicle.id} onClick={() => removeRoadVehicle(vehicle)} type="button">Excluir</button>])} /></div></section></section> : null}
+    </section> : <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><h2 className="font-semibold text-amber-950">Acesso restrito</h2><p className="mt-2 text-sm text-amber-900">A logística de carregamento pode ser consultada e administrada somente por usuários administradores.</p></section>;
   } else if (active === "Usuários") {
-    content = <Table headers={["Perfil", "Permissões"]} rows={[["Administrador", "Importações, premissas, usuários e regras"], ["Editor", "Tarefas, alertas e relatórios"], ["Visualizador", "Consulta e exportações autorizadas"]]} />;
+    content = currentUser?.role === "admin" ? <section className="space-y-5">
+      <div className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-5"><div><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Administração de acesso</p><h2 className="mt-1 text-xl font-bold text-emerald-950">Usuários da plataforma</h2><p className="mt-2 max-w-2xl text-sm leading-relaxed text-emerald-900">Crie e mantenha as contas que acessam a base central. Apenas administradores podem gerenciar usuários.</p></div><div className="rounded-xl bg-white px-4 py-3 text-right shadow-sm"><p className="text-xs font-semibold text-slate-500">Sua sessão</p><p className="mt-1 text-sm font-bold text-slate-800">{currentUser.name}</p><p className="text-xs text-emerald-700">Administrador</p></div></div>
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,.8fr)]">
+        <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4"><div><h3 className="font-semibold">Contas cadastradas</h3><p className="mt-1 text-xs text-slate-500">{managedUsers.length} usuário(s) com acesso ao AgroNexus.</p></div><button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700 disabled:opacity-50" disabled={userManagerLoading} onClick={() => void loadManagedUsers()} type="button">Atualizar</button></div><div className="overflow-x-auto"><table className="w-full min-w-[620px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr><th className="px-5 py-3 font-semibold">Usuário</th><th className="px-4 py-3 font-semibold">Login</th><th className="px-4 py-3 font-semibold">Perfil</th><th className="px-4 py-3 font-semibold">Criado em</th><th className="px-5 py-3 text-right font-semibold">Ações</th></tr></thead><tbody className="divide-y divide-slate-100">{managedUsers.map((user) => <tr key={user.id}><td className="px-5 py-4 font-semibold text-slate-800">{user.name}{user.id === currentUser.id ? <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">VOCÊ</span> : null}</td><td className="px-4 py-4 text-slate-600">{user.username}</td><td className="px-4 py-4"><span className={cn("rounded-full px-2.5 py-1 text-xs font-bold", user.role === "admin" ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-700")}>{user.role === "admin" ? "Administrador" : "Operador"}</span></td><td className="px-4 py-4 text-xs text-slate-500">{formatDateTime(user.createdAt)}</td><td className="px-5 py-4 text-right"><div className="inline-flex gap-2"><button className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-700" onClick={() => editManagedUser(user)} type="button">Editar</button><button className="rounded-lg border border-rose-200 px-3 py-1.5 text-xs font-bold text-rose-700 disabled:opacity-40" disabled={user.id === currentUser.id || userManagerLoading} onClick={() => void removeManagedUser(user)} type="button">Excluir</button></div></td></tr>)}{!managedUsers.length && !userManagerLoading ? <tr><td className="px-5 py-12 text-center text-sm text-slate-500" colSpan={5}>Nenhum usuário encontrado.</td></tr> : null}</tbody></table></div></section>
+        <form className="h-fit rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" onSubmit={saveManagedUser}><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">{userDraft.id ? "Editar usuário" : "Nova conta"}</h3><p className="mt-1 text-xs leading-relaxed text-slate-500">{userDraft.id ? "Deixe a senha em branco para mantê-la." : "Defina uma senha inicial para liberar o acesso."}</p></div>{userDraft.id ? <button className="text-xs font-bold text-slate-500" onClick={() => setUserDraft(emptyUserDraft)} type="button">Cancelar</button> : null}</div><div className="mt-5 grid gap-3"><label className="grid gap-1.5 text-xs font-bold text-slate-600">Nome<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, name: event.target.value }))} placeholder="Nome completo" required value={userDraft.name} /></label><label className="grid gap-1.5 text-xs font-bold text-slate-600">Login<input autoCapitalize="none" className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, username: event.target.value }))} placeholder="nome.sobrenome" required value={userDraft.username} /></label><label className="grid gap-1.5 text-xs font-bold text-slate-600">Perfil<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, role: event.target.value as UserDraft["role"] }))} value={userDraft.role}><option value="viewer">Operador</option><option value="admin">Administrador</option></select></label><label className="grid gap-1.5 text-xs font-bold text-slate-600">{userDraft.id ? "Nova senha (opcional)" : "Senha inicial"}<input autoComplete="new-password" className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" minLength={6} onChange={(event) => setUserDraft((current) => ({ ...current, password: event.target.value }))} placeholder={userDraft.id ? "Manter senha atual" : "Mínimo de 6 caracteres"} required={!userDraft.id} type="password" value={userDraft.password} /></label></div>{userManagerMessage ? <p className={cn("mt-4 rounded-xl px-3 py-2 text-sm", /atualizado|criado|excluído/i.test(userManagerMessage) ? "bg-emerald-50 text-emerald-800" : "bg-rose-50 text-rose-800")}>{userManagerMessage}</p> : null}<button className="mt-5 w-full rounded-xl bg-emerald-700 px-4 py-3 text-sm font-bold text-white disabled:cursor-wait disabled:opacity-60" disabled={userManagerLoading} type="submit">{userManagerLoading ? "Salvando..." : userDraft.id ? "Salvar alterações" : "Criar usuário"}</button></form>
+      </div>
+    </section> : <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><h2 className="font-semibold text-amber-950">Acesso restrito</h2><p className="mt-2 text-sm text-amber-900">A administração de usuários está disponível apenas para o perfil administrador.</p></section>;
   } else {
     content = <section className="rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="border-b border-slate-100 px-6 py-5"><h2 className="font-semibold">Configurações</h2><p className="mt-2 text-sm text-slate-500">Padronize premissas e destinatários das notificações por núcleo.</p></div><div className="flex gap-2 border-b border-slate-100 px-6 pt-4"><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "premissas" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("premissas")} type="button">Premissas</button><button className={cn("rounded-t-xl px-4 py-2 text-sm font-semibold", settingsTab === "email" ? "bg-emerald-50 text-emerald-800" : "text-slate-500")} onClick={() => setSettingsTab("email")} type="button">E-mails por núcleo</button></div>{settingsTab === "premissas" ? <div className="p-6"><p className="text-sm text-slate-500">Ajuste dimensões, conversões e regras aplicadas às análises.</p><button className="mt-5 inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Editar premissas</button></div> : <div className="space-y-5 p-6"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-950"><p className="font-semibold">Envio por domínio corporativo</p><p className="mt-1 text-xs">Os destinatários abaixo são sugeridos no envio manual de alertas. Use endereços internos @agroboaesperanca.com.br, separados por vírgula.</p></div><label className="grid max-w-xl gap-1.5 text-sm font-medium">Cópia padrão (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, defaultCopy: event.target.value }))} placeholder="planejamento@agroboaesperanca.com.br" value={emailSettings.defaultCopy} /></label><div><h3 className="text-sm font-semibold">Destinatário padrão por núcleo</h3><div className="mt-3 grid gap-3 md:grid-cols-2">{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <label className="grid gap-1.5 text-sm font-medium" key={nucleus}>{nucleus}<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setEmailSettings((current) => ({ ...current, nucleusRecipients: { ...current.nucleusRecipients, [nucleus]: event.target.value } }))} placeholder={`responsavel.${nucleus.toLowerCase()}@agroboaesperanca.com.br`} value={emailSettings.nucleusRecipients[nucleus] || ""} /></label>)}</div>{taskNuclei.length === 1 ? <p className="mt-3 text-sm text-slate-500">Os núcleos aparecem após a importação de pedidos pendentes.</p> : null}</div></div>}</section>;
+  }
+
+  if (active === "Tarefas") {
+    const taskSignalStyle = { emerald: "bg-emerald-100 text-emerald-800", sky: "bg-sky-100 text-sky-800", amber: "bg-amber-100 text-amber-900", rose: "bg-rose-100 text-rose-800", slate: "bg-slate-100 text-slate-700" };
+    content = <section className="space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div><h2 className="font-semibold">Farol e tarefas operacionais</h2><p className="mt-1 text-sm text-slate-500">Registre responsáveis, decisões e próximos passos ligados a pedidos ou materiais.</p></div>
+        <div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 rounded-xl border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={() => void exportTasks()} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-3 py-2 text-sm font-semibold text-white" onClick={openNotification} type="button"><Bell className="h-4 w-4" />Notificar por e-mail</button></div>
+      </div>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5">
+        <div className="flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Histórico de ações</h3><p className="mt-1 text-xs text-slate-500">As atualizações mais recentes aparecem primeiro.</p></div><label className="grid gap-1 text-xs font-semibold text-slate-600">Exibir<select className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-normal" onChange={(event) => { setTaskHistorySize(Number(event.target.value)); setTaskHistoryPage(0); }} value={taskHistorySize}><option value={10}>10 registros</option><option value={30}>30 registros</option><option value={50}>50 registros</option></select></label></div>
+        <div className="mt-4 space-y-2">{paginatedTaskHistory.length ? paginatedTaskHistory.map(({ task, ...action }) => <article className="rounded-xl border border-slate-100 bg-slate-50 p-3" key={action.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-sm font-semibold text-slate-800">{task.title}</p><p className="mt-1 text-sm text-slate-700">{action.note}</p><p className="mt-2 text-xs text-slate-500">{task.material || "Ação geral"}{task.nucleus ? ` · ${task.nucleus}` : ""} · {task.owner || "Não atribuído"}</p></div><p className="text-xs text-slate-500">{formatDateTime(action.createdAt)}</p></div></article>) : <p className="py-6 text-center text-sm text-slate-500">Nenhuma ação registrada ainda.</p>}</div>
+        {taskHistory.length > taskHistorySize ? <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3 text-xs text-slate-600"><span>Página {safeTaskHistoryPage + 1} de {taskHistoryPages} · {taskHistory.length} ações</span><span className="flex gap-2"><button className="rounded-lg border border-slate-200 px-3 py-1.5 font-semibold disabled:opacity-40" disabled={safeTaskHistoryPage === 0} onClick={() => setTaskHistoryPage((current) => Math.max(0, current - 1))} type="button">Anterior</button><button className="rounded-lg border border-slate-200 px-3 py-1.5 font-semibold disabled:opacity-40" disabled={safeTaskHistoryPage >= taskHistoryPages - 1} onClick={() => setTaskHistoryPage((current) => Math.min(taskHistoryPages - 1, current + 1))} type="button">Próxima</button></span></div> : null}
+      </section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Registrar ação do setor</h3><p className="mt-1 text-xs text-slate-500">Vincule a ação a um pedido específico ou agrupe o acompanhamento por material.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-xs font-semibold text-slate-600">Vincular por<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskLinkMode(event.target.value as "pedido" | "material")} value={taskLinkMode}><option value="pedido">Pedido pendente</option><option value="material">Material</option></select></label>{taskLinkMode === "pedido" ? <label className="grid gap-1 text-xs font-semibold text-slate-600">Pedido<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskPendingId(event.target.value)} value={taskPendingId}><option value="">Sem pedido vinculado</option>{pendingSignals.map((signal) => <option key={signal.id} value={signal.id}>{signal.reference} · {signal.material} · {signal.nucleus}</option>)}</select></label> : <label className="grid gap-1 text-xs font-semibold text-slate-600">Material<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTaskMaterialLink(event.target.value)} value={taskMaterialLink}><option value="">Selecione o material</option>{taskMaterialOptions.map((material) => <option key={material}>{material}</option>)}</select></label>}<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskTitle(event.target.value)} placeholder="Título da ação (opcional)" value={taskTitle} /><textarea className="min-h-28 rounded-xl border border-slate-200 px-3 py-2.5 text-sm" onChange={(event) => setTaskNote(event.target.value)} placeholder="Descreva a ação, causa da falta e próximo passo." value={taskNote} /><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white" onClick={addLinkedTask} type="button">Registrar no histórico</button></div></section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Responsáveis e prazos</h3><p className="mt-1 text-xs text-slate-500">Acompanhe a execução de cada tarefa aberta.</p></div><div className="grid grid-cols-3 gap-2 text-center text-xs"><span className="rounded-lg bg-sky-50 px-3 py-2 font-bold text-sky-800">{tasks.filter((task) => task.status === "Aberta").length} abertas</span><span className="rounded-lg bg-amber-50 px-3 py-2 font-bold text-amber-800">{tasks.filter((task) => task.status === "Em andamento").length} em curso</span><span className="rounded-lg bg-emerald-50 px-3 py-2 font-bold text-emerald-800">{tasks.filter((task) => task.status === "Concluída").length} concluídas</span></div></div><div className="space-y-3">{tasks.length ? tasks.slice().reverse().map((task) => <article className="rounded-xl border border-slate-200 p-4" key={task.id}><div className="grid gap-3 lg:grid-cols-[minmax(200px,1.4fr)_minmax(130px,.7fr)_150px_160px]"><div><p className="font-semibold text-slate-800">{task.title}</p><p className="mt-1 text-xs text-slate-500">{task.material || "Sem material"}{task.nucleus ? ` · ${task.nucleus}` : ""}</p></div><label className="grid gap-1 text-[11px] font-semibold text-slate-500">Responsável<input className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-normal text-slate-800" onBlur={(event) => updateTask(task.id, { owner: event.target.value })} defaultValue={task.owner || ""} /></label><label className="grid gap-1 text-[11px] font-semibold text-slate-500">Prazo<input className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-normal text-slate-800" onChange={(event) => updateTask(task.id, { dueDate: event.target.value })} type="date" value={task.dueDate || ""} /></label><label className="grid gap-1 text-[11px] font-semibold text-slate-500">Status<select className="rounded-lg border border-slate-200 px-2 py-1.5 text-sm font-normal text-slate-800" onChange={(event) => updateTask(task.id, { status: event.target.value as TaskStatus })} value={task.status || "Aberta"}>{["Aberta", "Em andamento", "Aguardando", "Concluída"].map((status) => <option key={status}>{status}</option>)}</select></label></div><div className="mt-3 flex flex-wrap gap-2"><input className="min-w-0 flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setTaskActionDrafts((current) => ({ ...current, [task.id]: event.target.value }))} placeholder="Adicionar atualização ao histórico" value={taskActionDrafts[task.id] || ""} /><button className="rounded-lg border border-emerald-700 px-3 text-sm font-semibold text-emerald-700" onClick={() => appendTaskAction(task.id)} type="button">Salvar atualização</button></div></article>) : <p className="py-6 text-center text-sm text-slate-500">Registre uma ação para iniciar o acompanhamento.</p>}</div></section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Farol de pedidos pendentes</h3><p className="mt-1 text-xs text-slate-500">Filtre a demanda que orienta as ações da equipe.</p></div><div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><select aria-label="Filtrar farol" className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setTaskSignalFilter(event.target.value)} value={taskSignalFilter}>{["Todos", "Demanda próxima", "Possível atraso", "Ponto de atenção", "Alerta", "Programado", "Sem data"].map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filtrar pedido" className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setTaskOrderFilter(event.target.value)} value={taskOrderFilter}>{taskOrders.map((item) => <option key={item}>{item}</option>)}</select><select aria-label="Filtrar núcleo" className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setTaskNucleusFilter(event.target.value)} value={taskNucleusFilter}>{taskNuclei.map((item) => <option key={item}>{item}</option>)}</select><input aria-label="Filtrar material" className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setTaskMaterialFilter(event.target.value)} placeholder="Material" value={taskMaterialFilter} /></div></div><Table empty="Nenhum pedido atende aos filtros selecionados." headers={["Farol", "Previsão", "Pedido", "Material", "Núcleo", "Volume solicitado"]} rows={filteredPendingSignals.map((signal) => [<span className={cn("inline-flex rounded-full px-2.5 py-1 text-xs font-bold", taskSignalStyle[signal.tone])} key={signal.id}>{signal.status}</span>, signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data", signal.reference, signal.material, signal.nucleus, formatNumber(signal.quantity)])} /></section>
+    </section>;
+  }
+
+  if (active === "Tarefas" && currentUser?.role === "admin") {
+    const taskContentForAdmin = content;
+    content = <section className="space-y-6">{taskContentForAdmin}<section className="rounded-2xl border border-rose-200 bg-rose-50/50 p-5"><h3 className="font-semibold text-rose-950">Administração de tarefas</h3><p className="mt-1 text-xs text-rose-800">A exclusão remove a tarefa e todas as ações vinculadas. Esta operação não pode ser desfeita.</p><div className="mt-4"><Table empty="Nenhuma tarefa para administrar." headers={["Tarefa", "Responsável", "Status", "Ação"]} rows={tasks.slice().reverse().map((task) => [task.title, task.owner || "Não atribuído", task.status || "Aberta", <button className="rounded-lg border border-rose-300 bg-white px-3 py-1.5 text-xs font-bold text-rose-700" key={task.id} onClick={() => deleteTask(task)} type="button">Excluir tarefa</button>])} /></div></section></section>;
   }
 
   if (active === "Configurações") {
@@ -1679,12 +2684,43 @@ export default function Home() {
     </section>;
   }
 
-  return <main className="min-h-screen bg-[#f7f9f7] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[248px]"><header className="sticky top-0 z-10 flex h-[72px] items-center justify-between border-b border-slate-200 bg-white/90 px-5 backdrop-blur lg:px-9"><div><p className="text-sm font-semibold">{active}</p><p className="text-xs text-slate-500">Safra 2026/2027</p></div><div className="flex items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-9 w-9 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" />Premissas</button></div></header><div className="mx-auto max-w-[1480px] px-5 py-8 lg:px-9"><section className="mb-7"><p className="text-xs font-bold uppercase tracking-[.15em] text-emerald-700">Centro de comando</p><h1 className="mt-2 text-3xl font-bold tracking-tight">{active}</h1><p className="mt-2 text-sm text-slate-500">{hasData ? "Dados carregados e salvos neste navegador." : "Importe as fontes para ativar os dados operacionais."}</p></section>{content}</div></div>
+  if (active === "Visão geral" && hasData) {
+    const overviewContent = content;
+    content = <section className="space-y-6"><div className="flex flex-wrap items-end justify-between gap-3 rounded-2xl border border-emerald-200 bg-emerald-50/70 p-5"><div><p className="text-xs font-bold uppercase tracking-[.12em] text-emerald-700">Centro de decisão</p><h2 className="mt-1 text-xl font-bold text-emerald-950">Prioridades de hoje</h2><p className="mt-1 text-sm text-emerald-900">{isOperator ? `Leitura operacional do núcleo ${operatorHasNucleus ? operatorNucleus : "ainda não definido"}.` : "Leitura rápida de riscos, tarefas e abastecimento antes da análise detalhada."}</p></div><div className="flex gap-2"><button className="rounded-xl border border-emerald-700 bg-white px-3 py-2 text-sm font-bold text-emerald-800" onClick={() => void exportExecutiveReport()} type="button"><Download className="mr-2 inline h-4 w-4" />Relatório executivo</button><button className="rounded-xl bg-emerald-800 px-3 py-2 text-sm font-bold text-white" onClick={() => window.print()} type="button">Imprimir / PDF</button></div></div>{isOperator && !operatorHasNucleus ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><strong>Acesso aguardando configuração.</strong> Um administrador precisa definir o núcleo deste usuário antes de liberar os dados operacionais.</div> : null}<div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><Card label="Riscos críticos" value={scopedOperationalAlerts.filter((alert) => alert.severity === "critical").length} note="estoque vencido, dose ou cobertura" tone="rose" /><Card label="Pendências de qualidade" value={dashboardQualityPending} note={isOperator ? "sem pendências no escopo do núcleo" : "conciliação e validações de importação"} tone={dashboardQualityPending ? "amber" : "emerald"} /><Card label="Tarefas abertas" value={openTasks.length} note={overdueTasks ? `${overdueTasks} com prazo vencido` : "sem prazo vencido"} tone={overdueTasks ? "amber" : "slate"} /><Card label="Pedidos urgentes" value={farol.alert + farol.attention} note="ponto de atenção ou alerta" tone={farol.alert ? "rose" : "amber"} /></div><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex items-center justify-between gap-3"><div><h3 className="font-semibold">Fila operacional</h3><p className="mt-1 text-xs text-slate-500">Itens que merecem decisão ou acompanhamento imediato.</p></div><button className="text-xs font-bold text-emerald-800" onClick={() => setActive("Alertas")} type="button">Ver alertas</button></div><div className="grid gap-2">{dailyPriorities.length ? dailyPriorities.map((item) => <article className={cn("rounded-xl border px-4 py-3", item.tone === "rose" ? "border-rose-200 bg-rose-50" : "border-amber-200 bg-amber-50/60")} key={item.id}><div className="flex flex-wrap items-start justify-between gap-2"><div><p className="text-xs font-bold uppercase tracking-wide text-slate-600">{item.level}</p><p className="mt-1 text-sm font-semibold text-slate-900">{item.title}</p><p className="mt-1 text-xs leading-relaxed text-slate-600">{item.detail}</p></div></div></article>) : <p className="py-4 text-sm text-slate-500">Não há prioridades críticas no recorte atual.</p>}</div></section>{overviewContent}</section>;
+  }
 
-    {showNotification ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Notificar pedidos pendentes</h2><p className="mt-1 text-xs text-slate-500">O e-mail lista os pedidos em atraso da faixa selecionada para o núcleo.</p></div><button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Núcleo<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => { const nucleus = event.target.value; setNotificationNucleus(nucleus); setNotificationTo(emailSettings.nucleusRecipients[nucleus] || ""); }} value={notificationNucleus}><option>Todos</option>{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1.5 text-sm font-medium">Notificar atrasos a partir de<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationDays(event.target.value)} value={notificationDays}><option value="1">1 dia</option><option value="3">3 dias</option><option value="5">5 dias</option><option value="10">10 dias</option></select></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Para<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationTo(event.target.value)} placeholder="responsavel@agroboaesperanca.com.br" value={notificationTo} /></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Cópia (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@agroboaesperanca.com.br" value={notificationCc} /></label></div><div className="border-t border-slate-100 px-6 py-4"><div className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-950"><strong>{notificationCandidates.length} pedido(s)</strong> serão incluídos no aviso. O envio aceita endereços internos @agroboaesperanca.com.br.</div>{notificationMessage ? <p className={cn("mt-3 text-sm", notificationMessage.startsWith("E-mail enviado") ? "text-emerald-700" : "text-rose-700")}>{notificationMessage}</p> : null}<div className="mt-4 flex justify-end gap-2"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={sendingNotification || !notificationCandidates.length} onClick={sendNotification} type="button">{sendingNotification ? "Enviando..." : "Enviar e-mail"}</button></div></div></div></div> : null}
+  if (active === "Importações") {
+    const importsContent = content;
+    content = <section className="space-y-6"><section className="grid gap-3 sm:grid-cols-3"><Card label="Qualidade da base" value={qualityPending ? `${qualityPending} pendências` : "Base consistente"} note={`${reconciliationIssues.length} itens para conciliar`} tone={qualityPending ? "amber" : "emerald"} /><Card label="Últimas importações" value={importHistory.length} note="versões registradas" /><Card label="Validações do arquivo" value={qualityWarnings} note="campos essenciais sem leitura" tone={qualityWarnings ? "amber" : "emerald"} /></section>{importsContent}<section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4"><h2 className="font-semibold">Histórico e versões de importação</h2><p className="mt-1 text-xs text-slate-500">Cada importação preserva data, versão, comparação de linhas e validações encontradas.</p></div><Table empty="Nenhuma importação registrada nesta base." headers={["Fonte", "Arquivo", "Versão", "Linhas", "Variação", "Validações", "Importada em"]} rows={importHistory.slice(0, 20).map((entry) => [sourceConfig.find((source) => source.key === entry.source)?.title || entry.source, entry.fileName, `v${entry.version}`, formatNumber(entry.rows), entry.previousRows ? `${entry.rows >= entry.previousRows ? "+" : ""}${formatNumber(entry.rows - entry.previousRows)}` : "Primeira carga", entry.warnings ? <span className="font-bold text-amber-700" key={entry.id}> {entry.warnings}</span> : "OK", formatDateTime(entry.importedAt)])} /></section></section>;
+  }
+
+  if (active === "Tarefas") {
+    const tasksContent = content;
+    content = <section className="space-y-6"><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4 flex flex-wrap items-end justify-between gap-3"><div><h2 className="font-semibold">Gestão de responsabilidade</h2><p className="mt-1 text-xs text-slate-500">Defina responsável, prazo, status e a referência da evidência de cada ação.</p></div><div className="grid grid-cols-3 gap-2 text-center text-xs"><span className="rounded-lg bg-sky-50 px-3 py-2 font-bold text-sky-800">{tasks.filter((task) => task.status === "Aberta").length} abertas</span><span className="rounded-lg bg-amber-50 px-3 py-2 font-bold text-amber-800">{tasks.filter((task) => task.status === "Em andamento").length} em curso</span><span className="rounded-lg bg-emerald-50 px-3 py-2 font-bold text-emerald-800">{tasks.filter((task) => task.status === "Concluída").length} concluídas</span></div></div><div className="overflow-x-auto"><table className="w-full min-w-[920px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Tarefa", "Responsável", "Prazo", "Status", "Evidência / link", "Atualizada"].map((head) => <th className="px-3 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{tasks.length ? tasks.slice().reverse().map((task) => <tr key={task.id}><td className="px-3 py-3 font-semibold text-slate-800">{task.title}<p className="mt-1 text-xs font-normal text-slate-500">{task.material || "Sem material"}{task.nucleus ? ` · ${task.nucleus}` : ""}</p></td><td className="px-3 py-3"><input aria-label={`Responsável por ${task.title}`} className="w-40 rounded-lg border border-slate-200 px-2 py-1.5" onBlur={(event) => updateTask(task.id, { owner: event.target.value })} defaultValue={task.owner || ""} /></td><td className="px-3 py-3"><input aria-label={`Prazo para ${task.title}`} className="rounded-lg border border-slate-200 px-2 py-1.5" onChange={(event) => updateTask(task.id, { dueDate: event.target.value })} type="date" value={task.dueDate || ""} /></td><td className="px-3 py-3"><select aria-label={`Status de ${task.title}`} className="rounded-lg border border-slate-200 px-2 py-1.5" onChange={(event) => updateTask(task.id, { status: event.target.value as TaskStatus })} value={task.status || "Aberta"}>{["Aberta", "Em andamento", "Aguardando", "Concluída"].map((status) => <option key={status}>{status}</option>)}</select></td><td className="px-3 py-3"><input aria-label={`Evidência de ${task.title}`} className="w-48 rounded-lg border border-slate-200 px-2 py-1.5" onBlur={(event) => updateTask(task.id, { evidence: event.target.value })} placeholder="Link, chamado ou referência" defaultValue={task.evidence || ""} /></td><td className="px-3 py-3 text-xs text-slate-500">{formatDateTime(task.updatedAt || task.createdAt)}</td></tr>) : <tr><td className="px-3 py-8 text-center text-slate-500" colSpan={6}>Registre uma ação abaixo para começar o acompanhamento.</td></tr>}</tbody></table></div></section>{tasksContent}</section>;
+  }
+
+  if (active === "Configurações") {
+    const settingsContent = content;
+    content = <section className="space-y-6">{settingsContent}<section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="mb-4"><h2 className="font-semibold">Auditoria recente</h2><p className="mt-1 text-xs text-slate-500">Registro de alterações relevantes feitas na base operacional.</p></div><Table empty="Ainda não há eventos registrados nesta sessão." headers={["Quando", "Responsável", "Tipo", "Detalhe"]} rows={auditEvents.slice(0, 15).map((event) => [formatDateTime(event.createdAt), event.actor, event.kind, event.detail])} /></section></section>;
+  }
+
+  if (active === "Usuários" && currentUser?.role === "admin") {
+    content = <section className="space-y-5"><div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5"><p className="text-xs font-bold uppercase tracking-wide text-emerald-700">Administração de acesso</p><h2 className="mt-1 text-xl font-bold text-emerald-950">Usuários e escopo operacional</h2><p className="mt-2 text-sm text-emerald-900">Operadores são direcionados para o núcleo definido. O Acompanhamento permanece comparativo e geral.</p></div><div className="grid gap-5 xl:grid-cols-[minmax(0,1.35fr)_360px]"><section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4"><div><h3 className="font-semibold">Contas cadastradas</h3><p className="mt-1 text-xs text-slate-500">Defina o núcleo dos operadores para priorizar suas análises.</p></div><button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700" onClick={() => void loadManagedUsers()} type="button">Atualizar</button></div><div className="overflow-x-auto"><table className="w-full min-w-[700px] text-left text-sm"><thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Usuário", "Login", "Perfil", "Núcleo", "Ações"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{managedUsers.map((user) => <tr key={user.id}><td className="px-4 py-4 font-semibold text-slate-800">{user.name}</td><td className="px-4 py-4 text-slate-600">{user.username}</td><td className="px-4 py-4"><span className={cn("rounded-full px-2.5 py-1 text-xs font-bold", user.role === "admin" ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-700")}>{user.role === "admin" ? "Administrador" : "Operador"}</span></td><td className="px-4 py-4 font-medium text-emerald-800">{user.role === "admin" ? "Todos" : user.nucleus || "Definir núcleo"}</td><td className="px-4 py-4"><div className="flex gap-2"><button className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-700" onClick={() => editManagedUser(user)} type="button">Editar</button><button className="rounded-lg border border-rose-200 px-3 py-1.5 text-xs font-bold text-rose-700 disabled:opacity-40" disabled={user.id === currentUser.id || userManagerLoading} onClick={() => void removeManagedUser(user)} type="button">Excluir</button></div></td></tr>)}{!managedUsers.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={5}>Nenhum usuário encontrado.</td></tr> : null}</tbody></table></div></section><form className="h-fit rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" onSubmit={saveManagedUser}><div className="flex items-start justify-between gap-3"><div><h3 className="font-semibold">{userDraft.id ? "Editar usuário" : "Novo usuário"}</h3><p className="mt-1 text-xs text-slate-500">Operadores só acessam as análises priorizadas para seu núcleo.</p></div>{userDraft.id ? <button className="text-xs font-bold text-slate-500" onClick={() => setUserDraft(emptyUserDraft)} type="button">Cancelar</button> : null}</div><div className="mt-5 grid gap-3"><label className="grid gap-1 text-xs font-bold text-slate-600">Nome<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, name: event.target.value }))} required value={userDraft.name} /></label><label className="grid gap-1 text-xs font-bold text-slate-600">Login<input autoCapitalize="none" className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, username: event.target.value }))} required value={userDraft.username} /></label><label className="grid gap-1 text-xs font-bold text-slate-600">Perfil<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setUserDraft((current) => ({ ...current, role: event.target.value as UserDraft["role"] }))} value={userDraft.role}><option value="viewer">Operador</option><option value="admin">Administrador</option></select></label><label className="grid gap-1 text-xs font-bold text-slate-600">Núcleo do operador<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal disabled:bg-slate-50" disabled={userDraft.role === "admin"} onChange={(event) => setUserDraft((current) => ({ ...current, nucleus: event.target.value }))} value={userDraft.role === "admin" ? "" : userDraft.nucleus}><option value="">Selecione o núcleo</option>{[...new Set([...ledger.map((row) => row.nucleus), ...taskNuclei.filter((nucleus) => nucleus !== "Todos")])].filter(Boolean).sort().map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1 text-xs font-bold text-slate-600">{userDraft.id ? "Nova senha (opcional)" : "Senha inicial"}<input autoComplete="new-password" className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" minLength={6} onChange={(event) => setUserDraft((current) => ({ ...current, password: event.target.value }))} required={!userDraft.id} type="password" value={userDraft.password} /></label></div>{userManagerMessage ? <p className={cn("mt-4 rounded-xl px-3 py-2 text-sm", /atualizado|criado|excluído/i.test(userManagerMessage) ? "bg-emerald-50 text-emerald-800" : "bg-rose-50 text-rose-800")}>{userManagerMessage}</p> : null}<button className="mt-5 w-full rounded-xl bg-emerald-700 px-4 py-3 text-sm font-bold text-white disabled:opacity-60" disabled={userManagerLoading} type="submit">{userManagerLoading ? "Salvando..." : userDraft.id ? "Salvar alterações" : "Criar usuário"}</button></form></div></section>;
+  }
+
+  if (active === "Importações" && currentUser?.role !== "admin") {
+    content = <section className="space-y-6"><div className="rounded-2xl border border-sky-200 bg-sky-50 p-5"><h2 className="font-semibold text-sky-950">Importações em modo consulta</h2><p className="mt-1 text-sm text-sky-900">Seu perfil pode acompanhar arquivos, versões e validações, mas não pode importar ou substituir dados operacionais.</p></div><section className="rounded-2xl border border-slate-200 bg-white p-5"><Table empty="Nenhuma importação registrada." headers={["Fonte", "Arquivo", "Versão", "Linhas", "Validações", "Importada em"]} rows={importHistory.slice(0, 30).map((entry) => [sourceConfig.find((source) => source.key === entry.source)?.title || entry.source, entry.fileName, `v${entry.version}`, formatNumber(entry.rows), entry.warnings || "OK", formatDateTime(entry.importedAt)])} /></section></section>;
+  }
+
+  if (!authReady || (currentUser && !storageReady)) return <main className="login-screen grid min-h-screen place-items-center p-5"><ContentLoading detail="Conectando à base central e preparando seu ambiente." /></main>;
+  if (!currentUser) return <LoginScreen error={loginError || persistenceError} loading={loggingIn} onPasswordChange={setLoginPassword} onSubmit={signIn} onUsernameChange={setLoginUsername} password={loginPassword} username={loginUsername} />;
+
+  return <main className="app-shell min-h-screen bg-[#f2f5ef] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[264px]"><header className="command-header sticky top-0 z-10 flex min-h-[64px] items-center justify-between gap-3 border-b border-emerald-950/10 bg-[#f8faf6]/95 px-4 py-2.5 lg:min-h-[72px] lg:px-9"><div className="flex min-w-0 items-center gap-2"><button aria-label="Abrir menu" className="grid h-11 w-11 shrink-0 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700 lg:hidden" onClick={() => setShowMobileNav(true)} type="button"><Menu className="h-5 w-5" /></button><div className="min-w-0"><p className="truncate text-sm font-bold text-slate-900">{active}</p><p className="mt-0.5 truncate text-xs font-medium text-slate-500">Safra 2026/2027 · {hasData ? "base operacional ativa" : "base ainda não carregada"}</p></div></div><div className="flex shrink-0 items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-11 w-11 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700 transition hover:border-emerald-400 hover:text-emerald-800" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button aria-label="Abrir premissas" className="inline-flex h-11 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 transition hover:border-emerald-500 hover:text-emerald-800" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" /><span className="hidden sm:inline">Premissas</span></button></div></header><div className="mx-auto max-w-[1540px] px-4 py-6 pb-24 sm:px-5 sm:py-7 lg:px-9 lg:py-9 lg:pb-9"><section className="page-intro mb-7 flex flex-wrap items-end justify-between gap-3 sm:mb-8 sm:gap-4"><div><h1 className="text-[1.75rem] font-bold tracking-tight text-emerald-950 sm:text-4xl">{active}</h1><p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-600">{hasData ? "Dados carregados, conciliados e prontos para leitura operacional." : "Importe as fontes para ativar a leitura operacional e a conciliação de materiais."}</p></div><div className={cn("rounded-xl border px-3 py-2 text-xs font-bold", hasData ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900")}>{hasData ? "Base pronta para análise" : "Aguardando fontes"}</div></section>{content}</div></div><nav aria-label="Atalhos principais" className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-emerald-950/10 bg-white/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 lg:hidden">{[nav[0], nav[1], nav[2], nav[4]].map(([label, Icon]) => <button className={cn("grid min-h-12 place-items-center gap-1 rounded-lg px-1 text-[10px] font-bold", active === label ? "bg-emerald-800 text-white" : "text-slate-600")} key={label} onClick={() => setActive(label)} type="button"><Icon className="h-4 w-4" /><span className="max-w-full truncate">{label}</span></button>)}<button className="grid min-h-12 place-items-center gap-1 rounded-lg px-1 text-[10px] font-bold text-slate-600" onClick={() => setShowMobileNav(true)} type="button"><Menu className="h-4 w-4" /><span>Mais</span></button></nav>{showMobileNav ? <div aria-modal="true" className="fixed inset-0 z-50 flex items-end bg-emerald-950/40 p-3 lg:hidden" role="dialog"><div className="w-full rounded-2xl bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))]"><div className="mb-3 flex items-center justify-between"><div><h2 className="text-lg font-bold">Navegação</h2><p className="text-xs text-slate-500">Acesse todas as áreas operacionais.</p></div><button aria-label="Fechar menu" className="grid h-11 w-11 place-items-center rounded-xl border border-slate-200" onClick={() => setShowMobileNav(false)} type="button"><X className="h-5 w-5" /></button></div><div className="grid grid-cols-2 gap-2">{nav.map(([label, Icon]) => <button className={cn("flex min-h-12 items-center gap-3 rounded-xl border px-3 text-left text-sm font-bold", active === label ? "border-emerald-700 bg-emerald-50 text-emerald-950" : "border-slate-200 text-slate-700")} key={label} onClick={() => { setActive(label); setShowMobileNav(false); }} type="button"><Icon className="h-4 w-4" />{label}</button>)}</div></div></div> : null}
+
+    {showNotification ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Notificar pedidos pendentes</h2><p className="mt-1 text-xs text-slate-500">O Outlook abrirá um rascunho com os pedidos da faixa selecionada para o núcleo.</p></div><button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Núcleo<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => { const nucleus = event.target.value; setNotificationNucleus(nucleus); setNotificationTo(emailSettings.nucleusRecipients[nucleus] || ""); }} value={notificationNucleus}><option>Todos</option>{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1.5 text-sm font-medium">Notificar atrasos a partir de<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationDays(event.target.value)} value={notificationDays}><option value="1">1 dia</option><option value="3">3 dias</option><option value="5">5 dias</option><option value="10">10 dias</option></select></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Para<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationTo(event.target.value)} placeholder="responsavel@empresa.com" value={notificationTo} /></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Cópia (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@empresa.com" value={notificationCc} /></label></div><div className="border-t border-slate-100 px-6 py-4"><div className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-950"><strong>{notificationCandidates.length} pedido(s)</strong> serão incluídos no rascunho. Revise os destinatários e o conteúdo antes de enviar no Outlook.</div>{notificationMessage ? <p className={cn("mt-3 text-sm", notificationMessage.startsWith("Rascunho aberto") ? "text-emerald-700" : "text-rose-700")}>{notificationMessage}</p> : null}<div className="mt-4 flex justify-end gap-2"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationCandidates.length} onClick={openOutlookDraft} type="button">Abrir rascunho no Outlook</button></div></div></div></div> : null}
 
     {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém, trânsito e pedidos pendentes do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Volume solicitado" value={formatNumber(provision.pendingOrder)} note="pedidos pendentes" /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1180px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "V. solicitado", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className="px-4 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-400">—</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={8}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
 
-    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais e mapeamentos aplicados à conciliação.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator.</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}</div><div className="border-t border-slate-100 px-6 py-5"><div className="mb-4"><h3 className="text-sm font-semibold">Catálogo de premissas</h3><p className="mt-1 text-xs text-slate-500">Escolha um tipo para consultar os dados em tabela e exportá-los para edição.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">{premiseSections.map((section) => <button className={cn("rounded-xl border p-4 text-left", premiseSection === section.id ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white hover:border-emerald-300")} key={section.id} onClick={() => setPremiseSection(section.id)} type="button"><p className="text-sm font-semibold">{section.title}</p><p className="mt-1 text-xs text-slate-500">{section.rows.length} registros</p></button>)}</div><div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h4 className="font-semibold">{selectedPremiseSection.title}</h4><p className="mt-1 text-xs text-slate-500">{selectedPremiseSection.description}</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportPremiseSection} type="button"><Download className="h-4 w-4" />Exportar para edição</button></div><Table empty="Nenhum registro nesta premissa." headers={selectedPremiseSection.headers} rows={selectedPremiseSection.rows} /></div></div><div className="border-t border-slate-100 px-6 py-5"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4"><p className="text-sm font-semibold text-sky-950">Alertas por e-mail</p><p className="mt-1 text-xs leading-relaxed text-sky-900">A programação de destinatários e frequência será habilitada assim que o serviço de envio for autorizado. A plataforma já sinaliza os alertas operacionais no painel.</p></div></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas e salvas neste navegador."); }} type="button">Salvar</button></div></div></div> : null}
+    {showPremises ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="max-h-[90vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Premissas e dimensões</h2><p className="mt-1 text-xs text-slate-500">Regras operacionais e mapeamentos aplicados à conciliação.</p></div><button aria-label="Fechar premissas" className="p-2 text-slate-500" onClick={() => setShowPremises(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2">{[["Tolerância de desvio (%)", "tolerance"], ["Amostra mínima", "sample"], ["Janelas de demanda", "horizon"], ["Status excluído", "excludedStatus"]].map(([label, key]) => <label className="grid gap-1.5 text-sm font-medium" key={key}>{label}<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setPremises({ ...premises, [key]: event.target.value })} value={premises[key as keyof Premises]} /></label>)}</div><div className="border-t border-slate-100 px-6 py-5"><h3 className="text-sm font-semibold">Nova premissa de dimensão</h3><p className="mt-1 text-xs text-slate-500">Material: nome → material agregado. Centro/Fazenda: chave → núcleo. Conversão: material padrão|apresentação física → fator.</p><div className="mt-3 grid gap-2 sm:grid-cols-4"><select className="rounded-lg border border-slate-200 px-2 py-2 text-sm" onChange={(event) => setDraft({ ...draft, domain: event.target.value })} value={draft.domain}><option>Material</option><option>Princípio ativo</option><option>Centro</option><option>Fazenda</option><option>Cultura</option><option>Conversão</option></select><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, key: event.target.value })} placeholder="Chave" value={draft.key} /><input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" onChange={(event) => setDraft({ ...draft, value: event.target.value })} placeholder="Valor" value={draft.value} /><button className="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-semibold text-emerald-700" onClick={addPremise} type="button">Incluir</button></div>{dimensionPremises.length ? <div className="mt-4 space-y-2">{dimensionPremises.map((item, index) => <div className="flex justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs" key={item.domain + "|" + item.key + "|" + String(index)}><span>{item.domain}: <strong>{item.key}</strong> → {item.value}</span><button className="text-rose-600" onClick={() => setDimensionPremises((current) => current.filter((_, position) => position !== index))} type="button">Remover</button></div>)}</div> : null}</div><div className="border-t border-slate-100 px-6 py-5"><div className="mb-4"><h3 className="text-sm font-semibold">Catálogo de premissas</h3><p className="mt-1 text-xs text-slate-500">Escolha um tipo para consultar os dados em tabela e exportá-los para edição.</p></div><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">{premiseSections.map((section) => <button className={cn("rounded-xl border p-4 text-left", premiseSection === section.id ? "border-emerald-500 bg-emerald-50" : "border-slate-200 bg-white hover:border-emerald-300")} key={section.id} onClick={() => setPremiseSection(section.id)} type="button"><p className="text-sm font-semibold">{section.title}</p><p className="mt-1 text-xs text-slate-500">{section.rows.length} registros</p></button>)}</div><div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4"><div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><h4 className="font-semibold">{selectedPremiseSection.title}</h4><p className="mt-1 text-xs text-slate-500">{selectedPremiseSection.description}</p></div><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 bg-white px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportPremiseSection} type="button"><Download className="h-4 w-4" />Exportar para edição</button></div><Table empty="Nenhum registro nesta premissa." headers={selectedPremiseSection.headers} rows={selectedPremiseSection.rows} /></div></div><div className="border-t border-slate-100 px-6 py-5"><div className="rounded-xl border border-sky-200 bg-sky-50 p-4"><p className="text-sm font-semibold text-sky-950">Alertas por e-mail</p><p className="mt-1 text-xs leading-relaxed text-sky-900">A programação de destinatários e frequência será habilitada assim que o serviço de envio for autorizado. A plataforma já sinaliza os alertas operacionais no painel.</p></div></div><div className="flex justify-end gap-2 border-t border-slate-100 px-6 py-4"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowPremises(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white" onClick={() => { setShowPremises(false); setMessage("Premissas aplicadas e salvas na base central."); }} type="button">Salvar</button></div></div></div> : null}
   </main>;
 }

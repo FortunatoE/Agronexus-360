@@ -74,11 +74,76 @@ const productFields: Record<ProductSource, string[]> = {
 
 const quantityFields: Record<ProductSource, string[]> = {
   planning: ["Qtde. talhão", "Qtde talhão", "Volume ajustado (produto) padrão", "Quantidade"],
-  stock: ["Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"],
+  stock: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"],
   transit: ["Quantidade", "Qtd.pedido", "Qtd pedido", "Saldo ajustado"],
   consumption: ["Qtd.retirada", "Qtd retirada", "Quantidade", "Saldo ajustado"],
   pending: ["Saldo Forn", "Saldo fornecedor", "Qtd.pedido", "Qtd pedido", "Volume solicitado", "Quantidade"],
 };
+
+export type CompactSource = ProductSource | "execution";
+
+/**
+ * Mantém apenas os campos que alimentam os visuais e os guarda com chaves
+ * curtas. Arquivos SAP possuem dezenas de colunas repetidas por linha; essa
+ * projeção reduz de forma importante a carga enviada ao navegador sem alterar
+ * a conciliação operacional.
+ */
+export function compactOperationalRow(row: OperationalRow, source: CompactSource): OperationalRow {
+  if (row._c === 1) return row;
+  const compact: OperationalRow = { _c: 1 };
+  // Normaliza cada cabeçalho uma única vez. Isto reduz drasticamente o custo
+  // de ler arquivos SAP grandes no worker de importação.
+  const values = new Map(Object.entries(row).map(([header, value]) => [headerKey(header), value]));
+  const valueFor = (...aliases: string[]) => {
+    for (const alias of aliases) {
+      const candidate = headerKey(alias);
+      const exact = values.get(candidate);
+      if (exact !== undefined && exact !== null && (typeof exact === "number" || String(exact).trim())) return exact;
+      if (candidate.length > 7) {
+        for (const [header, value] of values) {
+          if (header.startsWith(candidate) && value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) return value;
+        }
+      }
+    }
+    return undefined;
+  };
+  const assign = (key: string, ...aliases: string[]) => {
+    const value = valueFor(...aliases);
+    if (value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) compact[key] = value;
+  };
+  const productSource: ProductSource = source === "execution" ? "planning" : source;
+  const quantitySource: ProductSource = source === "execution" ? "planning" : source;
+
+  assign("s", "Status", "Situação", "Situacao");
+  assign("cl", "Classificação", "Classificacao", "Classificac�o", "Tipo");
+  assign("p", ...productFields[productSource]);
+  assign("q", ...quantityFields[quantitySource]);
+  assign("aq", "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
+  assign("c", "Material", "Código material", "Codigo material", "MAT");
+  assign("w", "WBS element", "WBS", "Elemento PEP", "Elemento WBS", "Def.proj.", "Def proj", "Projeto");
+  assign("ce", "Cen.", "Centro", "CEN", "Fazenda", "Nome Fazenda");
+  assign("t", "Talhao", "Talhão");
+  assign("cu", "Cultura", "Cultura 1");
+  assign("cy", "Ciclo Plantio", "Ciclo");
+  assign("n", "Nucleo", "Núcleo");
+  assign("d", "Dep.", "Depósito", "Deposito", "DEP");
+  assign("op", "Nome Est.Esp.", "Nome Est Esp", "Armazém", "Armazem");
+  assign("ct", "Local Est.Esp.", "Local Est Esp", "Cidade");
+  assign("dg", "DiagRede", "Diagrama");
+  assign("ta", "Tar.", "Operação", "Operacao", "Operações", "Operacoes", "Descr. Operação", "Descr Operação");
+  assign("ac", "Atividade");
+  assign("pa", "Área executar (HA)", "Area executar (HA)", "HA_plantio", "HA plantio", "HA_talhao", "HA talhão");
+  assign("aa", "Área Executada", "Area Executada", "Qtde. executada");
+  assign("pd", "Data de plantio", "Data Plantio", "Dt. Plantio", "Dt Plantio", "DT_Plantio", "DATA_PLANTIO", "Plantio");
+  assign("nq", "Qtd.necess.", "Qtd necess.", "Quantidade necessária", "Quantidade necessaria");
+  assign("ad", "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data");
+  assign("rd", "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Previsão de utilização", "Previsao de utilizacao");
+  assign("or", "Pedido", "Nº pedido", "No pedido", "Documento", "Doc. compra", "Solicitação", "Solicitacao");
+  assign("ex", "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade");
+  assign("va", "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque");
+  assign("el", "Eliminado?", "Eliminado", "Cancelado");
+  return compact;
+}
 
 const cropByCode: Record<string, { culture: string; cycle: string }> = {
   AL1: { culture: "Algodão", cycle: "Safrinha" },
@@ -97,7 +162,44 @@ export function headerKey(value: unknown) {
     .replace(/[^A-Z0-9]/g, "");
 }
 
+const compactAliasMap: Record<string, string> = {
+  STATUS: "s", SITUACAO: "s", CLASSIFICACAO: "cl", TIPO: "cl",
+  PRODUTO: "p", MATERIALPLANEJADO: "p", PRODUTOPLANEJADO: "p", TEXTOMATERIAL: "p", DESCRICAOMATERIAL: "p", TEXTOBREVEMATERIAL: "p", INSUMO: "p", PRODUTOSOLICITADO: "p", MATERIALSOLICITADO: "p",
+  QTDETALHAO: "q", QUANTIDADE: "q", UTILLIVRE: "q", UTILIZACAOLIVRE: "q", SALDOAJUSTADO: "q", ESTOQUE: "q", QTDRETIRADA: "q", SALDOFORN: "q", SALDOFORNECEDOR: "q", QTDPEDIDO: "q", VOLUMESOLICITADO: "q",
+  VOLUMEAJUSTADOPRODUTOPADRAO: "aq",
+  MATERIAL: "c", CODIGOMATERIAL: "c", MAT: "c",
+  WBSELEMENT: "w", WBS: "w", ELEMENTOPEP: "w", ELEMENTOWBS: "w", DEFPROJ: "w", PROJETO: "w",
+  CEN: "ce", CENTRO: "ce", FAZENDA: "ce", NOMEFAZENDA: "ce", TALHAO: "t", CULTURA: "cu", CULTURA1: "cu", CICLOPLANTIO: "cy", CICLO: "cy", NUCLEO: "n",
+  DEP: "d", DEPOSITO: "d", NOMEESTESP: "op", ARMAZEM: "op", LOCALESTESP: "ct", CIDADE: "ct",
+  DIAGREDE: "dg", DIAGRAMA: "dg", TAR: "ta", OPERACAO: "ta", OPERACOES: "ta", DESCROPERACAO: "ta", ATIVIDADE: "ac",
+  AREAEXECUTARHA: "pa", HAPLANTIO: "pa", HATALHAO: "pa", AREAEXECUTADA: "aa", QTDEEXECUTADA: "aa",
+  DATADEPLANTIO: "pd", DATAPLANTIO: "pd", DTPLANTIO: "pd", PLANTIO: "pd",
+  QTDNECESS: "nq", QUANTIDADENECESSARIA: "nq",
+  DTAPLICACAO: "ad", DATAPREVISTA: "ad", DATAPLANEJADA: "ad", DATAAPLICACAO: "ad", DATA: "ad",
+  DTREMPED: "rd", DATAREMESSA: "rd", PREVISAODEUTILIZACAO: "rd",
+  PEDIDO: "or", NOPEDIDO: "or", DOCUMENTO: "or", DOCCOMPRA: "or", SOLICITACAO: "or",
+  DTVALIDADE: "ex", DATADEVALIDADE: "ex", DATAVALIDADE: "ex", VALIDADE: "ex",
+  VALORTOTAL: "va", VALTOTAL: "va", VALOR: "va", VALESTOQUE: "va", VALORESTOQUE: "va",
+  ELIMINADO: "el", CANCELADO: "el",
+};
+const compactAliasCache = new Map<string, string | undefined>();
+
+function compactKeyForAlias(alias: string) {
+  if (compactAliasCache.has(alias)) return compactAliasCache.get(alias);
+  const key = compactAliasMap[headerKey(alias)];
+  compactAliasCache.set(alias, key);
+  return key;
+}
+
 export function readValue(row: OperationalRow, ...aliases: string[]) {
+  if (row._c === 1) {
+    for (const alias of aliases) {
+      const compactKey = compactKeyForAlias(alias);
+      const value = compactKey ? row[compactKey] : undefined;
+      if (value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) return value;
+    }
+    return undefined;
+  }
   for (const alias of aliases) {
     const candidate = headerKey(alias);
     const header = Object.keys(row).find((key) => {
@@ -288,11 +390,22 @@ export function quantityFor(row: OperationalRow, source: ProductSource) {
 /**
  * Expresses a physical material in the unit of its material agregado. The
  * Premissas sheet stores conversions as `material padrão|apresentação física`.
- * This is the same division used by the legacy MB52 Power Query.
+ * The factor is multiplicative: 0.5 means that 1,600 physical become 800 in
+ * the unit of the aggregated material.
  */
+export function conversionFactor(product: ResolvedProduct, bundle: DimensionBundle) {
+  const explicit = bundle.conversions[`${normalizeMaterial(product.canonicalName)}|${normalizeMaterial(product.rawName)}`];
+  if (explicit && explicit > 0) return explicit;
+  // Fallback seguro para dimensões que já trazem as duas doses, mas ainda não
+  // receberam a premissa de conversão explícita.
+  const physicalDose = bundle.materials[normalizeMaterial(product.rawName)]?.standardDose || 0;
+  const aggregateDose = bundle.materials[normalizeMaterial(product.canonicalName)]?.standardDose || 0;
+  if (physicalDose > 0 && aggregateDose > 0 && Math.abs(physicalDose - aggregateDose) > 0.000_001) return physicalDose / aggregateDose;
+  return 1;
+}
+
 export function standardAmount(amount: number, product: ResolvedProduct, bundle: DimensionBundle) {
-  const conversion = bundle.conversions[`${normalizeMaterial(product.canonicalName)}|${normalizeMaterial(product.rawName)}`] || 1;
-  return conversion > 0 ? amount / conversion : amount;
+  return amount * conversionFactor(product, bundle);
 }
 
 export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {

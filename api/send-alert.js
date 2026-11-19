@@ -1,3 +1,5 @@
+import { currentUser } from "./_core.js";
+
 const allowedDomain = "agroboaesperanca.com.br";
 
 function emailList(value) {
@@ -22,6 +24,8 @@ export default async function handler(request, response) {
   }
 
   try {
+    const user = await currentUser(request);
+    if (!user) return response.status(401).json({ error: "Sessão expirada. Entre novamente para enviar o aviso." });
     const payload = request.body || {};
     const to = emailList(payload.to);
     const cc = emailList(payload.cc);
@@ -37,6 +41,7 @@ export default async function handler(request, response) {
     const rows = notices.map((notice) => `<tr><td>${escapeHtml(notice.reference)}</td><td>${escapeHtml(notice.material)}</td><td>${escapeHtml(notice.nucleus)}</td><td>${escapeHtml(notice.dueDate)}</td><td>${escapeHtml(notice.delay)}</td><td>${escapeHtml(notice.quantity)}</td></tr>`).join("");
     const nucleus = escapeHtml(payload.nucleus || "Todos os núcleos");
     const threshold = escapeHtml(payload.threshold || "0");
+    const sender = "Emmanuel Fortunato <emmanuel.fortunato@agroboaesperanca.com.br>";
     const emailResponse = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
@@ -44,7 +49,7 @@ export default async function handler(request, response) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from: `AgroNexus 360 <alertas@${process.env.RESEND_EMAIL_DOMAIN}>`,
+        from: sender,
         to,
         ...(cc.length ? { cc } : {}),
         subject: `AgroNexus | pedidos pendentes — ${nucleus}`,
@@ -54,7 +59,13 @@ export default async function handler(request, response) {
     const result = await emailResponse.json().catch(() => ({}));
     if (!emailResponse.ok) {
       console.error("Resend rejected alert email", { status: emailResponse.status, error: result?.message || result?.name });
-      return response.status(502).json({ error: "O serviço de e-mail recusou o envio. Verifique o domínio remetente." });
+      const reason = String(result?.message || result?.name || "");
+      const domainIssue = /domain|sender|from|verify|verified/i.test(reason);
+      return response.status(502).json({
+        error: domainIssue
+          ? `O remetente ${sender} não está validado no serviço de e-mail. Verifique o domínio e os registros DNS no Resend.`
+          : `O serviço de e-mail recusou o envio${reason ? `: ${reason}` : "."}`,
+      });
     }
     return response.status(200).json({ ok: true, id: result?.id });
   } catch (error) {

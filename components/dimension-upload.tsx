@@ -1,15 +1,17 @@
 "use client";
 
-import * as XLSX from "xlsx";
 import { FileUp } from "lucide-react";
 import { normalizeMaterial, readMaterialDimension, type DimensionBundle } from "@/lib/material-dimension";
 
 type Row = Record<string, unknown>;
 type DimensionImport = { fileName: string; fileModifiedAt: string; importedAt: string; rows: number; sheets: string[] };
+type Sheet = Record<string, { v?: unknown }>;
+let xlsxLoader: Promise<typeof import("xlsx")> | null = null;
+function loadXlsx() { xlsxLoader ??= import("xlsx"); return xlsxLoader; }
 
-function sparseValue(sheet: XLSX.WorkSheet, column: string, row: number) { return String(sheet[`${column}${row}`]?.v ?? "").trim(); }
+function sparseValue(sheet: Sheet, column: string, row: number) { return String(sheet[`${column}${row}`]?.v ?? "").trim(); }
 
-function readPremises(sheet: XLSX.WorkSheet) {
+function readPremises(sheet: Sheet) {
   const centers: Record<string, string> = {}; const cultures: Record<string, string> = {}; const conversions: Record<string, number> = {};
   const rows = new Set<number>();
   Object.keys(sheet).forEach(cell => { const match = /^([HIPQTUVWXY])(\d+)$/.exec(cell); if (match) rows.add(Number(match[2])); });
@@ -27,12 +29,13 @@ function readPremises(sheet: XLSX.WorkSheet) {
 export function DimensionUpload({ count = 0, label = "Dimensões.xlsx (opcional)", onLoaded }: { count?: number; label?: string; onLoaded: (bundle: DimensionBundle, info: DimensionImport) => void }) {
   async function load(file: File | undefined) {
     if (!file) return;
+    const XLSX = await loadXlsx();
     const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
     const activeSheet = workbook.SheetNames.find(name => normalizeMaterial(name).includes("PRINCIPIOATIVO"));
     if (!activeSheet) throw new Error("A aba Princípio Ativo não foi encontrada.");
     const map = readMaterialDimension(XLSX.utils.sheet_to_json<Row>(workbook.Sheets[activeSheet], { defval: "" }));
     const premisesName = workbook.SheetNames.find(name => normalizeMaterial(name) === "PREMISSAS");
-    const premises = premisesName ? readPremises(workbook.Sheets[premisesName]) : { centerToNucleus: {}, cultureToCycle: {}, conversions: {} };
+    const premises = premisesName ? readPremises(workbook.Sheets[premisesName] as Sheet) : { centerToNucleus: {}, cultureToCycle: {}, conversions: {} };
     onLoaded({ materials: Object.fromEntries(map), ...premises }, {
       fileName: file.name,
       fileModifiedAt: new Date(file.lastModified || Date.now()).toISOString(),

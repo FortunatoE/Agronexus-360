@@ -5,8 +5,8 @@ export const metadata: Metadata = {
   title: "AgroNexus 360°",
   description: "Planejamento agrícola, execução operacional e gestão de insumos.",
   icons: {
-    icon: "/favicon.svg",
-    shortcut: "/favicon.svg",
+    icon: "/agronexus-favicon.svg",
+    shortcut: "/agronexus-favicon.svg",
   },
 };
 
