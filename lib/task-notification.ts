@@ -1,3 +1,8 @@
+import { normalizeMaterial } from "@/lib/material-dimension";
+import { headerKey, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
+
+type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow };
+
 type OrderEmailRow = {
   orderDate: string;
   reference: string;
@@ -7,12 +12,93 @@ type OrderEmailRow = {
   ordered: number | null;
   delivered: number | null;
   remaining: number | null;
+  recordedQuantity: number | null;
 };
 
 const headers = ["DATA PED", "PEDIDO", "ITEM PED", "INSUMO", "QTD PEDIDO", "QTD ENTREGUE", "FALTA ENTREGAR"];
 const volumeFormat = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 4 });
 const missingValue = "—";
 const encoder = new TextEncoder();
+
+function sapIdentifier(value: string) {
+  const key = normalizeMaterial(value);
+  return /^\d+$/.test(key) ? key.replace(/^0+(?=\d)/, "") : key;
+}
+
+function orderMaterialCode(row: OperationalRow) {
+  return sapIdentifier(readText(row, "Código material", "Código do material", "MAT", "Material"));
+}
+
+export function resolveTaskNotificationOrders(
+  candidates: PendingEmailOrder[],
+  pending: PendingEmailOrder[],
+  purchases: OperationalRow[],
+): OrderEmailRow[] {
+  const candidateReferences = new Set(candidates.map((signal) => sapIdentifier(signal.reference)));
+  const orders = new Map<string, Array<ReturnType<typeof readPendingOrderDetails> & { code: string; material: string }>>();
+  for (const purchase of purchases) {
+    if (["SIM", "S", "X", "TRUE"].includes(headerKey(readText(purchase, "Eliminado?", "Eliminado", "Cancelado")))) continue;
+    const reference = sapIdentifier(readText(purchase, "Doc.compra", "Documento de compra", "Documento de compras", "Pedido", "Nº pedido", "Documento"));
+    if (!reference || !candidateReferences.has(reference)) continue;
+    const lines = orders.get(reference) ?? [];
+    lines.push({
+      ...readPendingOrderDetails(purchase),
+      code: orderMaterialCode(purchase),
+      material: normalizeMaterial(readText(purchase, "Descrição Material", "Texto breve material", "Texto material", "Produto", "Insumo")),
+    });
+    orders.set(reference, lines);
+  }
+
+  const pendingReferences = new Map<string, Array<{ code: string; material: string }>>();
+  for (const signal of pending) {
+    const reference = sapIdentifier(signal.reference);
+    if (!orders.has(reference)) continue;
+    const lines = pendingReferences.get(reference) ?? [];
+    lines.push({ code: orderMaterialCode(signal.row), material: normalizeMaterial(signal.physicalMaterial) });
+    pendingReferences.set(reference, lines);
+  }
+
+  return candidates.flatMap((signal) => {
+    const details = readPendingOrderDetails(signal.row);
+    const reference = sapIdentifier(signal.reference);
+    const lines = orders.get(reference) ?? [];
+    const sameOrder = pendingReferences.get(reference) ?? [];
+    const code = orderMaterialCode(signal.row);
+    const material = normalizeMaterial(signal.physicalMaterial);
+    const item = sapIdentifier(details.item);
+    // O item identifica a linha. Para cargas antigas, código ou descrição só
+    // resolvem a linha quando também são únicos na relação de pendências.
+    const codeMatches = code && sameOrder.filter((line) => line.code === code).length === 1
+      ? lines.filter((line) => line.code === code) : [];
+    const matches = item ? lines.filter((line) => sapIdentifier(line.item) === item)
+      : codeMatches.length ? codeMatches
+        : material !== "SEMDESCRICAO" && sameOrder.filter((line) => line.material === material).length === 1
+          ? lines.filter((line) => line.material === material && (!code || !line.code || line.code === code)) : [];
+    const matched = matches.length === 1 && (!code || !matches[0].code || matches[0].code === code) ? matches[0] : undefined;
+    const orderDates = new Set(lines.map((line) => line.orderDate).filter(Boolean));
+    const orderDate = details.orderDate || matched?.orderDate || (orderDates.size === 1 ? [...orderDates][0] : "");
+    const ordered = details.ordered ?? matched?.ordered ?? null;
+    let delivered = details.delivered ?? matched?.delivered ?? null;
+    let remaining = details.remaining ?? matched?.remaining ?? null;
+    if (details.remaining !== null && details.delivered === null && ordered !== null) {
+      delivered = ordered >= details.remaining ? ordered - details.remaining : null;
+    } else if (details.ordered !== null && details.remaining === null && delivered !== null) {
+      remaining = Math.max(0, details.ordered - delivered);
+    }
+    if (remaining !== null && remaining <= 0) return [];
+    return [{
+      orderDate,
+      reference: signal.reference,
+      item: details.item || matched?.item || "",
+      material: signal.physicalMaterial,
+      nucleus: signal.nucleus,
+      ordered,
+      delivered,
+      remaining,
+      recordedQuantity: ordered === null && remaining === null ? details.recordedQuantity : null,
+    }];
+  });
+}
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({
@@ -26,20 +112,25 @@ export function buildTaskNotification(nucleus: string, minimumDays: number, rows
   const request = "Favor verificar os pedidos abaixo, pendentes no sistema";
   const instruction = "Se o produto já foi entregue por outro pedido (por exemplo, por transferência ou entrega direta) e não for necessário volume adicional, favor excluir a linha do pedido.";
   const partialDelivery = "Em caso de entrega parcial, ajuste a linha do pedido para a quantidade entregue se o volume restante não for necessário.";
-  const columns = nucleus === "Todos" ? [...headers, "NÚCLEO"] : headers;
+  const showRecordedQuantity = rows.some((row) => row.recordedQuantity !== null);
+  const columns = [...headers, ...(showRecordedQuantity ? ["QTD NA BASE"] : []), ...(nucleus === "Todos" ? ["NÚCLEO"] : [])];
   const formatVolume = (value: number | null) => value === null ? missingValue : volumeFormat.format(value);
   const cells = rows.map((row) => {
     const fields = [
       row.orderDate || missingValue, row.reference, row.item || missingValue, row.material,
       formatVolume(row.ordered), formatVolume(row.delivered), formatVolume(row.remaining),
     ];
-    return nucleus === "Todos" ? [...fields, row.nucleus] : fields;
+    if (showRecordedQuantity) fields.push(row.recordedQuantity === null ? "" : formatVolume(row.recordedQuantity));
+    if (nucleus === "Todos") fields.push(row.nucleus);
+    return fields;
   });
-  const missingNote = cells.some((row) => row.includes(missingValue)) ? "O traço (—) indica um campo indisponível na base." : "";
+  const incompleteRows = cells.filter((row) => row.slice(0, headers.length).includes(missingValue)).length;
+  const missingNote = incompleteRows ? "O traço (—) indica um campo indisponível na base." : "";
+  const volumeNote = showRecordedQuantity ? "Qtd na base mostra o volume preservado na importação antiga, que pode ser a quantidade pedida ou o saldo a entregar." : "";
 
   const tableHeader = columns.map((label) => `<th scope="col" bgcolor="#438d21" style="color:#fff;background:#438d21;text-align:left;padding:4px 6px;white-space:nowrap">${label}</th>`).join("");
   const tableRows = cells.map((row) => `<tr>${row.map((value, index) => {
-    const align = index >= 4 && index <= 6 ? "right" : "left";
+    const align = index >= 4 && columns[index] !== "NÚCLEO" ? "right" : "left";
     const dateCell = index === 0 ? ' bgcolor="#e2f2d9"' : "";
     const weight = index <= 1 ? "font-weight:bold;" : "";
     return `<td${dateCell} style="padding:4px 6px;border-bottom:1px solid #e7ebdf;text-align:${align};${weight}">${escapeHtml(value)}</td>`;
@@ -51,13 +142,15 @@ export function buildTaskNotification(nucleus: string, minimumDays: number, rows
     <p><strong>Observação:</strong> ${partialDelivery}</p>
     <table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:13px"><thead><tr>${tableHeader}</tr></thead><tbody>${tableRows}</tbody></table>
     ${missingNote ? `<p style="font-size:12px;color:#4b5563">${missingNote}</p>` : ""}
+    ${volumeNote ? `<p style="font-size:12px;color:#4b5563">${volumeNote}</p>` : ""}
+    <p><br></p>
   </body></html>`;
   const textTable = [columns, ...cells].map((row) => row.map((value) => value.replace(/[\t\r\n]+/g, " ")).join("\t")).join("\r\n");
   const text = [
     "Olá,", `${request}, com atraso de pelo menos ${days} em relação à previsão de utilização.`,
-    instruction, `Observação: ${partialDelivery}`, textTable, missingNote,
-  ].filter(Boolean).join("\r\n\r\n");
-  return { subject, html, text };
+    instruction, `Observação: ${partialDelivery}`, textTable, missingNote, volumeNote,
+  ].filter(Boolean).join("\r\n\r\n") + "\r\n\r\n";
+  return { subject, html, text, incompleteRows };
 }
 
 export function parseNotificationRecipients(value: string) {

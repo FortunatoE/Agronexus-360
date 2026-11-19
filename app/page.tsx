@@ -2,7 +2,7 @@
 
 import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { buildCommercialClosingOverview, matchesCommercialClosing, resolveCommercialClosings } from "@/lib/commercial-closings";
-import { buildNotificationMailto, buildOutlookEml, buildTaskNotification, parseNotificationRecipients } from "@/lib/task-notification";
+import { buildNotificationMailto, buildOutlookEml, buildTaskNotification, parseNotificationRecipients, resolveTaskNotificationOrders } from "@/lib/task-notification";
 import { base64ToBytes } from "@/lib/workspace-base64";
 import { CommercialClosingBalances } from "@/components/commercial-closing-balances";
 import { CommercialClosingCalendar, type ClosingCalendarPeriod } from "@/components/commercial-closing-calendar";
@@ -20,7 +20,6 @@ import {
   productFor,
   quantityFor,
   readNumber,
-  readPendingOrderDetails,
   readText,
   nucleusFor,
   stockLocationFor,
@@ -1065,7 +1064,6 @@ export default function Home() {
         standardProduct: dimension?.aggregateMaterial || product,
         active: dimension?.principleActive || "Não conciliado",
         supplier: readText(row, "Nome Fornecedor", "Fornecedor"),
-        row,
         dueDate: readText(row, "Vencimento"),
         unit: readText(row, "UMP", "Unidade") || "—",
         currency: headerKey(readText(row, "Moeda")) === "USD" ? "USD" as const : "BRL" as const,
@@ -1741,49 +1739,14 @@ export default function Home() {
       && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus));
     if (!candidates.length) return null;
 
-    const orderKey = (reference: string, material: string) => `${normalizeMaterial(reference)}|${normalizeMaterial(material)}`;
-    const itemKey = (item: string) => normalizeMaterial(item).replace(/^0+(?=\d)/, "");
-    const purchaseLines = new Map<string, ReturnType<typeof readPendingOrderDetails>[]>();
-    for (const order of commercialOrders) {
-      const key = orderKey(order.orderNumber, order.product);
-      const details = readPendingOrderDetails(order.row);
-      const lines = purchaseLines.get(key);
-      if (lines) lines.push(details);
-      else purchaseLines.set(key, [details]);
-    }
-
-    const pendingLineCounts = new Map<string, number>();
-    for (const signal of pendingSignals) {
-      const key = orderKey(signal.reference, signal.physicalMaterial);
-      pendingLineCounts.set(key, (pendingLineCounts.get(key) ?? 0) + 1);
-    }
     const dateFormatter = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
-    const rows = candidates.flatMap((signal) => {
-      const details = readPendingOrderDetails(signal.row);
-      const key = orderKey(signal.reference, signal.physicalMaterial);
-      const lines = purchaseLines.get(key) ?? [];
-      const matches = details.item
-        ? lines.filter((line) => itemKey(line.item) === itemKey(details.item))
-        : pendingLineCounts.get(key) === 1 ? lines : [];
-      const matched = matches.length === 1 ? matches[0] : undefined;
-      const remaining = details.remaining ?? matched?.remaining ?? null;
-      if (remaining !== null && remaining <= 0) return [];
-      const rawDate = details.orderDate || matched?.orderDate || "";
-      const orderDate = dateFromPlan(/^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? `${rawDate}T00:00:00` : rawDate);
-      return [{
-        orderDate: orderDate ? dateFormatter.format(orderDate) : "",
-        reference: signal.reference,
-        item: details.item || matched?.item || "",
-        material: signal.physicalMaterial,
-        nucleus: signal.nucleus,
-        ordered: details.ordered ?? matched?.ordered ?? null,
-        delivered: details.delivered ?? matched?.delivered ?? null,
-        remaining,
-      }];
+    const rows = resolveTaskNotificationOrders(candidates, pendingSignals, datasets.pedidosCompra).map((row) => {
+      const date = dateFromPlan(/^\d{4}-\d{2}-\d{2}$/.test(row.orderDate) ? `${row.orderDate}T00:00:00` : row.orderDate);
+      return { ...row, orderDate: date ? dateFormatter.format(date) : "" };
     });
 
     return rows.length ? { ...buildTaskNotification(notificationNucleus, minimumDays, rows), count: rows.length } : null;
-  }, [commercialOrders, notificationDays, notificationNucleus, pendingSignals, scopedPendingSignals, showNotification]);
+  }, [datasets.pedidosCompra, notificationDays, notificationNucleus, pendingSignals, scopedPendingSignals, showNotification]);
   const notificationRecipients = parseNotificationRecipients(notificationTo);
   const notificationCopy = parseNotificationRecipients(notificationCc);
   const outlookDraftUrl = notificationDraft && notificationRecipients?.length && notificationCopy
@@ -2258,7 +2221,7 @@ export default function Home() {
         "text/html": new Blob([notificationDraft.html], { type: "text/html" }),
         "text/plain": new Blob([notificationDraft.text], { type: "text/plain" }),
       })]);
-      setNotificationMessage({ text: "Corpo copiado. Cole com Ctrl+V no corpo da mensagem do Outlook.", success: true });
+      setNotificationMessage({ text: "Corpo copiado. Na nova mensagem do Outlook, cole no início do corpo, acima da assinatura.", success: true });
     } catch {
       setNotificationMessage({ text: "O navegador não permitiu copiar com formatação. Abra a prévia para copiar a mensagem ou baixe o arquivo .eml." });
     }
@@ -2281,7 +2244,7 @@ export default function Home() {
     launcher.click();
     launcher.remove();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setNotificationMessage({ text: "Rascunho preparado. Abra o arquivo .eml no Outlook para revisar.", success: true });
+    setNotificationMessage({ text: "Abra o arquivo .eml no Outlook. Para adicionar a sua assinatura, use Mensagem → Assinatura.", success: true });
   }
   async function exportTasks() {
     const XLSX = await loadXlsx();
@@ -2986,7 +2949,26 @@ export default function Home() {
             <p className="text-sm text-slate-600">{notificationDraft
               ? `${notificationDraft.count} ${notificationDraft.count === 1 ? "linha de pedido no rascunho" : "linhas de pedido no rascunho"}.`
               : "Nenhum pedido pendente na faixa e no núcleo selecionados."}</p>
-            {notificationDraft ? <p className="mt-1 text-xs text-slate-500">Copie o corpo formatado, abra o Outlook clássico e cole com Ctrl+V.</p> : null}
+            {notificationDraft?.incompleteRows ? (
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-amber-900">
+                <p>{notificationDraft.incompleteRows === 1
+                  ? "Uma linha tem campos ausentes na base."
+                  : `${notificationDraft.incompleteRows} linhas têm campos ausentes na base.`}
+                  {" "}{currentUser.role === "admin"
+                    ? "Reimporte PEDIDOS PENDENTES.xlsx para recuperar os campos disponíveis no SAP."
+                    : "A reimportação de PEDIDOS PENDENTES.xlsx por um administrador recupera os campos disponíveis no SAP."}</p>
+                {currentUser.role === "admin" ? (
+                  <button className="font-semibold underline" onClick={() => {
+                    setShowNotification(false);
+                    setActive("Importações");
+                    window.scrollTo({ top: 0 });
+                  }} type="button">Abrir Importações</button>
+                ) : null}
+              </div>
+            ) : null}
+            {notificationDraft ? (
+              <p className="mt-2 text-xs text-slate-600">Para usar a sua assinatura, copie o corpo, abra uma nova mensagem no Outlook e cole no início do corpo. Se necessário, selecione a assinatura em <strong>Mensagem → Assinatura</strong>.</p>
+            ) : null}
             {notificationMessage ? <p className={cn("mt-2 text-sm", notificationMessage.success ? "text-emerald-800" : "text-rose-700")} role="status">{notificationMessage.text}</p> : null}
             <div className="mt-4 flex flex-wrap justify-end gap-2">
               <button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button>
@@ -2997,12 +2979,12 @@ export default function Home() {
                   className="inline-flex items-center rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white"
                   href={outlookDraftUrl}
                   onClick={() => setNotificationMessage({
-                    text: "Se a mensagem não abrir, defina Outlook (clássico) como aplicativo padrão para MAILTO no Windows. Você também pode abrir uma nova mensagem no Outlook e colar o corpo copiado.",
+                    text: "No Outlook, confira a conta remetente e cole o corpo acima da assinatura. Se a janela não abrir, use Novo E-mail no Outlook clássico.",
                     success: true,
                   })}
-                >Abrir Outlook clássico</a>
+                >Nova mensagem no Outlook</a>
               ) : (
-                <button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationDraft} onClick={() => setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." })} type="button">Abrir Outlook clássico</button>
+                <button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationDraft} onClick={() => setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." })} type="button">Nova mensagem no Outlook</button>
               )}
             </div>
           </div>

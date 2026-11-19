@@ -1,4 +1,5 @@
 import { normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
+import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "./pending-order-fields.mjs";
 
 export type OperationalRow = Record<string, unknown>;
 export type ProductSource = "planning" | "stock" | "transit" | "consumption" | "pending";
@@ -77,15 +78,7 @@ const quantityFields: Record<ProductSource, string[]> = {
   stock: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"],
   transit: ["Quantidade", "Qtd.pedido", "Qtd pedido", "Saldo ajustado"],
   consumption: ["Qtd.retirada", "Qtd retirada", "Quantidade", "Saldo ajustado"],
-  pending: ["Saldo Forn", "Saldo fornecedor", "Qtd.pedido", "Qtd pedido", "Volume solicitado", "Quantidade"],
-};
-
-const pendingOrderDetailFields = {
-  orderDate: { key: "od", aliases: ["Data Ped", "Dt. Ped", "Data pedido", "Dt. pedido", "Data do pedido", "Data de emissão", "Data do documento", "Data doc.", "Dt. doc.", "Data doc.compra"] },
-  item: { key: "oi", aliases: ["Item Ped", "Item do pedido", "Item"] },
-  ordered: { key: "oq", aliases: ["Qtd.pedido", "Qtde. pedido", "Quantidade do pedido", "Quantidade pedida", "Quantidade pedido"] },
-  delivered: { key: "dq", aliases: ["Qtd. entregue", "Qtde. entregue", "Quantidade entregue", "Qtde. Forn", "Qtd. Forn", "Qtde. fornecida", "Quantidade fornecida"] },
-  remaining: { key: "rq", aliases: ["Falta entregar", "Saldo Forn", "Saldo fornecedor", "Saldo fornecer", "Saldo a fornecer", "Quantidade em aberto"] },
+  pending: pendingOrderQuantityAliases,
 };
 
 export type CompactSource = ProductSource | "execution";
@@ -259,6 +252,7 @@ export function readPendingOrderDetails(row: OperationalRow) {
     ordered: ordered ?? (delivered !== null && remaining !== null ? delivered + remaining : null),
     delivered: delivered ?? (ordered !== null && remaining !== null && ordered >= remaining ? ordered - remaining : null),
     remaining: remaining ?? (ordered !== null && delivered !== null ? Math.max(0, ordered - delivered) : null),
+    recordedQuantity: row._c === 1 && ordered === null && delivered === null && remaining === null ? quantity(row.q) : null,
   };
 }
 

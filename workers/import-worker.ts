@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { pendingOrderDetailFields } from "../lib/pending-order-fields.mjs";
 import { compactOperationalRow, headerKey, readText, type CompactSource, type OperationalRow } from "../lib/reconciliation";
 
 type SourceKey = "planejamento" | "execucao" | "consumo" | "estoque" | "estoqueMb52" | "transito" | "pedidos" | "estoqueWeb" | "solicitacoesWeb" | "pedidosCompra";
@@ -27,13 +28,16 @@ function stockHeaderRow(sheet: XLSX.WorkSheet) {
 }
 
 function pendingRowsFrom(workbook: XLSX.WorkBook) {
+  const quantityHeaders = new Set([
+    ...pendingOrderDetailFields.ordered.aliases, ...pendingOrderDetailFields.remaining.aliases,
+  ].map(headerKey));
   for (const name of workbook.SheetNames) {
     const sheet = workbook.Sheets[name];
     const preview = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: "" }).slice(0, 15);
     const header = preview.findIndex((row) => {
       const headers = row.map(headerKey);
       return headers.includes(headerKey("Descrição Material"))
-        && (headers.includes(headerKey("Saldo Forn")) || headers.includes(headerKey("Qtd.pedido")));
+        && headers.some((value) => quantityHeaders.has(value));
     });
     if (header < 0) continue;
     return XLSX.utils.sheet_to_json<OperationalRow>(sheet, { range: header, defval: "" })

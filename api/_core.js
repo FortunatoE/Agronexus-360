@@ -2,6 +2,7 @@ import { neon } from "@neondatabase/serverless";
 import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { gunzipSync, gzipSync } from "node:zlib";
+import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "../lib/pending-order-fields.mjs";
 
 const scrypt = promisify(scryptCallback);
 let schemaReady;
@@ -167,7 +168,7 @@ const compactSources = {
   estoque: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"] },
   estoqueMb52: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"] },
   transito: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Quantidade", "Qtd.pedido", "Qtd pedido", "Saldo ajustado"] },
-  pedidos: { product: ["Descrição Material", "Descricao Material", "Produto solicitado", "Material solicitado", "Texto material", "Texto breve material"], quantity: ["Saldo Forn", "Saldo fornecedor", "Qtd.pedido", "Qtd pedido", "Volume solicitado", "Quantidade"] },
+  pedidos: { product: ["Descrição Material", "Descricao Material", "Produto solicitado", "Material solicitado", "Texto material", "Texto breve material"], quantity: pendingOrderQuantityAliases },
 };
 
 function compactHeader(value) {
@@ -212,6 +213,9 @@ function compactRow(row, source) {
   assign("ad", "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data"); assign("rd", "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Previsão de utilização", "Previsao de utilizacao");
   assign("or", "Pedido", "Nº pedido", "No pedido", "Documento", "Doc. compra", "Solicitação", "Solicitacao"); assign("ex", "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade");
   assign("va", "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque"); assign("el", "Eliminado?", "Eliminado", "Cancelado");
+  if (source === "pedidos") {
+    for (const { key, aliases } of Object.values(pendingOrderDetailFields)) assign(key, ...aliases);
+  }
   return compact;
 }
 
