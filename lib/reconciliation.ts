@@ -80,6 +80,14 @@ const quantityFields: Record<ProductSource, string[]> = {
   pending: ["Saldo Forn", "Saldo fornecedor", "Qtd.pedido", "Qtd pedido", "Volume solicitado", "Quantidade"],
 };
 
+const pendingOrderDetailFields = {
+  orderDate: { key: "od", aliases: ["Data Ped", "Dt. Ped", "Data pedido", "Dt. pedido", "Data do pedido", "Data de emissão", "Data do documento", "Data doc.", "Dt. doc.", "Data doc.compra"] },
+  item: { key: "oi", aliases: ["Item Ped", "Item do pedido", "Item"] },
+  ordered: { key: "oq", aliases: ["Qtd.pedido", "Qtde. pedido", "Quantidade do pedido", "Quantidade pedida", "Quantidade pedido"] },
+  delivered: { key: "dq", aliases: ["Qtd. entregue", "Qtde. entregue", "Quantidade entregue", "Qtde. Forn", "Qtd. Forn", "Qtde. fornecida", "Quantidade fornecida"] },
+  remaining: { key: "rq", aliases: ["Falta entregar", "Saldo Forn", "Saldo fornecedor", "Saldo fornecer", "Saldo a fornecer", "Quantidade em aberto"] },
+};
+
 export type CompactSource = ProductSource | "execution";
 
 /**
@@ -142,6 +150,9 @@ export function compactOperationalRow(row: OperationalRow, source: CompactSource
   assign("ex", "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade");
   assign("va", "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque");
   assign("el", "Eliminado?", "Eliminado", "Cancelado");
+  if (source === "pending") {
+    for (const { key, aliases } of Object.values(pendingOrderDetailFields)) assign(key, ...aliases);
+  }
   return compact;
 }
 
@@ -229,6 +240,26 @@ export function numberFrom(value: unknown) {
       : raw;
   const result = Number(normalized);
   return Number.isFinite(result) ? result : 0;
+}
+
+export function readPendingOrderDetails(row: OperationalRow) {
+  const field = (name: keyof typeof pendingOrderDetailFields) => {
+    const { key, aliases } = pendingOrderDetailFields[name];
+    return row._c === 1 ? row[key] : readValue(row, ...aliases);
+  };
+  const quantity = (value: unknown) => (
+    (typeof value === "number" ? Number.isFinite(value) : /\d/.test(String(value ?? ""))) ? numberFrom(value) : null
+  );
+  const ordered = quantity(field("ordered"));
+  const delivered = quantity(field("delivered"));
+  const remaining = quantity(field("remaining"));
+  return {
+    orderDate: String(field("orderDate") ?? "").trim(),
+    item: String(field("item") ?? "").trim(),
+    ordered: ordered ?? (delivered !== null && remaining !== null ? delivered + remaining : null),
+    delivered: delivered ?? (ordered !== null && remaining !== null && ordered >= remaining ? ordered - remaining : null),
+    remaining: remaining ?? (ordered !== null && delivered !== null ? Math.max(0, ordered - delivered) : null),
+  };
 }
 
 export function readNumber(row: OperationalRow, ...aliases: string[]) {

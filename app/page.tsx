@@ -2,6 +2,7 @@
 
 import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { buildCommercialClosingOverview, matchesCommercialClosing, resolveCommercialClosings } from "@/lib/commercial-closings";
+import { buildNotificationMailto, buildOutlookEml, buildTaskNotification, parseNotificationRecipients } from "@/lib/task-notification";
 import { base64ToBytes } from "@/lib/workspace-base64";
 import { CommercialClosingBalances } from "@/components/commercial-closing-balances";
 import { CommercialClosingCalendar, type ClosingCalendarPeriod } from "@/components/commercial-closing-calendar";
@@ -19,6 +20,7 @@ import {
   productFor,
   quantityFor,
   readNumber,
+  readPendingOrderDetails,
   readText,
   nucleusFor,
   stockLocationFor,
@@ -126,9 +128,11 @@ type PendingSignal = {
   dueDate: Date | null;
   daysUntil: number | null;
   material: string;
+  physicalMaterial: string;
   nucleus: string;
   quantity: number;
   reference: string;
+  row: Row;
   status: "Demanda próxima" | "Possível atraso" | "Ponto de atenção" | "Alerta" | "Programado" | "Sem data";
   tone: "emerald" | "sky" | "amber" | "rose" | "slate";
 };
@@ -783,10 +787,10 @@ export default function Home() {
   const [alertSubgroupFilter, setAlertSubgroupFilter] = useState("Todos");
   const [showNotification, setShowNotification] = useState(false);
   const [notificationNucleus, setNotificationNucleus] = useState("Todos");
-  const [notificationDays, setNotificationDays] = useState("5");
+  const [notificationDays, setNotificationDays] = useState("7");
   const [notificationTo, setNotificationTo] = useState("");
   const [notificationCc, setNotificationCc] = useState("");
-  const [notificationMessage, setNotificationMessage] = useState("");
+  const [notificationMessage, setNotificationMessage] = useState<{ text: string; success?: boolean } | null>(null);
   const [settingsTab, setSettingsTab] = useState<"premissas" | "email">("premissas");
   const [storageReady, setStorageReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
@@ -1061,6 +1065,7 @@ export default function Home() {
         standardProduct: dimension?.aggregateMaterial || product,
         active: dimension?.principleActive || "Não conciliado",
         supplier: readText(row, "Nome Fornecedor", "Fornecedor"),
+        row,
         dueDate: readText(row, "Vencimento"),
         unit: readText(row, "UMP", "Unidade") || "—",
         currency: headerKey(readText(row, "Moeda")) === "USD" ? "USD" as const : "BRL" as const,
@@ -1630,9 +1635,11 @@ export default function Home() {
       dueDate,
       daysUntil,
       material: product.canonicalName,
+      physicalMaterial: product.rawName,
       nucleus,
       quantity: standardQuantity(row, "pending", product, dimensions),
       reference,
+      row,
       ...signal,
     };
   }).sort((left, right) => (left.daysUntil ?? Number.MAX_SAFE_INTEGER) - (right.daysUntil ?? Number.MAX_SAFE_INTEGER)), [clock, dimensions, farmToNucleus, pendingOrders]);
@@ -1726,9 +1733,62 @@ export default function Home() {
       && (taskNucleusFilter === "Todos" || signal.nucleus === taskNucleusFilter)
       && (!materialSearch || normalizeMaterial(signal.material).includes(materialSearch)));
   }, [scopedPendingSignals, taskMaterialFilter, taskNucleusFilter, taskOrderFilter, taskSignalFilter]);
-  const notificationCandidates = useMemo(() => scopedPendingSignals.filter((signal) => signal.daysUntil !== null
-    && signal.daysUntil <= -Number(notificationDays || 0)
-    && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus)), [notificationDays, notificationNucleus, scopedPendingSignals]);
+  const notificationDraft = useMemo(() => {
+    if (!showNotification) return null;
+    const minimumDays = Number(notificationDays);
+    const candidates = scopedPendingSignals.filter((signal) => signal.daysUntil !== null
+      && signal.daysUntil <= -minimumDays
+      && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus));
+    if (!candidates.length) return null;
+
+    const orderKey = (reference: string, material: string) => `${normalizeMaterial(reference)}|${normalizeMaterial(material)}`;
+    const itemKey = (item: string) => normalizeMaterial(item).replace(/^0+(?=\d)/, "");
+    const purchaseLines = new Map<string, ReturnType<typeof readPendingOrderDetails>[]>();
+    for (const order of commercialOrders) {
+      const key = orderKey(order.orderNumber, order.product);
+      const details = readPendingOrderDetails(order.row);
+      const lines = purchaseLines.get(key);
+      if (lines) lines.push(details);
+      else purchaseLines.set(key, [details]);
+    }
+
+    const pendingLineCounts = new Map<string, number>();
+    for (const signal of pendingSignals) {
+      const key = orderKey(signal.reference, signal.physicalMaterial);
+      pendingLineCounts.set(key, (pendingLineCounts.get(key) ?? 0) + 1);
+    }
+    const dateFormatter = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
+    const rows = candidates.flatMap((signal) => {
+      const details = readPendingOrderDetails(signal.row);
+      const key = orderKey(signal.reference, signal.physicalMaterial);
+      const lines = purchaseLines.get(key) ?? [];
+      const matches = details.item
+        ? lines.filter((line) => itemKey(line.item) === itemKey(details.item))
+        : pendingLineCounts.get(key) === 1 ? lines : [];
+      const matched = matches.length === 1 ? matches[0] : undefined;
+      const remaining = details.remaining ?? matched?.remaining ?? null;
+      if (remaining !== null && remaining <= 0) return [];
+      const rawDate = details.orderDate || matched?.orderDate || "";
+      const orderDate = dateFromPlan(/^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? `${rawDate}T00:00:00` : rawDate);
+      return [{
+        orderDate: orderDate ? dateFormatter.format(orderDate) : "",
+        reference: signal.reference,
+        item: details.item || matched?.item || "",
+        material: signal.physicalMaterial,
+        nucleus: signal.nucleus,
+        ordered: details.ordered ?? matched?.ordered ?? null,
+        delivered: details.delivered ?? matched?.delivered ?? null,
+        remaining,
+      }];
+    });
+
+    return rows.length ? { ...buildTaskNotification(notificationNucleus, minimumDays, rows), count: rows.length } : null;
+  }, [commercialOrders, notificationDays, notificationNucleus, pendingSignals, scopedPendingSignals, showNotification]);
+  const notificationRecipients = parseNotificationRecipients(notificationTo);
+  const notificationCopy = parseNotificationRecipients(notificationCc);
+  const outlookDraftUrl = notificationDraft && notificationRecipients?.length && notificationCopy
+    ? buildNotificationMailto(notificationDraft.subject, notificationRecipients, notificationCopy)
+    : null;
 
   const supplyAlerts = useMemo<OperationalAlert[]>(() => {
     const start = startOfDay(new Date(clock));
@@ -2184,48 +2244,44 @@ export default function Home() {
     recordAudit("task", `Tarefa excluída: ${task.title}.`);
   }
   function openNotification() {
-    const firstNucleus = taskNuclei.length > 1 ? taskNuclei[1] : "Todos";
-    setNotificationNucleus(firstNucleus);
-    setNotificationTo(emailSettings.nucleusRecipients[firstNucleus] || "");
+    const nucleus = taskNucleusFilter !== "Todos" && taskNuclei.includes(taskNucleusFilter) ? taskNucleusFilter : taskNuclei[1] ?? "Todos";
+    setNotificationNucleus(nucleus);
+    setNotificationTo(emailSettings.nucleusRecipients[nucleus] || "");
     setNotificationCc(emailSettings.defaultCopy || "");
-    setNotificationMessage("");
+    setNotificationMessage(null);
     setShowNotification(true);
   }
-  function openOutlookDraft() {
-    if (!notificationTo.trim() || !notificationCandidates.length) {
-      setNotificationMessage("Informe o destinatário e selecione uma faixa que possua pedidos pendentes.");
+  async function copyNotificationBody() {
+    if (!notificationDraft) return;
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html": new Blob([notificationDraft.html], { type: "text/html" }),
+        "text/plain": new Blob([notificationDraft.text], { type: "text/plain" }),
+      })]);
+      setNotificationMessage({ text: "Corpo copiado. Cole com Ctrl+V no corpo da mensagem do Outlook.", success: true });
+    } catch {
+      setNotificationMessage({ text: "O navegador não permitiu copiar com formatação. Abra a prévia para copiar a mensagem ou baixe o arquivo .eml." });
+    }
+  }
+  function downloadNotificationDraft() {
+    if (!notificationRecipients?.length || !notificationCopy) {
+      setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." });
       return;
     }
-    setNotificationMessage("");
-    // Clientes MAPI, como o Outlook Classic, recebem o rascunho pelo protocolo
-    // MAILTO. Limitamos o texto para evitar que uma lista muito grande exceda
-    // o tamanho aceito pelo Windows e impeça a abertura do OUTLOOK.EXE.
-    const maxNotices = 25;
-    const notices = notificationCandidates.slice(0, maxNotices).map((signal) => [
-      `Pedido: ${signal.reference}`,
-      `Material: ${signal.material}`,
-      `Núcleo: ${signal.nucleus}`,
-      `Previsão: ${signal.dueDate ? new Intl.DateTimeFormat("pt-BR").format(signal.dueDate) : "Sem data"}`,
-      `Atraso: ${signal.daysUntil === null ? "Sem cálculo" : `${Math.abs(signal.daysUntil)} dia(s)`}`,
-      `Volume solicitado: ${formatNumber(signal.quantity)}`,
-    ].join("\n")).join("\n\n");
-    const remaining = notificationCandidates.length - maxNotices;
-    const params = new URLSearchParams({
-      subject: `AgroNexus | pedidos pendentes — ${notificationNucleus}`,
-      body: `Pedidos pendentes com atenção\n\nNúcleo: ${notificationNucleus}\nAtrasos a partir de: ${notificationDays} dia(s)\n\n${notices}${remaining > 0 ? `\n\n+ ${remaining} pedido(s) adicionais. Consulte a exportação da guia Tarefas para a relação completa.` : ""}\n\nMensagem preparada pelo AgroNexus 360.`,
-    });
-    if (notificationCc.trim()) params.set("cc", notificationCc.trim());
-    const recipients = notificationTo.trim().split(/[;,]/).map((item) => item.trim()).filter(Boolean).join(";");
-    const mailto = `mailto:${recipients}?${params.toString()}`;
-    // Um clique em âncora preserva o gesto do usuário e aciona o handler
-    // MAILTO do Windows — o caminho suportado para o Outlook Classic.
+    if (!notificationDraft) return;
+
+    const url = URL.createObjectURL(new Blob([
+      buildOutlookEml(notificationDraft, notificationRecipients, notificationCopy),
+    ], { type: "message/rfc822" }));
     const launcher = document.createElement("a");
-    launcher.href = mailto;
-    launcher.style.display = "none";
+    launcher.href = url;
+    launcher.download = "controle-de-pedidos.eml";
+    launcher.hidden = true;
     document.body.appendChild(launcher);
     launcher.click();
     launcher.remove();
-    setNotificationMessage("Rascunho aberto pelo protocolo MAILTO no Outlook Classic. Revise e envie quando desejar.");
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setNotificationMessage({ text: "Rascunho preparado. Abra o arquivo .eml no Outlook para revisar.", success: true });
   }
   async function exportTasks() {
     const XLSX = await loadXlsx();
@@ -2882,7 +2938,77 @@ export default function Home() {
 
   return <main className="app-shell min-h-screen bg-[#f2f5ef] text-slate-900" data-theme={dark ? "dark" : "light"}><Navigation active={active} alertCount={operationalAlerts.length + farol.alert} lastUpdatedAt={latestDataUpdate} onSelect={setActive} /><div className="lg:pl-[264px]"><header className="command-header sticky top-0 z-10 flex min-h-[64px] items-center justify-between gap-3 border-b border-emerald-950/10 bg-[#f8faf6]/95 px-4 py-2.5 lg:min-h-[72px] lg:px-9"><div className="flex min-w-0 items-center gap-2"><button aria-label="Abrir menu" className="grid h-11 w-11 shrink-0 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700 lg:hidden" onClick={() => setShowMobileNav(true)} type="button"><Menu className="h-5 w-5" /></button><div className="min-w-0"><p className="truncate text-sm font-bold text-slate-900">{active}</p><p className="mt-0.5 truncate text-xs font-medium text-slate-500">Safra 2026/2027 · {hasData ? "base operacional ativa" : "base ainda não carregada"}</p></div></div><div className="flex shrink-0 items-center gap-2"><button aria-label="Alternar modo de cor" className="grid h-11 w-11 place-items-center rounded-xl border border-slate-200 bg-white text-slate-700 transition hover:border-emerald-400 hover:text-emerald-800" onClick={toggleTheme} type="button">{dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}</button><button aria-label="Abrir premissas" className="inline-flex h-11 items-center gap-2 rounded-xl border border-slate-300 bg-white px-3 text-sm font-bold text-slate-700 transition hover:border-emerald-500 hover:text-emerald-800" onClick={() => setShowPremises(true)} type="button"><SlidersHorizontal className="h-4 w-4" /><span className="hidden sm:inline">Premissas</span></button></div></header><div className="mx-auto max-w-[1540px] px-4 py-6 pb-24 sm:px-5 sm:py-7 lg:px-9 lg:py-9 lg:pb-9"><section className="page-intro mb-7 flex flex-wrap items-end justify-between gap-3 sm:mb-8 sm:gap-4"><div><h1 className="text-[1.75rem] font-bold tracking-tight text-emerald-950 sm:text-4xl">{active}</h1>{active !== "Fechamentos" ? <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-600">{hasData ? "Dados carregados, conciliados e prontos para leitura operacional." : "Importe as fontes para ativar a leitura operacional e a conciliação de materiais."}</p> : null}</div>{active !== "Fechamentos" ? <div className={cn("rounded-xl border px-3 py-2 text-xs font-bold", hasData ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-amber-200 bg-amber-50 text-amber-900")}>{hasData ? "Base pronta para análise" : "Aguardando fontes"}</div> : null}</section>{content}</div></div><nav aria-label="Atalhos principais" className="fixed inset-x-0 bottom-0 z-30 grid grid-cols-5 border-t border-emerald-950/10 bg-white/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 lg:hidden">{[nav[0], nav[1], nav[2], nav[4]].map(([label, Icon]) => <button className={cn("grid min-h-12 place-items-center gap-1 rounded-lg px-1 text-[10px] font-bold", active === label ? "bg-emerald-800 text-white" : "text-slate-600")} key={label} onClick={() => setActive(label)} type="button"><Icon className="h-4 w-4" /><span className="max-w-full truncate">{label}</span></button>)}<button className="grid min-h-12 place-items-center gap-1 rounded-lg px-1 text-[10px] font-bold text-slate-600" onClick={() => setShowMobileNav(true)} type="button"><Menu className="h-4 w-4" /><span>Mais</span></button></nav>{showMobileNav ? <div aria-modal="true" className="fixed inset-0 z-50 flex items-end bg-emerald-950/40 p-3 lg:hidden" role="dialog"><div className="w-full rounded-2xl bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))]"><div className="mb-3 flex items-center justify-between"><div><h2 className="text-lg font-bold">Navegação</h2><p className="text-xs text-slate-500">Acesse todas as áreas operacionais.</p></div><button aria-label="Fechar menu" className="grid h-11 w-11 place-items-center rounded-xl border border-slate-200" onClick={() => setShowMobileNav(false)} type="button"><X className="h-5 w-5" /></button></div><div className="grid grid-cols-2 gap-2">{nav.map(([label, Icon]) => <button className={cn("flex min-h-12 items-center gap-3 rounded-xl border px-3 text-left text-sm font-bold", active === label ? "border-emerald-700 bg-emerald-50 text-emerald-950" : "border-slate-200 text-slate-700")} key={label} onClick={() => { setActive(label); setShowMobileNav(false); }} type="button"><Icon className="h-4 w-4" />{label}</button>)}</div></div></div> : null}
 
-    {showNotification ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="w-full max-w-2xl rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Notificar pedidos pendentes</h2><p className="mt-1 text-xs text-slate-500">O Outlook abrirá um rascunho com os pedidos da faixa selecionada para o núcleo.</p></div><button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X className="h-4 w-4" /></button></div><div className="grid gap-4 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Núcleo<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => { const nucleus = event.target.value; setNotificationNucleus(nucleus); setNotificationTo(emailSettings.nucleusRecipients[nucleus] || ""); }} value={notificationNucleus}><option>Todos</option>{taskNuclei.filter((nucleus) => nucleus !== "Todos").map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1.5 text-sm font-medium">Notificar atrasos a partir de<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationDays(event.target.value)} value={notificationDays}><option value="1">1 dia</option><option value="3">3 dias</option><option value="5">5 dias</option><option value="10">10 dias</option></select></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Para<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationTo(event.target.value)} placeholder="responsavel@empresa.com" value={notificationTo} /></label><label className="grid gap-1.5 text-sm font-medium sm:col-span-2">Cópia (CC)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@empresa.com" value={notificationCc} /></label></div><div className="border-t border-slate-100 px-6 py-4"><div className="rounded-xl bg-amber-50 px-4 py-3 text-sm text-amber-950"><strong>{notificationCandidates.length} pedido(s)</strong> serão incluídos no rascunho. Revise os destinatários e o conteúdo antes de enviar no Outlook.</div>{notificationMessage ? <p className={cn("mt-3 text-sm", notificationMessage.startsWith("Rascunho aberto") ? "text-emerald-700" : "text-rose-700")}>{notificationMessage}</p> : null}<div className="mt-4 flex justify-end gap-2"><button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button><button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationCandidates.length} onClick={openOutlookDraft} type="button">Abrir rascunho no Outlook</button></div></div></div></div> : null}
+    {showNotification ? (
+      <div aria-labelledby="task-notification-title" aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog">
+        <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
+          <div className="flex items-center justify-between border-b border-slate-100 px-6 py-5">
+            <h2 className="font-semibold" id="task-notification-title">Notificar pedidos pendentes</h2>
+            <button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X aria-hidden="true" className="h-4 w-4" /></button>
+          </div>
+          <div className="grid gap-4 p-6 sm:grid-cols-2">
+            <label className="grid gap-1.5 text-sm font-medium">
+              Núcleo
+              <select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => {
+                const nucleus = event.target.value;
+                setNotificationNucleus(nucleus);
+                setNotificationTo(emailSettings.nucleusRecipients[nucleus] || "");
+                setNotificationMessage(null);
+              }} value={notificationNucleus}>
+                {taskNuclei.map((nucleus) => <option key={nucleus}>{nucleus}</option>)}
+              </select>
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium">
+              Atraso a partir de
+              <select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => {
+                setNotificationDays(event.target.value);
+                setNotificationMessage(null);
+              }} value={notificationDays}>
+                {[1, 3, 5, 7, 10].map((days) => <option key={days} value={days}>{days} {days === 1 ? "dia" : "dias"}</option>)}
+              </select>
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium sm:col-span-2">
+              Para
+              <input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationTo(event.target.value)} placeholder="responsavel@empresa.com" value={notificationTo} />
+            </label>
+            <label className="grid gap-1.5 text-sm font-medium sm:col-span-2">
+              Cópia (CC)
+              <input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@empresa.com" value={notificationCc} />
+            </label>
+            {notificationDraft ? (
+              <details className="rounded-xl border border-slate-200 p-3 sm:col-span-2">
+                <summary className="cursor-pointer text-sm font-semibold">Prévia do e-mail</summary>
+                <p className="mt-2 text-sm">{notificationDraft.subject}</p>
+                <iframe className="mt-2 h-72 w-full rounded-lg bg-white" sandbox="" srcDoc={notificationDraft.html} title="Corpo do e-mail de pedidos pendentes" />
+              </details>
+            ) : null}
+          </div>
+          <div className="border-t border-slate-100 px-6 py-4">
+            <p className="text-sm text-slate-600">{notificationDraft
+              ? `${notificationDraft.count} ${notificationDraft.count === 1 ? "linha de pedido no rascunho" : "linhas de pedido no rascunho"}.`
+              : "Nenhum pedido pendente na faixa e no núcleo selecionados."}</p>
+            {notificationDraft ? <p className="mt-1 text-xs text-slate-500">Copie o corpo formatado, abra o Outlook clássico e cole com Ctrl+V.</p> : null}
+            {notificationMessage ? <p className={cn("mt-2 text-sm", notificationMessage.success ? "text-emerald-800" : "text-rose-700")} role="status">{notificationMessage.text}</p> : null}
+            <div className="mt-4 flex flex-wrap justify-end gap-2">
+              <button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button>
+              <button className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 disabled:opacity-50" disabled={!notificationDraft} onClick={downloadNotificationDraft} type="button">Baixar .eml</button>
+              <button className="rounded-xl border border-emerald-700 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50" disabled={!notificationDraft} onClick={() => void copyNotificationBody()} type="button">Copiar corpo formatado</button>
+              {outlookDraftUrl ? (
+                <a
+                  className="inline-flex items-center rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white"
+                  href={outlookDraftUrl}
+                  onClick={() => setNotificationMessage({
+                    text: "Se a mensagem não abrir, defina Outlook (clássico) como aplicativo padrão para MAILTO no Windows. Você também pode abrir uma nova mensagem no Outlook e colar o corpo copiado.",
+                    success: true,
+                  })}
+                >Abrir Outlook clássico</a>
+              ) : (
+                <button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationDraft} onClick={() => setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." })} type="button">Abrir Outlook clássico</button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
 
     {showProvision ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4" role="dialog"><div className="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><div className="flex items-center justify-between border-b border-slate-100 px-6 py-5"><div><h2 className="font-semibold">Provisionamento micro</h2><p className="mt-1 text-xs text-slate-500">As linhas abaixo detalham fazenda, armazém, trânsito e pedidos pendentes do mesmo material.</p></div><div className="flex items-center gap-2"><button className="inline-flex items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-700" onClick={exportProvision} type="button"><Download className="h-4 w-4" />Exportar Excel</button><button aria-label="Fechar provisionamento" className="p-2 text-slate-500" onClick={() => setShowProvision(false)} type="button"><X className="h-4 w-4" /></button></div></div><div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2"><label className="grid gap-1.5 text-sm font-medium">Início<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setEvaluationDate(event.target.value)} type="date" value={evaluationDate} /></label><label className="grid gap-1.5 text-sm font-medium">Fim<input className="rounded-lg border border-slate-200 px-3 py-2" onChange={(event) => setProvisionUntil(event.target.value)} type="date" value={provisionUntil} /></label></div><div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5"><Card label="Demanda" value={formatNumber(provision.demand)} /><Card label="Saldo em fazenda" value={formatNumber(provision.farm)} /><Card label="Trânsito" value={formatNumber(provision.transit)} /><Card label="Volume solicitado" value={formatNumber(provision.pendingOrder)} note="pedidos pendentes" /><Card label="Apoio do armazém" value={formatNumber(provision.warehouse)} note="saldo central compartilhado" /></div><p className="px-6 py-3 text-xs text-slate-500">{provision.dated ? "A demanda foi filtrada por DT_Aplicacao do planejamento." : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}</p><div className="min-h-0 flex-1 overflow-auto border-t border-slate-100"><table className="w-full min-w-[1180px] text-left text-sm"><thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500"><tr>{["Núcleo", "Princípio ativo", "Material padrão", "Demanda", "Saldo", "Trânsito", "V. solicitado", "Situação"].map((head) => <th className="px-4 py-3 font-semibold" key={head}>{head}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{provision.rows.map((row) => <Fragment key={row.id}><tr><td className="px-4 py-3 font-medium">{row.nucleus}</td><td className="px-4 py-3">{row.active}</td><td className="px-4 py-3 font-medium">{row.standardMaterial}</td><td className="px-4 py-3">{formatNumber(row.demand)}</td><td className="px-4 py-3">{formatNumber(row.farmBalance)}</td><td className="px-4 py-3">{formatNumber(row.transit)}</td><td className="px-4 py-3 font-semibold text-emerald-700">{formatNumber(row.pendingOrder)}</td><td className={cn("px-4 py-3 font-semibold", row.status === "Falta" ? "text-rose-700" : "text-emerald-700")}>{row.status}</td></tr>{[...row.locations.filter((location) => location.type !== "Armazém"), ...row.warehouseLocations].map((location, index) => <tr className="bg-slate-50/70 text-xs" key={row.id + "|" + location.type + "|" + location.location + "|" + String(index)}><td className="py-2 pl-8 pr-4 text-slate-500">{location.type}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.location}</td><td className="px-4 py-2 text-slate-500" colSpan={2}>{location.material}</td><td className="px-4 py-2 font-medium">{formatNumber(location.amount)}</td><td className="px-4 py-2 text-slate-400">—</td><td className="px-4 py-2 text-slate-500">{location.type === "Armazém" ? "Apoio possível" : "Saldo localizado"}</td></tr>)}</Fragment>)}{!provision.rows.length ? <tr><td className="px-4 py-10 text-center text-slate-500" colSpan={8}>Não há demanda planejada para esta janela.</td></tr> : null}</tbody></table></div></div></div> : null}
 
