@@ -68,6 +68,7 @@ type LogisticsTripItem = {
 type LogisticsRequestLine = {
   active: string; id: string; lot: string; product: string; productCode: string;
   quantity: number; standardProduct: string; unit: string;
+  planningDate?: string; daysBeforePlanning?: number | null; plannedUntilRequest?: number; planningStatus?: string;
 };
 type LogisticsRequest = {
   date: string; destination: string; destinationCode: string; id: string; requestNumber: string;
@@ -397,6 +398,21 @@ function dateFromPlan(value: unknown) {
   }
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function logisticsDimensionFor(value: string, bundle: DimensionBundle) {
+  const key = normalizeMaterial(value);
+  if (!key) return undefined;
+  const exact = bundle.materials[key];
+  if (exact) return exact;
+  // O WebAgil pode trazer a apresentação completa (por exemplo, PRETORIAN
+  // 240 SC 4X5L) enquanto a dimensão está cadastrada como PRETORIAN.
+  // Usa somente um nome de dimensão com tamanho suficiente, escolhendo o
+  // mais específico, para não transformar códigos SAP em chave de negócio.
+  const matches = Object.entries(bundle.materials)
+    .filter(([candidate]) => candidate.length >= 5 && key.includes(candidate))
+    .sort(([left], [right]) => right.length - left.length);
+  return matches[0]?.[1];
 }
 
 async function parseImportFile(file: File, source: Pick<(typeof sourceConfig)[number], "key" | "header">) {
@@ -1713,10 +1729,49 @@ export default function Home() {
     });
     return [...values.values()].sort((left, right) => right.id.localeCompare(left.id, "pt-BR", { numeric: true }));
   }, [datasets.solicitacoesWeb, dimensions]);
+  const logisticsPlanningContext = useMemo(() => {
+    type PlannedDemand = { date: Date; quantity: number };
+    type PlanningContext = { daysBeforePlanning: number | null; planningDate: Date | null; plannedUntilRequest: number; planningStatus: string; priority: number; requestedAt: Date | null };
+    const schedules = new Map<string, PlannedDemand[]>();
+    plans.forEach((row) => {
+      const product = productFor(row, "planning", dimensions);
+      const nucleus = planningNucleusFor(row, dimensions, farmToNucleus);
+      const date = dateFromPlan(readText(row, "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data"));
+      if (!date || !product.canonicalKey || !nucleus) return;
+      const key = `${product.canonicalKey}|${normalizeMaterial(nucleus)}`;
+      const values = schedules.get(key) || [];
+      values.push({ date, quantity: standardQuantity(row, "planning", product, dimensions) });
+      schedules.set(key, values);
+    });
+    schedules.forEach((rows) => rows.sort((left, right) => left.date.getTime() - right.date.getTime()));
+    const values = new Map<string, PlanningContext>();
+    pendingSignals.forEach((signal) => {
+      const product = productFor(signal.row, "pending", dimensions);
+      const key = `${product.canonicalKey}|${normalizeMaterial(signal.nucleus)}`;
+      const schedule = schedules.get(key) || [];
+      const requestedAt = dateFromPlan(readText(signal.row, "Data pedido", "Dt. pedido", "Dt pedido", "Data solicitação", "Data solicitacao", "Criado em", "Data criação", "Data criacao"));
+      const next = signal.dueDate ? schedule.find((item) => item.date >= signal.dueDate!) || null : schedule[0] || null;
+      const previous = signal.dueDate ? [...schedule].reverse().find((item) => item.date < signal.dueDate!) || null : null;
+      const planningDate = next?.date || previous?.date || null;
+      const daysBeforePlanning = signal.dueDate && planningDate ? daysFromToday(planningDate, signal.dueDate) : null;
+      const plannedUntilRequest = signal.dueDate
+        ? schedule.filter((item) => item.date <= signal.dueDate!).reduce((sum, item) => sum + item.quantity, 0)
+        : 0;
+      const planningStatus = !planningDate ? "Sem data planejada"
+        : daysBeforePlanning! < 0 ? "Planejamento já iniciado"
+          : daysBeforePlanning! < 5 ? "Antecedência curta"
+            : daysBeforePlanning! <= 15 ? "Janela adequada"
+              : "Antecedência longa";
+      const priority = !planningDate ? 4 : daysBeforePlanning! < 0 ? 0 : daysBeforePlanning! < 5 ? 1 : daysBeforePlanning! <= 15 ? 2 : 3;
+      values.set(signal.id, { daysBeforePlanning, planningDate, plannedUntilRequest, planningStatus, priority, requestedAt });
+    });
+    return values;
+  }, [dimensions, farmToNucleus, pendingSignals, plans]);
   const logisticsRequests = useMemo<LogisticsRequest[]>(() => {
-    const values = new Map<string, LogisticsRequest>();
+    const values = new Map<string, LogisticsRequest & { priority: number; requestedAt: Date | null }>();
     pendingSignals.forEach((signal) => {
       const key = `sap|${signal.id}`;
+      const planning = logisticsPlanningContext.get(signal.id);
       const current = values.get(key) || {
         date: signal.dueDate ? dateKey(signal.dueDate) : "",
         destination: signal.nucleus || "Destino não informado",
@@ -1726,9 +1781,11 @@ export default function Home() {
         sourceWarehouse: "",
         status: "Pendente SAP",
         lines: [],
+        priority: planning?.priority || 4,
+        requestedAt: planning?.requestedAt || signal.dueDate,
       };
-      const dimension = dimensions.materials[normalizeMaterial(signal.physicalMaterial)]
-        || dimensions.materials[normalizeMaterial(signal.material)];
+      const dimension = logisticsDimensionFor(signal.physicalMaterial, dimensions)
+        || logisticsDimensionFor(signal.material, dimensions);
       current.lines.push({
         id: key,
         active: dimension?.principleActive || "Não conciliado",
@@ -1738,11 +1795,17 @@ export default function Home() {
         quantity: signal.quantity,
         standardProduct: signal.material,
         unit: readText(signal.row, "UMB", "UM", "Unidade", "Und") || "UN",
+        planningDate: planning?.planningDate ? dateKey(planning.planningDate) : "",
+        daysBeforePlanning: planning?.daysBeforePlanning ?? null,
+        plannedUntilRequest: planning?.plannedUntilRequest || 0,
+        planningStatus: planning?.planningStatus || "Sem data planejada",
       });
       values.set(key, current);
     });
-    return [...values.values()].sort((left, right) => left.requestNumber.localeCompare(right.requestNumber, "pt-BR", { numeric: true }));
-  }, [dimensions, pendingSignals]);
+    return [...values.values()].sort((left, right) => left.priority - right.priority
+      || (left.requestedAt?.getTime() || Number.MAX_SAFE_INTEGER) - (right.requestedAt?.getTime() || Number.MAX_SAFE_INTEGER)
+      || left.requestNumber.localeCompare(right.requestNumber, "pt-BR", { numeric: true }));
+  }, [dimensions, logisticsPlanningContext, pendingSignals]);
   const dispatchedByRequestLine = useMemo(() => {
     const values = new Map<string, number>();
     logistics.trips.flatMap(logisticsTripItems).forEach((item) => {
@@ -1756,8 +1819,8 @@ export default function Home() {
   const selectedLogisticsLine = selectedLogisticsRequest?.lines.find((line) => line.id === tripMaterialKey) || null;
   const selectedLineRemaining = selectedLogisticsLine ? Math.max(0, selectedLogisticsLine.quantity - (dispatchedByRequestLine.get(selectedLogisticsLine.id) || 0)) : 0;
   const webStockOptions = useMemo(() => datasets.estoqueWeb.map((row, index) => {
-    const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto", "INSUMO WEB", "Insumo Web", "INSUMO SAP", "Insumo SAP");
-    const dimension = dimensions.materials[normalizeMaterial(product)];
+    const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto", "INSUMO WEB", "Insumo Web", "INSUMO SAP", "Insumo SAP", "Produto Web", "Material Web", "Descrição material", "Descricao material");
+    const dimension = logisticsDimensionFor(product, dimensions);
     const balance = readNumber(row, "Saldo", "QTD", "Qtd", "Quantidade", "Qt. Disponível", "Qt Disponivel");
     const warehouse = readText(row, "Nome Op. Logístico", "Nome Op. Logistico", "Armazém", "Armazem", "AG", "Centro", "CEN") || "Armazém não identificado";
     return {
@@ -1782,6 +1845,8 @@ export default function Home() {
     const linkedWebProduct = normalizeMaterial(logistics.webMaterialLinks?.[requestedProduct]);
     return webStockOptions.filter((stock) => normalizeMaterial(stock.product) === requestedProduct
       || normalizeMaterial(stock.standardProduct) === requestedStandard
+      || (requestedProduct.length >= 5 && normalizeMaterial(stock.product).includes(requestedProduct))
+      || (requestedStandard.length >= 5 && normalizeMaterial(stock.product).includes(requestedStandard))
       || (linkedWebProduct && normalizeMaterial(stock.product) === linkedWebProduct)
       || (requestedActive && requestedActive !== "NAOCONCILIADO" && normalizeMaterial(stock.active) === requestedActive));
   }, [logistics.webMaterialLinks, selectedLogisticsLine, webStockOptions]);
@@ -2156,6 +2221,16 @@ export default function Home() {
     if (logistics.trips.some((trip) => trip.vehicleId === vehicle.id)) { setLogisticsMessage("Este veículo já está vinculado a uma viagem e não pode ser excluído."); return; }
     setLogistics((current) => ({ ...current, vehicles: current.vehicles.filter((item) => item.id !== vehicle.id) }));
     recordAudit("workspace", `Veículo removido: ${vehicle.plate}.`);
+  }
+  function selectLogisticsRequest(id: string) {
+    const request = logisticsRequests.find((item) => item.id === id);
+    const line = request?.lines[0];
+    const remaining = line ? Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0)) : 0;
+    setTripRequestId(id);
+    setTripMaterialKey(line?.id || "");
+    setTripFulfillmentStockId("");
+    setTripCollectionId("");
+    setTripQuantity(remaining ? String(remaining) : "");
   }
   function addRouteItem() {
     if (!selectedRouteItem) { setLogisticsMessage("Selecione um pedido SAP e um material para adicionar à rota."); return; }
@@ -3063,12 +3138,13 @@ export default function Home() {
 
       {logisticsTab === "emissao" ? <section className="space-y-5">
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Card label="Pedidos SAP disponíveis" value={logisticsRequests.length} note="com saldo restante para expedição" /><Card label="Saldo pendente" value={selectedLogisticsLine ? formatNumber(selectedLineRemaining) : "—"} note={selectedLogisticsLine ? `${selectedLogisticsLine.product} ainda a expedir` : "selecione um pedido SAP"} tone={selectedLogisticsLine && !selectedLineRemaining ? "slate" : "emerald"} /><Card label="Saldo na origem" value={selectedLogisticsLine ? formatNumber(selectedSourceBalance) : "—"} note={tripSourceMode === "coleta" ? "fazenda selecionada para coleta" : "Estoque webAgil"} tone={selectedLogisticsLine && selectedSourceBalance < selectedLineRemaining ? "amber" : "emerald"} /><Card label="Viagens emitidas" value={logistics.trips.length} note="salvas na base central" /></div>
+        <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="flex flex-wrap items-end justify-between gap-3 border-b border-slate-100 px-5 py-4"><div><h3 className="font-semibold">Fila de expedição SAP</h3><p className="mt-1 text-xs text-slate-500">Prioriza a urgência da janela planejada e, no mesmo nível, os pedidos mais antigos. A janela adequada é de 5 a 15 dias de antecedência.</p></div><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-800">{logisticsRequests.length} pedido(s)</span></div><Table empty="Nenhum pedido pendente SAP disponível." headers={["Pedido / material", "Núcleo", "Data solicitada", "Janela planejada", "Planejado até a data", "Pedido", "Ação"]} rows={logisticsRequests.slice(0, 30).map((request) => { const line = request.lines[0]; const timing = line?.daysBeforePlanning; const timingLabel = line?.planningDate ? `${line.planningStatus} · ${timing !== null && timing !== undefined ? timing >= 0 ? `${timing} dia(s) antes` : `${Math.abs(timing)} dia(s) após` : "sem cálculo"}` : "Sem data planejada"; return [<span key={`${request.id}-material`}><strong>{request.requestNumber}</strong><small className="mt-1 block text-slate-500">{line?.product || "Material não identificado"}</small></span>, request.destination || "Sem núcleo", request.date ? new Intl.DateTimeFormat("pt-BR").format(new Date(`${request.date}T00:00:00`)) : "Sem data", <span className={cn("font-semibold", line?.planningStatus === "Janela adequada" ? "text-emerald-700" : line?.planningStatus === "Planejamento já iniciado" || line?.planningStatus === "Antecedência curta" ? "text-rose-700" : "text-amber-800")} key={`${request.id}-timing`}>{timingLabel}<small className="mt-1 block font-normal text-slate-500">{line?.planningDate ? `Aplicação ${new Intl.DateTimeFormat("pt-BR").format(new Date(`${line.planningDate}T00:00:00`))}` : "Cadastre a data no planejamento"}</small></span>, formatNumber(line?.plannedUntilRequest || 0), `${formatNumber(line?.quantity || 0)} ${line?.unit || ""}`, <button className="rounded-lg border border-emerald-700 px-3 py-1.5 text-xs font-bold text-emerald-700" key={`${request.id}-select`} onClick={() => selectLogisticsRequest(request.id)} type="button">Planejar rota</button>]; })} /></section>
         <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           <div><h3 className="font-semibold">Planejamento da rota</h3><p className="mt-1 text-xs text-slate-500">A rota nasce do saldo restante do pedido pendente SAP. Vincule o material físico do Estoque webAgil, faça coleta entre fazendas quando necessário e valide a capacidade antes da emissão. A solicitação WebAgil é vinculada somente após a criação da rota.</p></div>
           <div className="mt-5 grid gap-4 lg:grid-cols-2">
-            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Pedido pendente SAP<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!logisticsRequests.length} onChange={(event) => { setTripRequestId(event.target.value); setTripMaterialKey(""); setTripFulfillmentStockId(""); setTripCollectionId(""); setTripQuantity(""); }} value={tripRequestId}><option value="">Selecione o pedido SAP</option>{logisticsRequests.map((request) => <option key={request.id} value={request.id}>{request.requestNumber} · {request.destination || "Destino não informado"} · {request.lines.length} material(is)</option>)}</select></label>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Pedido pendente SAP<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!logisticsRequests.length} onChange={(event) => selectLogisticsRequest(event.target.value)} value={tripRequestId}><option value="">Selecione o pedido SAP</option>{logisticsRequests.map((request) => { const line = request.lines[0]; const timing = line?.daysBeforePlanning; const window = line?.planningDate ? `${timing !== null && timing !== undefined ? timing >= 0 ? `${timing}d antes` : `${Math.abs(timing)}d após` : "sem cálculo"} · ${line.planningStatus}` : "sem data planejada"; return <option key={request.id} value={request.id}>{request.requestNumber} · {request.destination || "Destino não informado"} · {line?.product || "Material"} · {window}</option>; })}</select></label>
             <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Material solicitado no SAP<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!selectedLogisticsRequest} onChange={(event) => { const line = selectedLogisticsRequest?.lines.find((item) => item.id === event.target.value); const pending = line ? Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0)) : 0; setTripMaterialKey(event.target.value); setTripFulfillmentStockId(""); setTripCollectionId(""); setTripQuantity(pending ? String(pending) : ""); }} value={tripMaterialKey}><option value="">Selecione o material</option>{selectedLogisticsRequest?.lines.map((line) => { const pending = Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0)); return <option disabled={!pending} key={line.id} value={line.id}>{line.product} · saldo {formatNumber(pending)} {line.unit}</option>; })}</select></label>
-            {selectedLogisticsLine ? <div className="rounded-xl border border-sky-200 bg-sky-50 p-4 lg:col-span-2"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-sky-800">Necessidade da fazenda</p><p className="mt-1 font-semibold text-slate-900">{selectedDestinationNucleus} · {selectedLogisticsLine.standardProduct}</p><p className="mt-1 text-xs text-slate-600">Saldo pendente do pedido SAP: <strong>{formatNumber(selectedLineRemaining)} {selectedLogisticsLine.unit}</strong> · Necessidade conciliada: <strong>{formatNumber(selectedFarmPlan)}</strong>.</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-sky-800">Ativo: {selectedLogisticsLine.active}</span></div></div> : null}
+            {selectedLogisticsLine ? <div className="rounded-xl border border-sky-200 bg-sky-50 p-4 lg:col-span-2"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-sky-800">Necessidade da fazenda</p><p className="mt-1 font-semibold text-slate-900">{selectedDestinationNucleus} · {selectedLogisticsLine.standardProduct}</p><p className="mt-1 text-xs text-slate-600">Saldo pendente do pedido SAP: <strong>{formatNumber(selectedLineRemaining)} {selectedLogisticsLine.unit}</strong> · Necessidade conciliada: <strong>{formatNumber(selectedFarmPlan)}</strong>.</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-sky-800">Ativo: {selectedLogisticsLine.active}</span></div><div className="mt-3 grid gap-2 border-t border-sky-200 pt-3 text-sm sm:grid-cols-3"><div><p className="text-[11px] font-bold uppercase tracking-wide text-sky-800">Janela de aplicação</p><p className={cn("mt-1 font-semibold", selectedLogisticsLine.planningStatus === "Janela adequada" ? "text-emerald-700" : selectedLogisticsLine.planningStatus === "Planejamento já iniciado" || selectedLogisticsLine.planningStatus === "Antecedência curta" ? "text-rose-700" : "text-amber-800")}>{selectedLogisticsLine.planningDate ? `${selectedLogisticsLine.planningStatus} · ${selectedLogisticsLine.daysBeforePlanning !== null && selectedLogisticsLine.daysBeforePlanning !== undefined ? selectedLogisticsLine.daysBeforePlanning >= 0 ? `${selectedLogisticsLine.daysBeforePlanning} dia(s) antes` : `${Math.abs(selectedLogisticsLine.daysBeforePlanning)} dia(s) após` : "sem cálculo"}` : "Sem data planejada"}</p><p className="mt-0.5 text-xs text-slate-600">{selectedLogisticsLine.planningDate ? `Aplicação prevista: ${new Intl.DateTimeFormat("pt-BR").format(new Date(`${selectedLogisticsLine.planningDate}T00:00:00`))}` : "Inclua a data de aplicação no planejamento."}</p></div><div><p className="text-[11px] font-bold uppercase tracking-wide text-sky-800">Planejado até a data solicitada</p><p className="mt-1 font-semibold text-slate-900">{formatNumber(selectedLogisticsLine.plannedUntilRequest || 0)} {selectedLogisticsLine.unit}</p><p className="mt-0.5 text-xs text-slate-600">Simulação acumulada do planejamento até {selectedLogisticsRequest?.date ? new Intl.DateTimeFormat("pt-BR").format(new Date(`${selectedLogisticsRequest.date}T00:00:00`)) : "a data solicitada"}.</p></div><div><p className="text-[11px] font-bold uppercase tracking-wide text-sky-800">Leitura operacional</p><p className="mt-1 font-semibold text-slate-900">{selectedLogisticsLine.planningStatus === "Janela adequada" ? "Prazo adequado" : selectedLogisticsLine.planningStatus === "Antecedência curta" ? "Priorizar expedição" : selectedLogisticsLine.planningStatus === "Planejamento já iniciado" ? "Demanda em atraso" : "Avaliar programação"}</p><p className="mt-0.5 text-xs text-slate-600">Faixa recomendada: pedido entre 5 e 15 dias antes da aplicação.</p></div></div></div> : null}
             <fieldset className="grid gap-2 rounded-xl border border-slate-200 p-3 lg:col-span-2"><legend className="px-1 text-xs font-bold uppercase tracking-wide text-slate-500">Origem da carga</legend><div className="flex flex-wrap gap-3 text-sm"><label className="inline-flex items-center gap-2"><input checked={tripSourceMode === "armazem"} onChange={() => setTripSourceMode("armazem")} type="radio" />Armazém</label><label className="inline-flex items-center gap-2"><input checked={tripSourceMode === "coleta"} onChange={() => setTripSourceMode("coleta")} type="radio" />Coleta em fazenda</label></div>{tripSourceMode === "armazem" ? <label className="mt-3 grid gap-1.5 text-sm font-semibold text-slate-700">Material físico no Estoque webAgil<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!compatibleWarehouseStocks.length} onChange={(event) => setTripFulfillmentStockId(event.target.value)} value={tripFulfillmentStockId}><option value="">Selecione o produto do armazém</option>{compatibleWarehouseStocks.map((stock) => <option key={stock.id} value={stock.id}>{stock.product} · lote {stock.lot || "não informado"} · saldo {formatNumber(stock.balance)} {stock.unit} · {stock.warehouse}</option>)}</select></label> : <label className="mt-3 grid gap-1.5 text-sm font-semibold text-slate-700">Fazenda para coleta<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!collectionOptions.length} onChange={(event) => setTripCollectionId(event.target.value)} value={tripCollectionId}><option value="">Selecione a unidade com saldo</option>{collectionOptions.map((item) => <option key={item.id} value={item.id}>Coletar na {item.nucleus} · {item.material} · saldo {formatNumber(item.balance)}</option>)}</select></label>}</fieldset>
             {selectedLogisticsLine && selectedWarehouseStock && tripSourceMode === "armazem" && normalizeMaterial(selectedWarehouseStock.product) !== normalizeMaterial(selectedLogisticsLine.product) ? <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 lg:col-span-2"><strong>Substituição pelo mesmo princípio ativo.</strong> Pedido: {selectedLogisticsLine.product} · Estoque escolhido: {selectedWarehouseStock.product}. A rota mantém o pedido original e exige solicitação de ajuste à fazenda no sistema.</div> : null}
             <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Quantidade a expedir<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" max={Math.min(selectedLineRemaining, selectedSourceBalance)} onChange={(event) => setTripQuantity(event.target.value)} placeholder={selectedLineRemaining ? String(selectedLineRemaining) : "0"} value={tripQuantity} /></label>
