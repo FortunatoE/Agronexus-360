@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, startTransition, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, startTransition, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { buildCommercialClosingOverview, matchesCommercialClosing, resolveCommercialClosings } from "@/lib/commercial-closings";
 import { buildNotificationMailto, buildOutlookEml, buildTaskNotification, parseNotificationRecipients, resolveTaskNotificationOrders } from "@/lib/task-notification";
 import { base64ToBytes } from "@/lib/workspace-base64";
@@ -377,7 +377,7 @@ function dateFromPlan(value: unknown) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-async function parseImportFile(file: File, source: (typeof sourceConfig)[number]) {
+async function parseImportFile(file: File, source: Pick<(typeof sourceConfig)[number], "key" | "header">) {
   const buffer = await file.arrayBuffer();
   return new Promise<{ rows: Row[]; rowCount: number; sheets: string[] }>((resolve, reject) => {
     const worker = new Worker(new URL("../workers/import-worker.ts", import.meta.url), { type: "module" });
@@ -790,6 +790,9 @@ export default function Home() {
   const [notificationTo, setNotificationTo] = useState("");
   const [notificationCc, setNotificationCc] = useState("");
   const [notificationMessage, setNotificationMessage] = useState<{ text: string; success?: boolean } | null>(null);
+  const [notificationSource, setNotificationSource] = useState<{ name: string; rows: Row[] } | null>(null);
+  const [notificationSourceLoading, setNotificationSourceLoading] = useState(false);
+  const notificationSourceRequest = useRef(0);
   const [settingsTab, setSettingsTab] = useState<"premissas" | "email">("premissas");
   const [storageReady, setStorageReady] = useState(false);
   const [persistenceError, setPersistenceError] = useState("");
@@ -1742,12 +1745,12 @@ export default function Home() {
       && (notificationNucleus === "Todos" || signal.nucleus === notificationNucleus));
     if (!candidates.length) return null;
 
-    const rows = resolveTaskNotificationOrders(candidates, pendingSignals, datasets.pedidosCompra);
+    const rows = resolveTaskNotificationOrders(candidates, pendingSignals, datasets.pedidosCompra, notificationSource?.rows);
     return rows.length ? { ...buildTaskNotification(notificationNucleus, minimumDays, rows), count: rows.length } : null;
-  }, [datasets.pedidosCompra, notificationDays, notificationNucleus, pendingSignals, scopedPendingSignals, showNotification]);
+  }, [datasets.pedidosCompra, notificationDays, notificationNucleus, notificationSource, pendingSignals, scopedPendingSignals, showNotification]);
   const notificationRecipients = parseNotificationRecipients(notificationTo);
   const notificationCopy = parseNotificationRecipients(notificationCc);
-  const outlookDraftUrl = notificationDraft && notificationRecipients?.length && notificationCopy
+  const outlookDraftUrl = !notificationSourceLoading && notificationDraft && notificationRecipients?.length && notificationCopy
     ? buildNotificationMailto(notificationDraft.subject, notificationRecipients, notificationCopy)
     : null;
 
@@ -2211,6 +2214,28 @@ export default function Home() {
     setNotificationCc(emailSettings.defaultCopy || "");
     setNotificationMessage(null);
     setShowNotification(true);
+  }
+  function closeNotification() {
+    notificationSourceRequest.current += 1;
+    setNotificationSource(null);
+    setNotificationSourceLoading(false);
+    setShowNotification(false);
+  }
+  async function loadNotificationSource(file: File) {
+    const request = ++notificationSourceRequest.current;
+    setNotificationSourceLoading(true);
+    setNotificationMessage(null);
+    try {
+      const { rows } = await parseImportFile(file, { key: "pedidos", header: 0 });
+      if (!rows.length) throw new Error("A planilha não contém linhas de pedidos pendentes.");
+      if (request === notificationSourceRequest.current) setNotificationSource({ name: file.name, rows });
+    } catch (error) {
+      if (request === notificationSourceRequest.current) {
+        setNotificationMessage({ text: error instanceof Error ? error.message : "Não foi possível ler a planilha." });
+      }
+    } finally {
+      if (request === notificationSourceRequest.current) setNotificationSourceLoading(false);
+    }
   }
   async function copyNotificationBody() {
     if (!notificationDraft) return;
@@ -2904,7 +2929,7 @@ export default function Home() {
         <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
           <div className="flex items-center justify-between border-b border-slate-100 px-6 py-5">
             <h2 className="font-semibold" id="task-notification-title">Notificar pedidos pendentes</h2>
-            <button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={() => setShowNotification(false)} type="button"><X aria-hidden="true" className="h-4 w-4" /></button>
+            <button aria-label="Fechar notificação" className="p-2 text-slate-500" onClick={closeNotification} type="button"><X aria-hidden="true" className="h-4 w-4" /></button>
           </div>
           <div className="grid gap-4 p-6 sm:grid-cols-2">
             <label className="grid gap-1.5 text-sm font-medium">
@@ -2935,6 +2960,24 @@ export default function Home() {
               Cópia (CC)
               <input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setNotificationCc(event.target.value)} placeholder="planejamento@empresa.com" value={notificationCc} />
             </label>
+            {notificationDraft?.incompleteRows || notificationSource || notificationSourceLoading ? (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 p-3 sm:col-span-2">
+                <p className="min-w-0 break-words text-xs text-slate-600" role="status">
+                  {notificationSourceLoading ? "Lendo a planilha…" : notificationSource
+                    ? `Planilha deste rascunho · ${notificationSource.name}`
+                    : "Use PEDIDOS PENDENTES.xlsx para recuperar os campos ausentes neste rascunho."}
+                </p>
+                <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-semibold text-emerald-800 focus-within:outline-2 focus-within:outline-emerald-700 has-disabled:cursor-wait has-disabled:opacity-50">
+                  <FileUp aria-hidden="true" className="h-4 w-4" />
+                  {notificationSource ? "Trocar planilha" : "Completar com Excel"}
+                  <input accept=".xlsx,.xls" className="sr-only" disabled={notificationSourceLoading} onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = "";
+                    if (file) void loadNotificationSource(file);
+                  }} type="file" />
+                </label>
+              </div>
+            ) : null}
             {notificationDraft ? (
               <details className="rounded-xl border border-slate-200 p-3 sm:col-span-2">
                 <summary className="cursor-pointer text-sm font-semibold">Prévia do e-mail</summary>
@@ -2952,12 +2995,10 @@ export default function Home() {
                 <p>{notificationDraft.incompleteRows === 1
                   ? "Uma linha tem campos ausentes na base."
                   : `${notificationDraft.incompleteRows} linhas têm campos ausentes na base.`}
-                  {" "}{currentUser.role === "admin"
-                    ? "Reimporte PEDIDOS PENDENTES.xlsx para recuperar os campos disponíveis no SAP."
-                    : "A reimportação de PEDIDOS PENDENTES.xlsx por um administrador recupera os campos disponíveis no SAP."}</p>
+                </p>
                 {currentUser.role === "admin" ? (
                   <button className="font-semibold underline" onClick={() => {
-                    setShowNotification(false);
+                    closeNotification();
                     setActive("Importações");
                     window.scrollTo({ top: 0 });
                   }} type="button">Abrir Importações</button>
@@ -2969,9 +3010,9 @@ export default function Home() {
             ) : null}
             {notificationMessage ? <p className={cn("mt-2 text-sm", notificationMessage.success ? "text-emerald-800" : "text-rose-700")} role="status">{notificationMessage.text}</p> : null}
             <div className="mt-4 flex flex-wrap justify-end gap-2">
-              <button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={() => setShowNotification(false)} type="button">Cancelar</button>
-              <button className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 disabled:opacity-50" disabled={!notificationDraft} onClick={downloadNotificationDraft} type="button">Baixar .eml</button>
-              <button className="rounded-xl border border-emerald-700 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50" disabled={!notificationDraft} onClick={() => void copyNotificationBody()} type="button">Copiar corpo formatado</button>
+              <button className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600" onClick={closeNotification} type="button">Cancelar</button>
+              <button className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 disabled:opacity-50" disabled={!notificationDraft || notificationSourceLoading} onClick={downloadNotificationDraft} type="button">Baixar .eml</button>
+              <button className="rounded-xl border border-emerald-700 px-4 py-2 text-sm font-semibold text-emerald-800 disabled:opacity-50" disabled={!notificationDraft || notificationSourceLoading} onClick={() => void copyNotificationBody()} type="button">Copiar corpo formatado</button>
               {outlookDraftUrl ? (
                 <a
                   className="inline-flex items-center rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white"
@@ -2982,7 +3023,7 @@ export default function Home() {
                   })}
                 >Nova mensagem no Outlook</a>
               ) : (
-                <button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationDraft} onClick={() => setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." })} type="button">Nova mensagem no Outlook</button>
+                <button className="rounded-xl bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={!notificationDraft || notificationSourceLoading} onClick={() => setNotificationMessage({ text: "Informe um destinatário válido e confira os endereços em cópia." })} type="button">Nova mensagem no Outlook</button>
               )}
             </div>
           </div>

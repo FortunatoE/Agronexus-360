@@ -2,6 +2,8 @@ import { normalizeMaterial } from "@/lib/material-dimension";
 import { headerKey, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
 
 type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow; dueDate: Date | null };
+type OrderMaterial = { code: string; material: string };
+type OrderLine = OrderMaterial & ReturnType<typeof readPendingOrderDetails>;
 
 type OrderEmailRow = {
   dueDate: Date | null;
@@ -30,30 +32,48 @@ function orderMaterialCode(row: OperationalRow) {
   return sapIdentifier(readText(row, "Código material", "Código do material", "MAT", "Material"));
 }
 
+function indexOrderLines(rows: OperationalRow[], candidateReferences: Set<string>) {
+  const orders = new Map<string, OrderLine[]>();
+  for (const row of rows) {
+    if (["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Eliminado", "Cancelado")))) continue;
+    const reference = sapIdentifier(readText(row, "Doc.compra", "Documento de compra", "Documento de compras", "Pedido", "Nº pedido", "Documento"));
+    if (!reference || !candidateReferences.has(reference)) continue;
+    const lines = orders.get(reference) ?? [];
+    lines.push({
+      ...readPendingOrderDetails(row),
+      code: orderMaterialCode(row),
+      material: normalizeMaterial(readText(row, "Descrição Material", "Texto breve material", "Texto material", "Produto", "Insumo")),
+    });
+    orders.set(reference, lines);
+  }
+  return orders;
+}
+
+function matchOrderLine(lines: OrderLine[], sameOrder: OrderMaterial[], item: string, { code, material }: OrderMaterial) {
+  if (!lines.length) return undefined;
+  // Em cargas antigas sem item, o produto deve identificar uma única linha em ambas as bases.
+  const codeMatches = code && sameOrder.filter((line) => line.code === code).length === 1
+    ? lines.filter((line) => line.code === code) : [];
+  const matches = item ? lines.filter((line) => sapIdentifier(line.item) === item)
+    : codeMatches.length ? codeMatches
+      : material && material !== "SEMDESCRICAO" && sameOrder.filter((line) => line.material === material).length === 1
+        ? lines.filter((line) => line.material === material && (!code || !line.code || line.code === code)) : [];
+  return matches.length === 1 && (!code || !matches[0].code || matches[0].code === code) ? matches[0] : undefined;
+}
+
 export function resolveTaskNotificationOrders(
   candidates: PendingEmailOrder[],
   pending: PendingEmailOrder[],
   purchases: OperationalRow[],
+  supplementalRows: OperationalRow[] = [],
 ): OrderEmailRow[] {
   const candidateReferences = new Set(candidates.map((signal) => sapIdentifier(signal.reference)));
-  const orders = new Map<string, Array<ReturnType<typeof readPendingOrderDetails> & { code: string; material: string }>>();
-  for (const purchase of purchases) {
-    if (["SIM", "S", "X", "TRUE"].includes(headerKey(readText(purchase, "Eliminado?", "Eliminado", "Cancelado")))) continue;
-    const reference = sapIdentifier(readText(purchase, "Doc.compra", "Documento de compra", "Documento de compras", "Pedido", "Nº pedido", "Documento"));
-    if (!reference || !candidateReferences.has(reference)) continue;
-    const lines = orders.get(reference) ?? [];
-    lines.push({
-      ...readPendingOrderDetails(purchase),
-      code: orderMaterialCode(purchase),
-      material: normalizeMaterial(readText(purchase, "Descrição Material", "Texto breve material", "Texto material", "Produto", "Insumo")),
-    });
-    orders.set(reference, lines);
-  }
-
-  const pendingReferences = new Map<string, Array<{ code: string; material: string }>>();
+  const orders = indexOrderLines(purchases, candidateReferences);
+  const supplementalOrders = indexOrderLines(supplementalRows, candidateReferences);
+  const pendingReferences = new Map<string, OrderMaterial[]>();
   for (const signal of pending) {
     const reference = sapIdentifier(signal.reference);
-    if (!orders.has(reference)) continue;
+    if (!orders.has(reference) && !supplementalOrders.has(reference)) continue;
     const lines = pendingReferences.get(reference) ?? [];
     lines.push({ code: orderMaterialCode(signal.row), material: normalizeMaterial(signal.physicalMaterial) });
     pendingReferences.set(reference, lines);
@@ -62,23 +82,17 @@ export function resolveTaskNotificationOrders(
   return candidates.flatMap((signal) => {
     const details = readPendingOrderDetails(signal.row);
     const reference = sapIdentifier(signal.reference);
-    const lines = orders.get(reference) ?? [];
     const sameOrder = pendingReferences.get(reference) ?? [];
-    const code = orderMaterialCode(signal.row);
-    const material = normalizeMaterial(signal.physicalMaterial);
-    const item = sapIdentifier(details.item);
-    // O item identifica a linha. Para cargas antigas, código ou descrição só
-    // resolvem a linha quando também são únicos na relação de pendências.
-    const codeMatches = code && sameOrder.filter((line) => line.code === code).length === 1
-      ? lines.filter((line) => line.code === code) : [];
-    const matches = item ? lines.filter((line) => sapIdentifier(line.item) === item)
-      : codeMatches.length ? codeMatches
-        : material !== "SEMDESCRICAO" && sameOrder.filter((line) => line.material === material).length === 1
-          ? lines.filter((line) => line.material === material && (!code || !line.code || line.code === code)) : [];
-    const matched = matches.length === 1 && (!code || !matches[0].code || matches[0].code === code) ? matches[0] : undefined;
-    const ordered = details.ordered ?? matched?.ordered ?? null;
-    let delivered = details.delivered ?? matched?.delivered ?? null;
-    let remaining = details.remaining ?? matched?.remaining ?? null;
+    const product = { code: orderMaterialCode(signal.row), material: normalizeMaterial(signal.physicalMaterial) };
+    const supplement = matchOrderLine(supplementalOrders.get(reference) ?? [], sameOrder, sapIdentifier(details.item), product);
+    const supplementalQuantities = supplement && (["ordered", "delivered", "remaining"] as const).every((field) =>
+      details[field] === null || supplement[field] === null || details[field] === supplement[field],
+    ) ? supplement : undefined;
+    const item = details.item || supplement?.item || "";
+    const matched = matchOrderLine(orders.get(reference) ?? [], sameOrder, sapIdentifier(item), product);
+    const ordered = details.ordered ?? supplementalQuantities?.ordered ?? matched?.ordered ?? null;
+    let delivered = details.delivered ?? supplementalQuantities?.delivered ?? matched?.delivered ?? null;
+    let remaining = details.remaining ?? supplementalQuantities?.remaining ?? matched?.remaining ?? null;
     if (details.remaining !== null && details.delivered === null && ordered !== null) {
       delivered = ordered >= details.remaining ? ordered - details.remaining : null;
     } else if (details.ordered !== null && details.remaining === null && delivered !== null) {
@@ -88,7 +102,7 @@ export function resolveTaskNotificationOrders(
     return [{
       dueDate: signal.dueDate,
       reference: signal.reference,
-      item: details.item || matched?.item || "",
+      item: item || matched?.item || "",
       material: signal.physicalMaterial,
       nucleus: signal.nucleus,
       ordered,
