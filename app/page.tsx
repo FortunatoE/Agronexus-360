@@ -54,18 +54,23 @@ type TaskAction = { id: string; note: string; createdAt: string };
 type TaskStatus = "Aberta" | "Em andamento" | "Aguardando" | "Concluída";
 type TaskItem = { id: string; pendingId: string; material?: string; nucleus?: string; title: string; createdAt: string; actions: TaskAction[]; owner?: string; dueDate?: string; evidence?: string; status?: TaskStatus; updatedAt?: string };
 type RoadDriver = { id: string; fullName: string; cpf: string; phone?: string; createdAt: string };
-type RoadVehicle = { id: string; plate: string; capacity: number; model: string; createdAt: string };
+type RoadVehicle = {
+  id: string; plate: string; capacity: number; palletCapacity?: number; model: string;
+  trackerNumber?: string; ownership?: "interno" | "terceiro"; defaultDriverId?: string; createdAt: string;
+};
 type TripRecipe = { culture: string; target: string; dose: string };
 type LogisticsTripItem = {
   id: string; requestId: string; requestDate: string; product: string; productCode: string; lot: string;
   quantity: number; unit: string; sourceWarehouse: string; destination: string; destinationCode: string;
+  requestProduct?: string; requestLineId?: string; sourceMode?: "armazem" | "coleta" | "manual";
+  sourceNucleus?: string; stockReference?: string; adjustmentRequired?: boolean; weightKg?: number; pallets?: number;
 };
 type LogisticsTrip = {
   id: string; requestId: string; requestDate: string; product: string; productCode: string; lot: string;
   quantity: number; unit: string; sourceWarehouse: string; destination: string; destinationCode: string;
   driverId: string; vehicleId: string; invoiceNumber: string; createdAt: string; recipe?: TripRecipe; items?: LogisticsTripItem[];
 };
-type LogisticsState = { drivers: RoadDriver[]; trips: LogisticsTrip[]; vehicles: RoadVehicle[] };
+type LogisticsState = { drivers: RoadDriver[]; trips: LogisticsTrip[]; vehicles: RoadVehicle[]; municipalityByLocation?: Record<string, string>; webMaterialLinks?: Record<string, string> };
 type ClosingDistribution = Record<string, number>;
 type CommercialCurrency = "" | "BRL" | "USD";
 type CommercialClosing = {
@@ -152,7 +157,7 @@ const emptyDatasets: Datasets = { planejamento: [], execucao: [], consumo: [], e
 const initialPremises: Premises = { tolerance: "5", sample: "3", horizon: "7, 15, 30", excludedStatus: "EXCL" };
 const initialEmailSettings: EmailSettings = { defaultCopy: "", nucleusRecipients: {} };
 const initialDashboardSettings: DashboardSettings = { daeCycle: "Safra" };
-const initialLogistics: LogisticsState = { drivers: [], trips: [], vehicles: [] };
+const initialLogistics: LogisticsState = { drivers: [], trips: [], vehicles: [], municipalityByLocation: {}, webMaterialLinks: {} };
 const initialCommercialClosings: CommercialClosingsState = { annotations: [], closings: [] };
 const emptyUserDraft: UserDraft = { name: "", nucleus: "", password: "", role: "viewer", username: "" };
 function logisticsTripItems(trip: LogisticsTrip): LogisticsTripItem[] {
@@ -161,6 +166,14 @@ function logisticsTripItems(trip: LogisticsTrip): LogisticsTripItem[] {
     productCode: trip.productCode, lot: trip.lot, quantity: trip.quantity, unit: trip.unit,
     sourceWarehouse: trip.sourceWarehouse, destination: trip.destination, destinationCode: trip.destinationCode,
   }];
+}
+function logisticsMunicipalityFor(location: string, municipalities: Record<string, string> | undefined) {
+  const key = normalizeMaterial(location);
+  if (!key || !municipalities) return location;
+  const exact = municipalities[key];
+  if (exact) return exact;
+  const matchedKey = Object.keys(municipalities).find((entry) => key.includes(entry) || entry.includes(key));
+  return matchedKey ? municipalities[matchedKey] : location;
 }
 let xlsxLoader: Promise<typeof import("xlsx")> | null = null;
 function loadXlsx() { xlsxLoader ??= import("xlsx"); return xlsxLoader; }
@@ -764,9 +777,18 @@ export default function Home() {
   const [closingMessage, setClosingMessage] = useState("");
   const [logisticsTab, setLogisticsTab] = useState<"emissao" | "viagens" | "rodoviaria">("emissao");
   const [driverDraft, setDriverDraft] = useState({ cpf: "", fullName: "", phone: "" });
-  const [vehicleDraft, setVehicleDraft] = useState({ capacity: "", model: "", plate: "" });
+  const [vehicleDraft, setVehicleDraft] = useState({ capacity: "", defaultDriverId: "", model: "", ownership: "interno" as "interno" | "terceiro", palletCapacity: "", plate: "", trackerNumber: "" });
   const [tripRequestId, setTripRequestId] = useState("");
   const [tripMaterialKey, setTripMaterialKey] = useState("");
+  const [tripSourceMode, setTripSourceMode] = useState<"armazem" | "coleta">("armazem");
+  const [tripFulfillmentStockId, setTripFulfillmentStockId] = useState("");
+  const [tripCollectionId, setTripCollectionId] = useState("");
+  const [tripQuantity, setTripQuantity] = useState("");
+  const [manualStockId, setManualStockId] = useState("");
+  const [manualDestination, setManualDestination] = useState("");
+  const [manualQuantity, setManualQuantity] = useState("");
+  const [manualUnit, setManualUnit] = useState("UN");
+  const [locationDraft, setLocationDraft] = useState({ location: "", municipality: "" });
   const [routeItems, setRouteItems] = useState<LogisticsTripItem[]>([]);
   const [tripDriverId, setTripDriverId] = useState("");
   const [tripVehicleId, setTripVehicleId] = useState("");
@@ -1649,15 +1671,16 @@ export default function Home() {
   }).sort((left, right) => (left.daysUntil ?? Number.MAX_SAFE_INTEGER) - (right.daysUntil ?? Number.MAX_SAFE_INTEGER)), [clock, dimensions, farmToNucleus, pendingOrders]);
 
   const logisticsRequests = useMemo(() => {
-    type LogisticsRequestLine = { id: string; lot: string; product: string; productCode: string; quantity: number; unit: string };
+    type LogisticsRequestLine = { active: string; id: string; lot: string; product: string; productCode: string; quantity: number; standardProduct: string; unit: string };
     type LogisticsRequest = { date: string; destination: string; destinationCode: string; id: string; sourceWarehouse: string; status: string; lines: LogisticsRequestLine[] };
     const values = new Map<string, LogisticsRequest>();
     datasets.solicitacoesWeb.forEach((row, index) => {
       const id = readText(row, "Nº Solicitação", "N° Solicitação", "Numero Solicitação", "Numero Solicitacao", "Solicitação", "Solicitacao");
-      const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto");
+      const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto", "INSUMO WEB", "Insumo Web", "INSUMO SAP", "Insumo SAP");
       const status = readText(row, "St. do Atendimento");
       const shippingStatus = readText(row, "Situação de Envio ao Rodopar", "Situacao de Envio ao Rodopar");
       if (!id || !product || headerKey(status).includes("CANCEL") || headerKey(shippingStatus).includes("CANCEL")) return;
+      const dimension = dimensions.materials[normalizeMaterial(product)];
       const current = values.get(id) || {
         date: readText(row, "Data Atendimento", "Data"),
         destination: readText(row, "Nome do Tomador", "Nome do Responsável", "Nome do Responsavel"),
@@ -1668,50 +1691,150 @@ export default function Home() {
         lines: [],
       };
       current.lines.push({
-        id: `${id}|${index}|${normalizeMaterial(product)}|${normalizeMaterial(readText(row, "Lote"))}`,
-        lot: readText(row, "Lote"),
+        id: `${id}|${index}|${normalizeMaterial(product)}|${normalizeMaterial(readText(row, "Lote", "LOTE WEB", "Lote Web", "LOTE SAP", "Lote SAP"))}`,
+        active: dimension?.principleActive || "Não conciliado",
+        lot: readText(row, "Lote", "LOTE WEB", "Lote Web", "LOTE SAP", "Lote SAP"),
         product,
-        productCode: readText(row, "Cód. Prod. Indústria", "Cod. Prod. Industria", "Cód. Prod. Operador", "Cod. Prod. Operador"),
-        quantity: readNumber(row, "Qt. Solicitada", "Qt Solicitada", "Quantidade solicitada", "Quantidade"),
+        productCode: readText(row, "Cód. Prod. Indústria", "Cod. Prod. Industria", "Cód. Prod. Operador", "Cod. Prod. Operador", "CD MAT", "Material"),
+        quantity: readNumber(row, "Qt. Solicitada", "Qt Solicitada", "Quantidade solicitada", "Quantidade", "QTD"),
+        standardProduct: dimension?.aggregateMaterial || product,
         unit: readText(row, "UMB", "Und", "Unidade") || "UN",
       });
       values.set(id, current);
     });
     return [...values.values()].sort((left, right) => right.id.localeCompare(left.id, "pt-BR", { numeric: true }));
-  }, [datasets.solicitacoesWeb]);
+  }, [datasets.solicitacoesWeb, dimensions]);
+  const dispatchedByRequestLine = useMemo(() => {
+    const values = new Map<string, number>();
+    logistics.trips.flatMap(logisticsTripItems).forEach((item) => {
+      const key = item.requestLineId || item.id;
+      if (!key || item.sourceMode === "manual") return;
+      values.set(key, (values.get(key) || 0) + item.quantity);
+    });
+    return values;
+  }, [logistics.trips]);
   const selectedLogisticsRequest = logisticsRequests.find((request) => request.id === tripRequestId) || null;
   const selectedLogisticsLine = selectedLogisticsRequest?.lines.find((line) => line.id === tripMaterialKey) || null;
-  const selectedLogisticsStock = useMemo(() => {
-    if (!selectedLogisticsLine) return { balance: 0, pallets: 0, warehouses: [] as string[] };
-    const productKey = normalizeMaterial(selectedLogisticsLine.product);
-    const lotKey = normalizeMaterial(selectedLogisticsLine.lot);
-    const matches = datasets.estoqueWeb.filter((row) => {
-      const product = normalizeMaterial(readText(row, "Descrição Produto", "Descricao Produto", "Produto"));
-      const lot = normalizeMaterial(readText(row, "Lote"));
-      return product === productKey && (!lotKey || lot === lotKey);
-    });
+  const selectedLineRemaining = selectedLogisticsLine ? Math.max(0, selectedLogisticsLine.quantity - (dispatchedByRequestLine.get(selectedLogisticsLine.id) || 0)) : 0;
+  const webStockOptions = useMemo(() => datasets.estoqueWeb.map((row, index) => {
+    const product = readText(row, "Descrição Produto", "Descricao Produto", "Produto", "INSUMO WEB", "Insumo Web", "INSUMO SAP", "Insumo SAP");
+    const dimension = dimensions.materials[normalizeMaterial(product)];
+    const balance = readNumber(row, "Saldo", "QTD", "Qtd", "Quantidade", "Qt. Disponível", "Qt Disponivel");
+    const warehouse = readText(row, "Nome Op. Logístico", "Nome Op. Logistico", "Armazém", "Armazem", "AG", "Centro", "CEN") || "Armazém não identificado";
     return {
-      balance: matches.reduce((sum, row) => sum + readNumber(row, "Saldo"), 0),
-      pallets: matches.reduce((sum, row) => sum + readNumber(row, "Qt Paletes", "Qtd Paletes"), 0),
-      warehouses: [...new Set(matches.map((row) => readText(row, "Nome Op. Logístico", "Nome Op. Logistico", "Armazém", "Armazem")).filter(Boolean))],
+      id: `${index}|${normalizeMaterial(product)}|${normalizeMaterial(readText(row, "Lote", "LOTE WEB", "Lote Web"))}`,
+      active: dimension?.principleActive || "Não conciliado",
+      balance,
+      code: readText(row, "Cód. Prod. Indústria", "Cod. Prod. Industria", "CD MAT", "Material"),
+      lot: readText(row, "Lote", "LOTE WEB", "Lote Web"),
+      pallets: readNumber(row, "Qt Paletes", "Qtd Paletes", "Paletes", "Pallets"),
+      product,
+      standardProduct: dimension?.aggregateMaterial || product,
+      unit: readText(row, "UMB", "Und", "Unidade", "UM") || "UN",
+      warehouse,
+      weightKg: readNumber(row, "Peso KG", "Peso (kg)", "Peso", "Peso Total"),
     };
-  }, [datasets.estoqueWeb, selectedLogisticsLine]);
+  }).filter((item) => item.product && item.balance > 0), [datasets.estoqueWeb, dimensions]);
+  const compatibleWarehouseStocks = useMemo(() => {
+    if (!selectedLogisticsLine) return [];
+    const requestedProduct = normalizeMaterial(selectedLogisticsLine.product);
+    const requestedStandard = normalizeMaterial(selectedLogisticsLine.standardProduct);
+    const requestedActive = normalizeMaterial(selectedLogisticsLine.active);
+    const linkedWebProduct = normalizeMaterial(logistics.webMaterialLinks?.[requestedProduct]);
+    return webStockOptions.filter((stock) => normalizeMaterial(stock.product) === requestedProduct
+      || normalizeMaterial(stock.standardProduct) === requestedStandard
+      || (linkedWebProduct && normalizeMaterial(stock.product) === linkedWebProduct)
+      || (requestedActive && requestedActive !== "NAOCONCILIADO" && normalizeMaterial(stock.active) === requestedActive));
+  }, [logistics.webMaterialLinks, selectedLogisticsLine, webStockOptions]);
+  const selectedWarehouseStock = compatibleWarehouseStocks.find((stock) => stock.id === tripFulfillmentStockId)
+    || compatibleWarehouseStocks.find((stock) => normalizeMaterial(stock.product) === normalizeMaterial(selectedLogisticsLine?.product))
+    || compatibleWarehouseStocks[0];
+  const selectedDestinationNucleus = selectedLogisticsRequest
+    ? dimensions.centerToNucleus[normalizeMaterial(selectedLogisticsRequest.destinationCode)]
+      || farmToNucleus[normalizeMaterial(selectedLogisticsRequest.destinationCode)]
+      || dimensions.centerToNucleus[normalizeMaterial(selectedLogisticsRequest.destination)]
+      || farmToNucleus[normalizeMaterial(selectedLogisticsRequest.destination)]
+      || (selectedLogisticsRequest.destinationCode.startsWith("NC-") ? selectedLogisticsRequest.destinationCode : "Sem núcleo")
+    : "Sem núcleo";
+  const collectionOptions = useMemo(() => {
+    if (!selectedLogisticsLine) return [] as Array<{ balance: number; id: string; material: string; nucleus: string }>;
+    const requestedActive = normalizeMaterial(selectedLogisticsLine.active);
+    const requestedStandard = normalizeMaterial(selectedLogisticsLine.standardProduct);
+    const values = new Map<string, { balance: number; id: string; material: string; nucleus: string }>();
+    ledger.forEach((entry) => {
+      const match = normalizeMaterial(entry.standardMaterial) === requestedStandard
+        || (requestedActive && requestedActive !== "NAOCONCILIADO" && normalizeMaterial(entry.active) === requestedActive);
+      if (!match) return;
+      entry.locations.filter((location) => location.type === "Fazenda" && location.amount > 0).forEach((location) => {
+        const id = `${entry.nucleus}|${location.material}`;
+        const current = values.get(id) || { balance: 0, id, material: location.material, nucleus: entry.nucleus };
+        current.balance += location.amount;
+        values.set(id, current);
+      });
+    });
+    return [...values.values()].filter((item) => item.nucleus !== selectedDestinationNucleus).sort((left, right) => left.nucleus.localeCompare(right.nucleus) || left.material.localeCompare(right.material));
+  }, [ledger, selectedDestinationNucleus, selectedLogisticsLine]);
+  const selectedCollection = collectionOptions.find((item) => item.id === tripCollectionId) || collectionOptions[0];
+  const selectedSourceBalance = tripSourceMode === "coleta" ? selectedCollection?.balance || 0 : selectedWarehouseStock?.balance || 0;
+  const selectedQuantity = tripQuantity.trim() ? numberFrom(tripQuantity) : selectedLineRemaining;
+  const selectedFarmPlan = selectedLogisticsLine ? ledger.filter((entry) => entry.nucleus === selectedDestinationNucleus
+    && (normalizeMaterial(entry.standardMaterial) === normalizeMaterial(selectedLogisticsLine.standardProduct)
+      || (normalizeMaterial(selectedLogisticsLine.active) !== "NAOCONCILIADO" && normalizeMaterial(entry.active) === normalizeMaterial(selectedLogisticsLine.active))))
+    .reduce((sum, entry) => sum + entry.shortage, 0) : 0;
+  const selectedOverPlan = Math.max(0, selectedQuantity - selectedFarmPlan);
   const selectedRouteItem = useMemo<LogisticsTripItem | null>(() => {
     if (!selectedLogisticsRequest || !selectedLogisticsLine) return null;
+    const source = tripSourceMode === "coleta" ? selectedCollection : selectedWarehouseStock;
+    if (!source || selectedQuantity <= 0) return null;
+    const sourceProduct = tripSourceMode === "coleta" ? selectedCollection?.material || selectedLogisticsLine.product : selectedWarehouseStock?.product || selectedLogisticsLine.product;
+    const sourceBalance = selectedSourceBalance || 1;
+    const sourcePallets = tripSourceMode === "coleta" ? 0 : selectedWarehouseStock?.pallets || 0;
+    const sourceWeight = tripSourceMode === "coleta" ? 0 : selectedWarehouseStock?.weightKg || 0;
     return {
-      id: selectedLogisticsLine.id,
+      id: taskId("rota"),
       requestId: selectedLogisticsRequest.id,
       requestDate: selectedLogisticsRequest.date,
-      product: selectedLogisticsLine.product,
-      productCode: selectedLogisticsLine.productCode,
-      lot: selectedLogisticsLine.lot,
-      quantity: selectedLogisticsLine.quantity,
+      product: sourceProduct,
+      productCode: tripSourceMode === "coleta" ? "" : selectedWarehouseStock?.code || selectedLogisticsLine.productCode,
+      lot: tripSourceMode === "coleta" ? "" : selectedWarehouseStock?.lot || selectedLogisticsLine.lot,
+      quantity: selectedQuantity,
       unit: selectedLogisticsLine.unit,
-      sourceWarehouse: selectedLogisticsStock.warehouses.join(", ") || selectedLogisticsRequest.sourceWarehouse || "Armazém não identificado",
+      adjustmentRequired: normalizeMaterial(sourceProduct) !== normalizeMaterial(selectedLogisticsLine.product),
+      pallets: sourcePallets ? selectedQuantity / sourceBalance * sourcePallets : 0,
+      requestLineId: selectedLogisticsLine.id,
+      requestProduct: selectedLogisticsLine.product,
+      sourceMode: tripSourceMode,
+      sourceNucleus: tripSourceMode === "coleta" ? selectedCollection?.nucleus : "",
+      sourceWarehouse: tripSourceMode === "coleta" ? `Coletar na ${selectedCollection?.nucleus || "fazenda"}` : selectedWarehouseStock?.warehouse || selectedLogisticsRequest.sourceWarehouse || "Armazém não identificado",
+      stockReference: tripSourceMode === "coleta" ? selectedCollection?.material : selectedWarehouseStock?.id,
       destination: selectedLogisticsRequest.destination || "Destino não identificado",
       destinationCode: selectedLogisticsRequest.destinationCode,
+      weightKg: sourceWeight ? selectedQuantity / sourceBalance * sourceWeight : selectedLogisticsLine.unit.toUpperCase().includes("KG") ? selectedQuantity : 0,
     };
-  }, [selectedLogisticsLine, selectedLogisticsRequest, selectedLogisticsStock]);
+  }, [selectedCollection, selectedLogisticsLine, selectedLogisticsRequest, selectedQuantity, selectedSourceBalance, selectedWarehouseStock, tripSourceMode]);
+  const selectedLogisticsVehicle = logistics.vehicles.find((vehicle) => vehicle.id === tripVehicleId);
+  const routeLoad = useMemo(() => ({
+    pallets: routeItems.reduce((sum, item) => sum + (item.pallets || 0), 0),
+    weightKg: routeItems.reduce((sum, item) => sum + (item.weightKg || 0), 0),
+  }), [routeItems]);
+  const routeCapacity = selectedLogisticsVehicle ? {
+    palletExceeded: Boolean(selectedLogisticsVehicle.palletCapacity && routeLoad.pallets > selectedLogisticsVehicle.palletCapacity),
+    weightExceeded: routeLoad.weightKg > selectedLogisticsVehicle.capacity,
+  } : null;
+  const routeMap = useMemo(() => {
+    const origins = [...new Set(routeItems.map((item) => logisticsMunicipalityFor(item.sourceWarehouse, logistics.municipalityByLocation)).filter(Boolean))];
+    const destinations = [...new Set(routeItems.map((item) => logisticsMunicipalityFor(item.destinationCode || item.destination, logistics.municipalityByLocation)).filter(Boolean))];
+    const origin = origins[0] || "";
+    const destination = destinations[0] || "";
+    return {
+      destination,
+      destinations,
+      embedUrl: origin && destination ? `https://www.google.com/maps?q=${encodeURIComponent(`${origin} até ${destination}`)}&output=embed` : "",
+      mapUrl: origin && destination ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}` : "",
+      origin,
+      origins,
+    };
+  }, [logistics.municipalityByLocation, routeItems]);
 
   const scopedPendingSignals = useMemo(() => isOperator
     ? pendingSignals.filter((signal) => signal.nucleus === operatorNucleus)
@@ -1968,11 +2091,18 @@ export default function Home() {
     if (currentUser?.role !== "admin") return;
     const plate = vehicleDraft.plate.toUpperCase().replace(/[^A-Z0-9]/g, "");
     const capacity = Number(vehicleDraft.capacity.replace(",", "."));
+    const palletCapacity = Number(vehicleDraft.palletCapacity.replace(",", "."));
     const model = vehicleDraft.model.trim();
     if (plate.length < 7 || !Number.isFinite(capacity) || capacity <= 0 || !model) { setLogisticsMessage("Informe placa, modelo e capacidade válida do veículo."); return; }
     if (logistics.vehicles.some((vehicle) => vehicle.plate === plate)) { setLogisticsMessage("Já existe um veículo cadastrado com esta placa."); return; }
-    setLogistics((current) => ({ ...current, vehicles: [...current.vehicles, { id: taskId("veiculo"), plate, capacity, model, createdAt: new Date().toISOString() }] }));
-    setVehicleDraft({ capacity: "", model: "", plate: "" });
+    setLogistics((current) => ({ ...current, vehicles: [...current.vehicles, {
+      id: taskId("veiculo"), plate, capacity, model, createdAt: new Date().toISOString(),
+      defaultDriverId: vehicleDraft.defaultDriverId || undefined,
+      ownership: vehicleDraft.ownership,
+      palletCapacity: Number.isFinite(palletCapacity) && palletCapacity > 0 ? palletCapacity : undefined,
+      trackerNumber: vehicleDraft.trackerNumber.trim() || undefined,
+    }] }));
+    setVehicleDraft({ capacity: "", defaultDriverId: "", model: "", ownership: "interno", palletCapacity: "", plate: "", trackerNumber: "" });
     setLogisticsMessage("Veículo cadastrado para a configuração rodoviária.");
     recordAudit("workspace", `Veículo cadastrado: ${plate}.`);
   }
@@ -1990,10 +2120,50 @@ export default function Home() {
   }
   function addRouteItem() {
     if (!selectedRouteItem) { setLogisticsMessage("Selecione uma solicitação e um material para adicionar à rota."); return; }
-    if (routeItems.some((item) => item.id === selectedRouteItem.id)) { setLogisticsMessage("Este material já foi adicionado à rota."); return; }
+    if (tripSourceMode === "armazem" && !tripFulfillmentStockId) { setLogisticsMessage("Selecione o material físico no Estoque webAgil para vincular à solicitação."); return; }
+    if (tripSourceMode === "coleta" && !tripCollectionId) { setLogisticsMessage("Selecione a fazenda e o material que será coletado."); return; }
+    if (selectedQuantity > selectedLineRemaining) { setLogisticsMessage("A quantidade informada ultrapassa o saldo pendente da solicitação."); return; }
+    if (selectedQuantity > selectedSourceBalance) { setLogisticsMessage("A quantidade informada ultrapassa o saldo disponível na origem selecionada."); return; }
+    if (routeItems.some((item) => item.requestLineId === selectedRouteItem.requestLineId)) { setLogisticsMessage("Este pedido já possui um material reservado nesta rota. Ajuste a quantidade antes de adicionar."); return; }
     setRouteItems((current) => [...current, selectedRouteItem]);
+    if (tripSourceMode === "armazem" && selectedLogisticsLine && selectedWarehouseStock) {
+      setLogistics((current) => ({ ...current, webMaterialLinks: {
+        ...(current.webMaterialLinks || {}),
+        [normalizeMaterial(selectedLogisticsLine.product)]: selectedWarehouseStock.product,
+      } }));
+    }
     setTripMaterialKey("");
-    setLogisticsMessage(`${selectedRouteItem.product} adicionado à rota.`);
+    setTripFulfillmentStockId("");
+    setTripCollectionId("");
+    setTripQuantity("");
+    setLogisticsMessage(`${selectedRouteItem.product} adicionado à rota.${selectedRouteItem.adjustmentRequired ? " Solicite à fazenda o ajuste do produto no sistema." : ""}`);
+  }
+  function addManualRouteItem() {
+    const stock = webStockOptions.find((item) => item.id === manualStockId);
+    const quantity = numberFrom(manualQuantity);
+    if (!stock || !manualDestination || quantity <= 0) { setLogisticsMessage("Selecione o material em estoque, o destino e a quantidade para incluir um material sem pedido."); return; }
+    if (quantity > stock.balance) { setLogisticsMessage("A quantidade manual ultrapassa o saldo disponível no Estoque webAgil."); return; }
+    const item: LogisticsTripItem = {
+      id: taskId("rota"), requestId: "SEM-PEDIDO", requestDate: dateKey(new Date()), product: stock.product,
+      productCode: stock.code, lot: stock.lot, quantity, unit: manualUnit || stock.unit, sourceWarehouse: stock.warehouse,
+      destination: manualDestination, destinationCode: manualDestination, sourceMode: "manual", stockReference: stock.id,
+      pallets: stock.pallets ? quantity / stock.balance * stock.pallets : 0,
+      weightKg: stock.weightKg ? quantity / stock.balance * stock.weightKg : (manualUnit || stock.unit).toUpperCase().includes("KG") ? quantity : 0,
+    };
+    setRouteItems((current) => [...current, item]);
+    setManualStockId("");
+    setManualDestination("");
+    setManualQuantity("");
+    setManualUnit("UN");
+    setLogisticsMessage(`${item.product} incluído na rota sem pedido vinculado.`);
+  }
+  function addLogisticsLocation() {
+    const location = locationDraft.location.trim();
+    const municipality = locationDraft.municipality.trim();
+    if (!location || !municipality) { setLogisticsMessage("Informe o centro, núcleo ou armazém e o município correspondente."); return; }
+    setLogistics((current) => ({ ...current, municipalityByLocation: { ...(current.municipalityByLocation || {}), [normalizeMaterial(location)]: municipality } }));
+    setLocationDraft({ location: "", municipality: "" });
+    setLogisticsMessage(`Localização logística vinculada: ${location} → ${municipality}.`);
   }
   function removeRouteItem(id: string) {
     setRouteItems((current) => current.filter((item) => item.id !== id));
@@ -2005,6 +2175,7 @@ export default function Home() {
     const invoiceNumber = tripInvoiceNumber.trim();
     const primary = routeItems[0];
     if (!primary || !driver || !vehicle || !invoiceNumber) { setLogisticsMessage("Adicione ao menos um material à rota e informe motorista, veículo e nota fiscal."); return; }
+    if (routeCapacity?.weightExceeded || routeCapacity?.palletExceeded) { setLogisticsMessage("A carga excede a capacidade configurada para o veículo. Revise o peso e os paletes antes de emitir."); return; }
     const sourceWarehouses = [...new Set(routeItems.map((item) => item.sourceWarehouse).filter(Boolean))];
     const destinations = [...new Set(routeItems.map((item) => item.destination).filter(Boolean))];
     const trip: LogisticsTrip = {
@@ -2018,6 +2189,9 @@ export default function Home() {
     setRecipeTripId(trip.id);
     setTripRequestId("");
     setTripMaterialKey("");
+    setTripFulfillmentStockId("");
+    setTripCollectionId("");
+    setTripQuantity("");
     setRouteItems([]);
     setTripInvoiceNumber("");
     setLogisticsMessage(`Viagem ${trip.id.replace("viagem-", "")} emitida com ${routeItems.length} material(is) de ${new Set(routeItems.map((item) => item.requestId)).size} solicitação(ões). Agora vincule a receita, se aplicável.`);
@@ -2045,8 +2219,8 @@ export default function Home() {
     const driver = logistics.drivers.find((item) => item.id === trip.driverId);
     const vehicle = logistics.vehicles.find((item) => item.id === trip.vehicleId);
     const rows = [
-      ["Viagem", "Solicitação", "Data solicitação", "Armazém", "Cód. material", "Insumo web", "Lote", "Unidade", "Quantidade", "Destino", "Cód. destino", "Motorista", "CPF", "Placa", "Modelo", "Capacidade", "Nota fiscal", "Cultura", "Alvo", "Dose"],
-      ...logisticsTripItems(trip).map((item) => [trip.id.replace("viagem-", ""), item.requestId, item.requestDate, item.sourceWarehouse, item.productCode, item.product, item.lot, item.unit, item.quantity, item.destination, item.destinationCode, driver?.fullName || "Motorista removido", driver?.cpf || "", vehicle?.plate || "Veículo removido", vehicle?.model || "", vehicle?.capacity || "", trip.invoiceNumber, trip.recipe?.culture || "", trip.recipe?.target || "", trip.recipe?.dose || ""]),
+      ["Viagem", "Solicitação", "Data solicitação", "Origem", "Modo", "Produto solicitado", "Cód. material", "Material físico", "Lote", "Unidade", "Quantidade", "Peso estimado (kg)", "Paletes", "Ajuste da fazenda", "Destino", "Cód. destino", "Motorista", "CPF", "Placa", "Modelo", "Capacidade", "Nota fiscal", "Cultura", "Alvo", "Dose"],
+      ...logisticsTripItems(trip).map((item) => [trip.id.replace("viagem-", ""), item.requestId, item.requestDate, item.sourceWarehouse, item.sourceMode || "armazem", item.requestProduct || item.product, item.productCode, item.product, item.lot, item.unit, item.quantity, item.weightKg || "", item.pallets || "", item.adjustmentRequired ? "Solicitar ajuste no sistema" : "", item.destination, item.destinationCode, driver?.fullName || "Motorista removido", driver?.cpf || "", vehicle?.plate || "Veículo removido", vehicle?.model || "", vehicle?.capacity || "", trip.invoiceNumber, trip.recipe?.culture || "", trip.recipe?.target || "", trip.recipe?.dose || ""]),
     ];
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(rows), "Emissão de doc");
@@ -2822,27 +2996,33 @@ export default function Home() {
       {logisticsMessage ? <p className={cn("rounded-xl px-4 py-3 text-sm", /cadastrado|emitida|vinculada|adicionado/i.test(logisticsMessage) ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-900")}>{logisticsMessage}</p> : null}
 
       {logisticsTab === "emissao" ? <section className="space-y-5">
-        <div className="grid gap-3 md:grid-cols-3"><Card label="Solicitações disponíveis" value={logisticsRequests.length} note="aceitas e não canceladas" /><Card label="Saldo do material" value={selectedLogisticsLine ? formatNumber(selectedLogisticsStock.balance) : "—"} note={selectedLogisticsLine ? `${selectedLogisticsStock.pallets} palete(s) no estoque web` : "selecione uma solicitação"} tone={selectedLogisticsLine && selectedLogisticsStock.balance < selectedLogisticsLine.quantity ? "amber" : "emerald"} /><Card label="Viagens emitidas" value={logistics.trips.length} note="salvas na base central" /></div>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"><Card label="Solicitações disponíveis" value={logisticsRequests.length} note="aceitas e não canceladas" /><Card label="Saldo pendente" value={selectedLogisticsLine ? formatNumber(selectedLineRemaining) : "—"} note={selectedLogisticsLine ? `${selectedLogisticsLine.product} ainda a expedir` : "selecione uma solicitação"} tone={selectedLogisticsLine && !selectedLineRemaining ? "slate" : "emerald"} /><Card label="Saldo na origem" value={selectedLogisticsLine ? formatNumber(selectedSourceBalance) : "—"} note={tripSourceMode === "coleta" ? "fazenda selecionada para coleta" : "Estoque webAgil"} tone={selectedLogisticsLine && selectedSourceBalance < selectedLineRemaining ? "amber" : "emerald"} /><Card label="Viagens emitidas" value={logistics.trips.length} note="salvas na base central" /></div>
         <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <div><h3 className="font-semibold">Dados da rota e emissão</h3><p className="mt-1 text-xs text-slate-500">Inclua materiais de uma ou mais solicitações na mesma rota. O saldo considera produto e lote do Estoque webAgil.</p></div>
+          <div><h3 className="font-semibold">Planejamento da rota</h3><p className="mt-1 text-xs text-slate-500">A rota usa somente o saldo restante da solicitação. Vincule o material físico do Estoque webAgil, faça coleta entre fazendas quando necessário e valide a capacidade antes da emissão.</p></div>
           <div className="mt-5 grid gap-4 lg:grid-cols-2">
-            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Solicitação<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!logisticsRequests.length} onChange={(event) => { setTripRequestId(event.target.value); setTripMaterialKey(""); }} value={tripRequestId}><option value="">Selecione a solicitação</option>{logisticsRequests.map((request) => <option key={request.id} value={request.id}>{request.id} · {request.destination || "Destino não informado"} · {request.lines.length} material(is)</option>)}</select></label>
-            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Material e lote<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!selectedLogisticsRequest} onChange={(event) => setTripMaterialKey(event.target.value)} value={tripMaterialKey}><option value="">Selecione o material</option>{selectedLogisticsRequest?.lines.map((line) => <option key={line.id} value={line.id}>{line.product} · lote {line.lot || "não informado"} · {formatNumber(line.quantity)} {line.unit}</option>)}</select></label>
-            <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm"><p className="text-xs font-bold uppercase tracking-wide text-slate-500">Origem</p><p className="mt-1 font-semibold text-slate-800">{selectedLogisticsStock.warehouses.join(", ") || selectedLogisticsRequest?.sourceWarehouse || "—"}</p><p className="mt-1 text-xs text-slate-500">Saldo localizado: {selectedLogisticsLine ? formatNumber(selectedLogisticsStock.balance) : "—"}</p></div>
-            <div className="flex items-end"><button className="w-full rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700 disabled:cursor-not-allowed disabled:opacity-50" disabled={!selectedRouteItem} onClick={addRouteItem} type="button">Adicionar material à rota</button></div>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Solicitação pendente<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!logisticsRequests.length} onChange={(event) => { setTripRequestId(event.target.value); setTripMaterialKey(""); setTripFulfillmentStockId(""); setTripCollectionId(""); setTripQuantity(""); }} value={tripRequestId}><option value="">Selecione a solicitação</option>{logisticsRequests.map((request) => <option key={request.id} value={request.id}>{request.id} · {request.destination || "Destino não informado"} · {request.lines.length} material(is)</option>)}</select></label>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Material solicitado<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!selectedLogisticsRequest} onChange={(event) => { const line = selectedLogisticsRequest?.lines.find((item) => item.id === event.target.value); const pending = line ? Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0)) : 0; setTripMaterialKey(event.target.value); setTripFulfillmentStockId(""); setTripCollectionId(""); setTripQuantity(pending ? String(pending) : ""); }} value={tripMaterialKey}><option value="">Selecione o material</option>{selectedLogisticsRequest?.lines.map((line) => { const pending = Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0)); return <option disabled={!pending} key={line.id} value={line.id}>{line.product} · lote {line.lot || "não informado"} · saldo {formatNumber(pending)} {line.unit}</option>; })}</select></label>
+            {selectedLogisticsLine ? <div className="rounded-xl border border-sky-200 bg-sky-50 p-4 lg:col-span-2"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="text-xs font-bold uppercase tracking-wide text-sky-800">Necessidade da fazenda</p><p className="mt-1 font-semibold text-slate-900">{selectedDestinationNucleus} · {selectedLogisticsLine.standardProduct}</p><p className="mt-1 text-xs text-slate-600">Saldo pendente da solicitação: <strong>{formatNumber(selectedLineRemaining)} {selectedLogisticsLine.unit}</strong> · Necessidade conciliada: <strong>{formatNumber(selectedFarmPlan)}</strong>.</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-sky-800">Ativo: {selectedLogisticsLine.active}</span></div></div> : null}
+            <fieldset className="grid gap-2 rounded-xl border border-slate-200 p-3 lg:col-span-2"><legend className="px-1 text-xs font-bold uppercase tracking-wide text-slate-500">Origem da carga</legend><div className="flex flex-wrap gap-3 text-sm"><label className="inline-flex items-center gap-2"><input checked={tripSourceMode === "armazem"} onChange={() => setTripSourceMode("armazem")} type="radio" />Armazém</label><label className="inline-flex items-center gap-2"><input checked={tripSourceMode === "coleta"} onChange={() => setTripSourceMode("coleta")} type="radio" />Coleta em fazenda</label></div>{tripSourceMode === "armazem" ? <label className="mt-3 grid gap-1.5 text-sm font-semibold text-slate-700">Material físico no Estoque webAgil<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!compatibleWarehouseStocks.length} onChange={(event) => setTripFulfillmentStockId(event.target.value)} value={tripFulfillmentStockId}><option value="">Selecione o produto do armazém</option>{compatibleWarehouseStocks.map((stock) => <option key={stock.id} value={stock.id}>{stock.product} · lote {stock.lot || "não informado"} · saldo {formatNumber(stock.balance)} {stock.unit} · {stock.warehouse}</option>)}</select></label> : <label className="mt-3 grid gap-1.5 text-sm font-semibold text-slate-700">Fazenda para coleta<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" disabled={!collectionOptions.length} onChange={(event) => setTripCollectionId(event.target.value)} value={tripCollectionId}><option value="">Selecione a unidade com saldo</option>{collectionOptions.map((item) => <option key={item.id} value={item.id}>Coletar na {item.nucleus} · {item.material} · saldo {formatNumber(item.balance)}</option>)}</select></label>}</fieldset>
+            {selectedLogisticsLine && selectedWarehouseStock && tripSourceMode === "armazem" && normalizeMaterial(selectedWarehouseStock.product) !== normalizeMaterial(selectedLogisticsLine.product) ? <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950 lg:col-span-2"><strong>Substituição pelo mesmo princípio ativo.</strong> Pedido: {selectedLogisticsLine.product} · Estoque escolhido: {selectedWarehouseStock.product}. A rota mantém o pedido original e exige solicitação de ajuste à fazenda no sistema.</div> : null}
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Quantidade a expedir<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" inputMode="decimal" max={Math.min(selectedLineRemaining, selectedSourceBalance)} onChange={(event) => setTripQuantity(event.target.value)} placeholder={selectedLineRemaining ? String(selectedLineRemaining) : "0"} value={tripQuantity} /></label>
+            <div className={cn("rounded-xl border p-3 text-sm", selectedOverPlan > 0 ? "border-amber-200 bg-amber-50 text-amber-950" : "border-slate-200 bg-slate-50 text-slate-700")}><p className="text-xs font-bold uppercase tracking-wide">Comparativo de necessidade</p><p className="mt-1">Carga: <strong>{formatNumber(selectedQuantity)}</strong> · planejado a atender: <strong>{formatNumber(selectedFarmPlan)}</strong>{selectedOverPlan > 0 ? ` · ${formatNumber(selectedOverPlan)} acima da necessidade` : " · dentro da necessidade"}</p></div>
+            <div className="flex items-end lg:col-span-2"><button className="w-full rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700 disabled:cursor-not-allowed disabled:opacity-50" disabled={!selectedRouteItem || !tripQuantity.trim() || (tripSourceMode === "armazem" ? !tripFulfillmentStockId : !tripCollectionId) || selectedQuantity > selectedLineRemaining || selectedQuantity > selectedSourceBalance} onClick={addRouteItem} type="button">Adicionar pedido à rota</button></div>
+            <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 lg:col-span-2"><div className="flex flex-wrap items-end justify-between gap-2"><div><h4 className="text-sm font-bold text-slate-800">Material sem pedido</h4><p className="mt-1 text-xs text-slate-500">Inclua uma carga avulsa usando o saldo do Estoque webAgil.</p></div><span className="text-xs font-semibold text-slate-500">Opcional</span></div><div className="mt-3 grid gap-3 md:grid-cols-4"><label className="grid gap-1 text-xs font-semibold text-slate-600 md:col-span-2">Material em estoque<select className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" onChange={(event) => { const stock = webStockOptions.find((item) => item.id === event.target.value); setManualStockId(event.target.value); if (stock) setManualUnit(stock.unit); }} value={manualStockId}><option value="">Selecione o material</option>{webStockOptions.map((stock) => <option key={stock.id} value={stock.id}>{stock.product} · {formatNumber(stock.balance)} {stock.unit} · {stock.warehouse}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Destino / núcleo<select className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" onChange={(event) => setManualDestination(event.target.value)} value={manualDestination}><option value="">Selecione o destino</option>{[...new Set(ledger.map((row) => row.nucleus).filter(Boolean))].sort().map((nucleus) => <option key={nucleus}>{nucleus}</option>)}</select></label><label className="grid gap-1 text-xs font-semibold text-slate-600">Quantidade<input className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal" inputMode="decimal" onChange={(event) => setManualQuantity(event.target.value)} value={manualQuantity} /></label></div><button className="mt-3 rounded-lg border border-slate-700 bg-white px-3 py-2 text-xs font-bold text-slate-700 disabled:opacity-50" disabled={!manualStockId || !manualDestination || !numberFrom(manualQuantity)} onClick={addManualRouteItem} type="button">Incluir material sem pedido</button></div>
+            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Veículo<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => { const vehicle = logistics.vehicles.find((item) => item.id === event.target.value); setTripVehicleId(event.target.value); if (vehicle?.defaultDriverId) setTripDriverId(vehicle.defaultDriverId); }} value={tripVehicleId}><option value="">Selecione a placa</option>{logistics.vehicles.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.plate} · {vehicle.model} · {formatNumber(vehicle.capacity)} kg{vehicle.palletCapacity ? ` · ${formatNumber(vehicle.palletCapacity)} paletes` : ""}</option>)}</select></label>
             <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Motorista<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripDriverId(event.target.value)} value={tripDriverId}><option value="">Selecione o motorista</option>{logistics.drivers.map((driver) => <option key={driver.id} value={driver.id}>{driver.fullName} · CPF {driver.cpf}</option>)}</select></label>
-            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">Veículo<select className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripVehicleId(event.target.value)} value={tripVehicleId}><option value="">Selecione a placa</option>{logistics.vehicles.map((vehicle) => <option key={vehicle.id} value={vehicle.id}>{vehicle.plate} · {vehicle.model} · {formatNumber(vehicle.capacity)} kg</option>)}</select></label>
             <label className="grid gap-1.5 text-sm font-semibold text-slate-700 lg:col-span-2">Nota fiscal vinculada<input className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal" onChange={(event) => setTripInvoiceNumber(event.target.value)} placeholder="Digite a nota fiscal da viagem" value={tripInvoiceNumber} /></label>
           </div>
-          <div className="mt-5 rounded-xl border border-emerald-100 bg-emerald-50/50 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="text-sm font-bold text-emerald-950">Carga da rota</h4><p className="mt-1 text-xs text-emerald-900">{routeItems.length} material(is) · {new Set(routeItems.map((item) => item.requestId)).size} solicitação(ões)</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-emerald-800">Uma viagem, várias solicitações</span></div>{routeItems.length ? <div className="mt-3 divide-y divide-emerald-100 rounded-lg bg-white">{routeItems.map((item) => <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 text-sm" key={item.id}><div><p className="font-semibold text-slate-800">{item.product} <span className="font-normal text-slate-500">· lote {item.lot || "não informado"}</span></p><p className="mt-0.5 text-xs text-slate-500">Solicitação {item.requestId} · {formatNumber(item.quantity)} {item.unit} · {item.sourceWarehouse} → {item.destination}</p></div><button className="text-xs font-bold text-rose-700" onClick={() => removeRouteItem(item.id)} type="button">Remover</button></div>)}</div> : <p className="mt-3 text-sm text-slate-600">Selecione uma solicitação e um material, depois use “Adicionar material à rota”. Você pode trocar a solicitação e repetir o processo.</p>}</div>
-          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4"><p className="text-xs text-slate-500">{selectedDriver && selectedVehicle ? `Rota pronta: ${selectedDriver.fullName} · ${selectedVehicle.plate}` : "Cadastre e selecione motorista e veículo para completar a rota."}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50" disabled={!routeItems.length || !tripDriverId || !tripVehicleId || !tripInvoiceNumber.trim()} onClick={createLogisticsTrip} type="button">Emitir viagem</button></div>
+          <div className="mt-5 rounded-xl border border-emerald-100 bg-emerald-50/50 p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div><h4 className="text-sm font-bold text-emerald-950">Carga da rota</h4><p className="mt-1 text-xs text-emerald-900">{routeItems.length} material(is) · {new Set(routeItems.map((item) => item.requestId).filter((id) => id !== "SEM-PEDIDO")).size} solicitação(ões) · {formatNumber(routeLoad.weightKg)} kg estimados · {formatNumber(routeLoad.pallets)} palete(s)</p></div><span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-emerald-800">Uma viagem, várias solicitações</span></div>{routeCapacity ? <p className={cn("mt-3 rounded-lg px-3 py-2 text-xs font-semibold", routeCapacity.weightExceeded || routeCapacity.palletExceeded ? "bg-rose-100 text-rose-800" : "bg-white text-emerald-800")}>{routeCapacity.weightExceeded || routeCapacity.palletExceeded ? "Capacidade excedida: revise a carga antes de emitir." : `Capacidade validada: ${formatNumber(routeLoad.weightKg)} de ${formatNumber(selectedLogisticsVehicle?.capacity || 0)} kg${selectedLogisticsVehicle?.palletCapacity ? ` · ${formatNumber(routeLoad.pallets)} de ${formatNumber(selectedLogisticsVehicle.palletCapacity)} paletes` : ""}.`}</p> : <p className="mt-3 text-xs text-slate-600">Selecione um veículo para validar peso e paletes.</p>}{routeItems.length ? <div className="mt-3 divide-y divide-emerald-100 rounded-lg bg-white">{routeItems.map((item) => <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 text-sm" key={item.id}><div><p className="font-semibold text-slate-800">{item.product} <span className="font-normal text-slate-500">· lote {item.lot || "não informado"}</span>{item.adjustmentRequired ? <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-900">AJUSTAR PRODUTO NA FAZENDA</span> : null}</p><p className="mt-0.5 text-xs text-slate-500">{item.requestId === "SEM-PEDIDO" ? "Sem pedido" : `Solicitação ${item.requestId}`} · {formatNumber(item.quantity)} {item.unit} · {item.sourceWarehouse} → {item.destination}</p>{item.requestProduct && item.requestProduct !== item.product ? <p className="mt-1 text-xs text-amber-800">Pedido original: {item.requestProduct}</p> : null}</div><button className="text-xs font-bold text-rose-700" onClick={() => removeRouteItem(item.id)} type="button">Remover</button></div>)}</div> : <p className="mt-3 text-sm text-slate-600">Selecione uma solicitação ou adicione um material avulso, depois use “Adicionar pedido à rota”.</p>}</div>
+          {routeItems.length ? <section className="mt-5 overflow-hidden rounded-xl border border-sky-200 bg-sky-50"><div className="flex flex-wrap items-end justify-between gap-3 p-4"><div><h4 className="text-sm font-bold text-sky-950">Mapa da rota</h4><p className="mt-1 text-xs text-sky-900">{routeMap.origin || "Configure a origem"} → {routeMap.destination || "configure o destino"}. Cadastre municípios em Configuração rodoviária para melhorar a rota.</p></div>{routeMap.mapUrl ? <a className="rounded-lg border border-sky-700 bg-white px-3 py-2 text-xs font-bold text-sky-800" href={routeMap.mapUrl} rel="noreferrer" target="_blank">Abrir no Google Maps</a> : null}</div>{routeMap.embedUrl ? <iframe className="h-64 w-full border-0 bg-white" loading="lazy" referrerPolicy="no-referrer-when-downgrade" src={routeMap.embedUrl} title="Mapa da rota da viagem" /> : <div className="m-4 rounded-lg border border-dashed border-sky-300 bg-white p-4 text-sm text-sky-900">Vincule o armazém e o núcleo/destino aos seus municípios para exibir o mapa.</div>}</section> : null}
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4"><p className="text-xs text-slate-500">{selectedDriver && selectedVehicle ? `Rota pronta: ${selectedDriver.fullName} · ${selectedVehicle.plate}` : "Cadastre e selecione motorista e veículo para completar a rota."}</p><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50" disabled={!routeItems.length || !tripDriverId || !tripVehicleId || !tripInvoiceNumber.trim() || Boolean(routeCapacity?.weightExceeded || routeCapacity?.palletExceeded)} onClick={createLogisticsTrip} type="button">Emitir viagem</button></div>
         </section>
         {recipeTrip ? <section className="rounded-2xl border border-sky-200 bg-sky-50 p-5"><div><h3 className="font-semibold text-sky-950">Vincular receita à viagem</h3><p className="mt-1 text-xs text-sky-900">{logisticsTripItems(recipeTrip).length} material(is) · {new Set(logisticsTripItems(recipeTrip).map((item) => item.requestId)).size} solicitação(ões) · NF {recipeTrip.invoiceNumber}</p></div><div className="mt-4 grid gap-3 md:grid-cols-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Cultura<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, culture: event.target.value }))} placeholder="Ex.: Soja" value={recipeDraft.culture} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Alvo<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, target: event.target.value }))} placeholder="Ex.: Mancha-alvo" value={recipeDraft.target} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Dose<input className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal" onChange={(event) => setRecipeDraft((current) => ({ ...current, dose: event.target.value }))} placeholder="Ex.: 0,50 L/ha" value={recipeDraft.dose} /></label></div><div className="mt-4 flex justify-end"><button className="rounded-xl border border-sky-700 bg-white px-4 py-2.5 text-sm font-bold text-sky-800" onClick={attachTripRecipe} type="button">Vincular receita</button></div></section> : null}
       </section> : null}
 
       {logisticsTab === "viagens" ? <section className="space-y-4"><div className="flex flex-wrap items-end justify-between gap-3"><div><h3 className="font-semibold">Viagens emitidas</h3><p className="mt-1 text-xs text-slate-500">Cada documento exportado lista todos os materiais e solicitações vinculados à rota.</p></div><span className="text-sm font-bold text-emerald-800">{logistics.trips.length} registro(s)</span></div><Table empty="Nenhuma viagem emitida." headers={["Solicitações", "Carga da rota", "Rota", "Motorista / placa", "NF", "Receita", "Ações"]} rows={logistics.trips.map((trip) => { const driver = logistics.drivers.find((item) => item.id === trip.driverId); const vehicle = logistics.vehicles.find((item) => item.id === trip.vehicleId); const items = logisticsTripItems(trip); const requests = [...new Set(items.map((item) => item.requestId))]; return [<span key={`${trip.id}-requests`} className="font-semibold">{requests.join(", ")}<br /><small className="font-normal text-slate-500">{requests.length} solicitação(ões)</small></span>, <span key={`${trip.id}-material`}>{items.slice(0, 2).map((item) => <span className="block" key={item.id}>{item.product} <small className="text-slate-500">· {formatNumber(item.quantity)} {item.unit}</small></span>)}{items.length > 2 ? <small className="text-slate-500">+ {items.length - 2} material(is)</small> : null}</span>, <span key={`${trip.id}-route`}>{trip.sourceWarehouse}<br /><small className="text-slate-500">→ {trip.destination}</small></span>, <span key={`${trip.id}-driver`}>{driver?.fullName || "Cadastro removido"}<br /><small className="text-slate-500">{vehicle?.plate || "Placa removida"}</small></span>, trip.invoiceNumber, trip.recipe ? <span className="font-semibold text-emerald-700">{trip.recipe.culture} · {trip.recipe.target}<br /><small>{trip.recipe.dose}</small></span> : <button className="text-xs font-bold text-sky-700" key={`${trip.id}-recipe`} onClick={() => { setRecipeTripId(trip.id); setLogisticsTab("emissao"); }} type="button">Vincular receita</button>, <span className="flex flex-wrap gap-2" key={`${trip.id}-actions`}><button className="rounded-lg border border-emerald-700 px-2.5 py-1.5 text-xs font-bold text-emerald-700" onClick={() => void exportLogisticsDocument(trip)} type="button">Exportar doc.</button><button className="rounded-lg border border-rose-200 px-2.5 py-1.5 text-xs font-bold text-rose-700" onClick={() => removeLogisticsTrip(trip)} type="button">Excluir</button></span>]; })} /></section> : null}
 
-      {logisticsTab === "rodoviaria" ? <section className="grid gap-5 xl:grid-cols-2"><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Motoristas</h3><p className="mt-1 text-xs text-slate-500">Cadastre nome completo e CPF para vincular às viagens.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Nome completo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, fullName: event.target.value }))} value={driverDraft.fullName} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">CPF<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="numeric" onChange={(event) => setDriverDraft((current) => ({ ...current, cpf: event.target.value }))} placeholder="Somente números" value={driverDraft.cpf} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Telefone (opcional)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, phone: event.target.value }))} value={driverDraft.phone} /></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadDriver} type="button">Cadastrar motorista</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum motorista cadastrado." headers={["Motorista", "CPF", "Telefone", "Ação"]} rows={logistics.drivers.map((driver) => [driver.fullName, driver.cpf, driver.phone || "—", <button className="text-xs font-bold text-rose-700" key={driver.id} onClick={() => removeRoadDriver(driver)} type="button">Excluir</button>])} /></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Veículos</h3><p className="mt-1 text-xs text-slate-500">A capacidade é armazenada em kg para apoiar a separação de carga.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Placa<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal uppercase" onChange={(event) => setVehicleDraft((current) => ({ ...current, plate: event.target.value }))} placeholder="ABC1D23" value={vehicleDraft.plate} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">Modelo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, model: event.target.value }))} placeholder="Ex.: Bitruck" value={vehicleDraft.model} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Capacidade (kg)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="decimal" onChange={(event) => setVehicleDraft((current) => ({ ...current, capacity: event.target.value }))} placeholder="Ex.: 15000" value={vehicleDraft.capacity} /></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadVehicle} type="button">Cadastrar veículo</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum veículo cadastrado." headers={["Placa", "Modelo", "Capacidade", "Ação"]} rows={logistics.vehicles.map((vehicle) => [vehicle.plate, vehicle.model, `${formatNumber(vehicle.capacity)} kg`, <button className="text-xs font-bold text-rose-700" key={vehicle.id} onClick={() => removeRoadVehicle(vehicle)} type="button">Excluir</button>])} /></div></section></section> : null}
+      {logisticsTab === "rodoviaria" ? <section className="grid gap-5 xl:grid-cols-2"><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Motoristas</h3><p className="mt-1 text-xs text-slate-500">Cadastre nome completo e CPF. A vinculação padrão é definida no veículo.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Nome completo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, fullName: event.target.value }))} value={driverDraft.fullName} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">CPF<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="numeric" onChange={(event) => setDriverDraft((current) => ({ ...current, cpf: event.target.value }))} placeholder="Somente números" value={driverDraft.cpf} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Telefone (opcional)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setDriverDraft((current) => ({ ...current, phone: event.target.value }))} value={driverDraft.phone} /></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadDriver} type="button">Cadastrar motorista</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum motorista cadastrado." headers={["Motorista", "CPF", "Telefone", "Ação"]} rows={logistics.drivers.map((driver) => [driver.fullName, driver.cpf, driver.phone || "—", <button className="text-xs font-bold text-rose-700" key={driver.id} onClick={() => removeRoadDriver(driver)} type="button">Excluir</button>])} /></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5"><h3 className="font-semibold">Veículos</h3><p className="mt-1 text-xs text-slate-500">Informe limites de peso, paletes, rastreador e o motorista geralmente vinculado à placa.</p><div className="mt-4 grid gap-3"><label className="grid gap-1 text-sm font-semibold text-slate-700">Placa<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal uppercase" onChange={(event) => setVehicleDraft((current) => ({ ...current, plate: event.target.value }))} placeholder="ABC1D23" value={vehicleDraft.plate} /></label><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">Modelo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, model: event.target.value }))} placeholder="Ex.: Bitruck" value={vehicleDraft.model} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Tipo<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, ownership: event.target.value as "interno" | "terceiro" }))} value={vehicleDraft.ownership}><option value="interno">Veículo interno</option><option value="terceiro">Terceiro</option></select></label></div><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">Capacidade (kg)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="decimal" onChange={(event) => setVehicleDraft((current) => ({ ...current, capacity: event.target.value }))} placeholder="Ex.: 15000" value={vehicleDraft.capacity} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Capacidade (paletes)<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" inputMode="decimal" onChange={(event) => setVehicleDraft((current) => ({ ...current, palletCapacity: event.target.value }))} placeholder="Ex.: 24" value={vehicleDraft.palletCapacity} /></label></div><div className="grid gap-3 sm:grid-cols-2"><label className="grid gap-1 text-sm font-semibold text-slate-700">Isca / rastreador<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, trackerNumber: event.target.value }))} placeholder="Nº da isca" value={vehicleDraft.trackerNumber} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Motorista vinculado<select className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setVehicleDraft((current) => ({ ...current, defaultDriverId: event.target.value }))} value={vehicleDraft.defaultDriverId}><option value="">Selecionar depois</option>{logistics.drivers.map((driver) => <option key={driver.id} value={driver.id}>{driver.fullName}</option>)}</select></label></div><button className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white" onClick={addRoadVehicle} type="button">Cadastrar veículo</button></div><div className="mt-5 border-t border-slate-100 pt-4"><Table empty="Nenhum veículo cadastrado." headers={["Placa / tipo", "Modelo", "Capacidade", "Motorista / rastreador", "Ação"]} rows={logistics.vehicles.map((vehicle) => { const driver = logistics.drivers.find((item) => item.id === vehicle.defaultDriverId); return [<span key={`${vehicle.id}-plate`} className="font-semibold">{vehicle.plate}<br /><small className="font-normal text-slate-500">{vehicle.ownership === "terceiro" ? "Terceiro" : "Interno"}</small></span>, vehicle.model, `${formatNumber(vehicle.capacity)} kg${vehicle.palletCapacity ? ` · ${formatNumber(vehicle.palletCapacity)} paletes` : ""}`, <span key={`${vehicle.id}-driver`}>{driver?.fullName || "Sem motorista padrão"}<br /><small className="text-slate-500">{vehicle.trackerNumber ? `Isca ${vehicle.trackerNumber}` : "Sem isca"}</small></span>, <button className="text-xs font-bold text-rose-700" key={vehicle.id} onClick={() => removeRoadVehicle(vehicle)} type="button">Excluir</button>]; })} /></div></section><section className="rounded-2xl border border-slate-200 bg-white p-5 xl:col-span-2"><h3 className="font-semibold">Premissas de rota: centro / núcleo → município</h3><p className="mt-1 text-xs text-slate-500">Use o mesmo nome ou código exibido na origem e no destino. Essas premissas alimentam a prévia do mapa.</p><div className="mt-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"><label className="grid gap-1 text-sm font-semibold text-slate-700">Centro, armazém ou núcleo<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setLocationDraft((current) => ({ ...current, location: event.target.value }))} placeholder="Ex.: 0714, BRAVO SORRISO, NC-AGV" value={locationDraft.location} /></label><label className="grid gap-1 text-sm font-semibold text-slate-700">Município<input className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal" onChange={(event) => setLocationDraft((current) => ({ ...current, municipality: event.target.value }))} placeholder="Ex.: Sorriso - MT" value={locationDraft.municipality} /></label><button className="self-end rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700" onClick={addLogisticsLocation} type="button">Vincular município</button></div><div className="mt-5"><Table empty="Nenhum município vinculado ainda." headers={["Centro / núcleo", "Município"]} rows={Object.entries(logistics.municipalityByLocation || {}).sort(([left], [right]) => left.localeCompare(right)).map(([location, municipality]) => [location, municipality])} /></div></section></section> : null}
     </section> : <section className="rounded-2xl border border-amber-200 bg-amber-50 p-6"><h2 className="font-semibold text-amber-950">Acesso restrito</h2><p className="mt-2 text-sm text-amber-900">A logística de carregamento pode ser consultada e administrada somente por usuários administradores.</p></section>;
   } else if (active === "Usuários") {
     content = currentUser?.role === "admin" ? <section className="space-y-5">
