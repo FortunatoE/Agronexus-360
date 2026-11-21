@@ -79,7 +79,7 @@ O objetivo não é apenas exibir indicadores: é deixar explícitas as regras de
 | Alertas | Repasse em até 30 dias, risco de disponibilidade, variação expressiva de dose e vencimento de estoque. |
 | Tarefas | Farol de pedidos, filtros, histórico de ações, vínculo a pedido/material e exportação. |
 | Premissas | Visão tabulada e editável de dimensões, conversões, centros, núcleos, culturas e regras operacionais. |
-| Logística | Motoristas, veículos, rotas com múltiplas solicitações, NF, receita e documento Excel. |
+| Logística | Reservas por saldo de pedido SAP, veículos, motoristas, rota multi-item, status, NF, receita e documento Excel. |
 | Fechamentos | Distribuições comercialmente fechadas, calendarização mensal, anotações e vínculo posterior aos pedidos de compra. |
 | Usuários | Login, sessão, administração de contas e recorte de acesso para operadores por núcleo. |
 
@@ -170,7 +170,7 @@ PersistedWorkspace
 | ZPS007 | Execução e área registrada | DiagRede, operação, status e área executada. |
 | CN52 | Consumo/aplicado | Elemento PEP, centro, talhão, material e quantidade retirada. |
 | ZMM_BATCH | Estoque prioritário | Centro, depósito, lote, utilização livre, nome/local de estoque especial. |
-| MB52 | Complemento de estoque | Usado somente quando a apresentação não aparece na BATCH. |
+| MB52 | Complemento de estoque e valor de carga | Usado somente quando a apresentação não aparece na BATCH; `Val.utiliz.livre` é a fonte prioritária do valor disponível. |
 | MB5T | Materiais em trânsito | Centro, destino, material e quantidade. |
 | Pedidos pendentes | Demanda em aberto | Pedido, produto, volume e `DtRemPed`. |
 | Dimensões.xlsx | Semântica e regras | Ativo, grupo, subgrupo, padrão, conversão, centro, núcleo e cultura. |
@@ -319,30 +319,51 @@ O módulo **Logística** é administrativo e usa as fontes `Estoque webAgil` e `
 ### Configuração rodoviária
 
 - Cadastro de motorista: nome completo, CPF e telefone opcional.
-- Cadastro de veículo: placa, modelo e capacidade em quilogramas.
+- Cadastro de veículo: placa, modelo, capacidade em quilogramas e paletes, isca/rastreador, tipo interno/terceiro e motorista padrão por placa.
+- Cadastro de premissas de rota a partir de uma lista controlada de centros, armazéns e núcleos, com município e link de endereço específico para o mapa.
 - Proteção contra excluir motorista ou veículo já vinculado a uma viagem.
 
-### Uma rota, várias solicitações
+### Emissão: uma rota, vários pedidos SAP
 
-Uma viagem não está limitada a uma única solicitação. O fluxo foi modelado para a rotina real de carregamento:
+Uma viagem não está limitada a um único pedido ou material SAP. O fluxo preserva a separação entre o planejamento de rota e a solicitação operacional do webAgil:
 
 ```text
-Selecionar solicitação + material/lote
+Selecionar pedido SAP com saldo restante
         ↓
-Adicionar à carga da rota
+Selecionar material físico e saldo consolidado na origem
         ↓
-Trocar a solicitação e repetir quantas vezes for necessário
+Adicionar item à carga e repetir para os demais pedidos
         ↓
-Selecionar motorista, veículo e NF
+Selecionar data, motorista e veículo
         ↓
 Emitir uma viagem única
         ↓
-Vincular receita, se aplicável
+Vincular NF, solicitação webAgil e receitas posteriormente
 ```
 
-Cada item da rota preserva sua solicitação, data, produto, código, lote, quantidade, origem e destino. A viagem concentra motorista, veículo, nota fiscal, data de emissão e receita. Assim, uma mesma NF pode transportar diversos materiais e solicitações sem perder rastreabilidade.
+Cada item da rota preserva seu pedido SAP, data solicitada, produto solicitado, produto físico, código, quantidade, origem e destino. O lote não é reservado durante o planejamento: ele é definido no carregamento físico. A viagem concentra a data operacional, motorista, veículo, status, notas fiscais e receitas.
 
-O documento Excel é gerado com **uma linha por item da rota**, repetindo os dados gerais da viagem. Viagens legadas de uma única solicitação continuam compatíveis com o modelo novo.
+### Regras de reserva, capacidade e valor
+
+| Regra | Comportamento operacional |
+| --- | --- |
+| Saldo de pedido SAP | A quantidade emitida é descontada do saldo disponível do pedido/material. Pedidos totalmente reservados deixam de aparecer na fila para impedir duplicação de volume. Viagens legadas também são reconhecidas por pedido e produto. |
+| Estoque da origem | O armazém usa saldo consolidado por material/local; coleta em fazenda usa a unidade com saldo disponível. Materiais sem pedido podem usar o estoque geral. |
+| Lote | O lote não é escolhido na reserva inicial; a rota mostra `lote a definir` até a operação física. |
+| Peso | Apenas massa explicitamente reconhecida em kg é usada para validar a capacidade. Litros e mililitros não viram kg sem uma densidade cadastrada, evitando conversões incorretas como `2.000 UN × 20 L = 40.000 kg`. |
+| Paletes | A carga acumula os paletes informados no estoque webAgil e compara com a capacidade do veículo. |
+| Valor da carga | O valor unitário é derivado do estoque SAP, priorizando `MB52[Val.utiliz.livre]`, e é acumulado por item na rota. Cargas acima de R$ 1 milhão sinalizam necessidade de escolta e isca. |
+| Mesma placa/data | Ao escolher uma data já usada pela mesma placa, a tela apresenta aviso antes da emissão; o usuário pode confirmar a disponibilidade e seguir. |
+
+### Pós-emissão e rastreabilidade
+
+- Status de operação por viagem: **Em progresso** (fiscal/agendamento), **Rota ativa** (veículo em deslocamento) e **Concluído**.
+- Notas fiscais são vinculadas após a emissão e uma viagem pode registrar várias NFs.
+- A solicitação webAgil é vinculada apenas depois que a rota SAP existe. Uma mesma solicitação pode pertencer a somente uma viagem, evitando duplicidade de expedição.
+- A receita permite várias recomendações por viagem. Ao selecionar destino e produto, o volume lançado na carga é sugerido automaticamente, mas continua editável.
+- O documento Excel é gerado com **uma linha por item da rota** e inclui data, status, pedido, origem, destino, motorista, placa, NF e dados de receita.
+
+Viagens legadas de uma única solicitação continuam compatíveis com o modelo novo.
 
 ## Fechamentos comerciais
 
@@ -397,7 +418,7 @@ O administrador pode criar, editar e excluir usuários. A aplicação impede rem
 - O payload é compactado antes de ser gravado e descompactado em worker no navegador.
 - A API compacta cargas antigas automaticamente quando identifica o formato anterior.
 - A tela de carregamento existe para aguardar dados sem bloquear a interface durante parsing, reconciliação e renderização.
-- Tarefas, histórico, motoristas, veículos, viagens, fechamentos e anotações permanecem no mesmo workspace central.
+- Tarefas, histórico, motoristas, veículos, reservas de pedido, viagens, status, fechamentos e anotações permanecem no mesmo workspace central.
 
 ## Como executar localmente
 
@@ -466,6 +487,13 @@ vercel --prod
 ```
 
 O arquivo `vercel.json` define `npm run build:vercel`, publica `dist-vercel/` e preserva o fallback de SPA. As APIs em `api/` são detectadas como funções serverless.
+
+Após uma publicação direta pela CLI, valide o domínio principal e os logs:
+
+```powershell
+vercel inspect https://agronexus-360.vercel.app
+vercel logs https://agronexus-360.vercel.app --level error --since 1h
+```
 
 ### Checklist de uma atualização operacional
 

@@ -248,7 +248,9 @@ type LogisticsTrip = {
   driverId: string;
   vehicleId: string;
   invoiceNumber: string;
+  tripDate?: string;
   createdAt: string;
+  status?: "Em progresso" | "Rota ativa" | "Concluído";
   recipe?: TripRecipe;
   recipes?: TripRecipe[];
   items?: LogisticsTripItem[];
@@ -429,6 +431,9 @@ function logisticsTripInvoices(trip: LogisticsTrip) {
     : [trip.invoiceNumber];
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
+function logisticsTripDate(trip: LogisticsTrip) {
+  return trip.tripDate || dateKey(new Date(trip.createdAt));
+}
 function logisticsTripRecipes(trip: LogisticsTrip) {
   if (trip.recipes?.length) return trip.recipes;
   return trip.recipe
@@ -442,6 +447,23 @@ function logisticsTripRecipes(trip: LogisticsTrip) {
         },
       ]
     : [];
+}
+function tripRecipeVolume(
+  trip: LogisticsTrip,
+  destination: string,
+  product: string,
+) {
+  const normalizedDestination = normalizeMaterial(destination);
+  const normalizedProduct = normalizeMaterial(product);
+  if (!normalizedDestination || !normalizedProduct) return 0;
+  return logisticsTripItems(trip)
+    .filter(
+      (item) =>
+        normalizeMaterial(item.destination) === normalizedDestination &&
+        (normalizeMaterial(item.product) === normalizedProduct ||
+          normalizeMaterial(item.requestProduct || "") === normalizedProduct),
+    )
+    .reduce((total, item) => total + item.quantity, 0);
 }
 function logisticsMunicipalityFor(
   location: string,
@@ -481,8 +503,11 @@ function inferredPackageWeightKg(product: string, unit: string) {
     : Number(direct?.[1] || 0);
   const rawUnit = multiplied?.[3] || direct?.[2] || "";
   if (!Number.isFinite(rawAmount) || rawAmount <= 0) return 0;
-  if (rawUnit === "KG" || rawUnit === "L") return rawAmount;
-  return rawAmount / 1000;
+  if (rawUnit === "KG") return rawAmount;
+  if (rawUnit === "G") return rawAmount / 1000;
+  // Litros e mililitros são volume, não massa. Sem densidade cadastrada,
+  // não podem ser usados para ocupar a capacidade em kg do veículo.
+  return 0;
 }
 let xlsxLoader: Promise<typeof import("xlsx")> | null = null;
 function loadXlsx() {
@@ -2038,6 +2063,7 @@ export default function Home() {
   const [routeItems, setRouteItems] = useState<LogisticsTripItem[]>([]);
   const [tripDriverId, setTripDriverId] = useState("");
   const [tripVehicleId, setTripVehicleId] = useState("");
+  const [tripDate, setTripDate] = useState(() => dateKey(new Date()));
   const [webLinkDrafts, setWebLinkDrafts] = useState<Record<string, string>>(
     {},
   );
@@ -4124,12 +4150,62 @@ export default function Home() {
   const dispatchedByRequestLine = useMemo(() => {
     const values = new Map<string, number>();
     logistics.trips.flatMap(logisticsTripItems).forEach((item) => {
-      const key = item.requestLineId || item.id;
-      if (!key || item.sourceMode === "manual") return;
+      if (!item.requestLineId || item.sourceMode === "manual") return;
+      values.set(
+        item.requestLineId,
+        (values.get(item.requestLineId) || 0) + item.quantity,
+      );
+    });
+    return values;
+  }, [logistics.trips]);
+  const legacyDispatchedByRequestProduct = useMemo(() => {
+    const values = new Map<string, number>();
+    logistics.trips.flatMap(logisticsTripItems).forEach((item) => {
+      if (
+        item.requestLineId ||
+        item.sourceMode === "manual" ||
+        item.requestId === "SEM-PEDIDO"
+      )
+        return;
+      const key = [
+        normalizeMaterial(item.requestId),
+        normalizeMaterial(item.requestProduct || item.product),
+      ].join("|");
       values.set(key, (values.get(key) || 0) + item.quantity);
     });
     return values;
   }, [logistics.trips]);
+  function remainingForLogisticsLine(
+    request: LogisticsRequest,
+    line: LogisticsRequestLine,
+  ) {
+    const exactDispatched = dispatchedByRequestLine.get(line.id) || 0;
+    const legacyKey = [
+      normalizeMaterial(request.requestNumber),
+      normalizeMaterial(line.product),
+    ].join("|");
+    const legacyDispatched =
+      legacyDispatchedByRequestProduct.get(legacyKey) || 0;
+    return Math.max(0, line.quantity - exactDispatched - legacyDispatched);
+  }
+  const availableLogisticsRequests = logisticsRequests.filter((request) =>
+    request.lines.some(
+      (line) => remainingForLogisticsLine(request, line) > 0,
+    ),
+  );
+  const availableFilteredLogisticsRequests = filteredLogisticsRequests.filter(
+    (request) =>
+      request.lines.some(
+        (line) => remainingForLogisticsLine(request, line) > 0,
+      ),
+  );
+  const linkedWebRequestIds = useMemo(
+    () =>
+      new Set(
+        logistics.trips.flatMap((trip) => trip.webRequestIds || []),
+      ),
+    [logistics.trips],
+  );
   const selectedLogisticsRequest =
     logisticsRequests.find((request) => request.id === tripRequestId) || null;
   const selectedLogisticsLine =
@@ -4137,10 +4213,9 @@ export default function Home() {
       (line) => line.id === tripMaterialKey,
     ) || null;
   const selectedLineRemaining = selectedLogisticsLine
-    ? Math.max(
-        0,
-        selectedLogisticsLine.quantity -
-          (dispatchedByRequestLine.get(selectedLogisticsLine.id) || 0),
+    ? remainingForLogisticsLine(
+        selectedLogisticsRequest!,
+        selectedLogisticsLine,
       )
     : 0;
   const webStockOptions = useMemo(
@@ -4209,8 +4284,8 @@ export default function Home() {
               row,
               "Peso KG",
               "Peso (kg)",
-              "Peso",
-              "Peso Total",
+              "Peso total KG",
+              "Peso total (kg)",
             ),
           };
         })
@@ -4318,6 +4393,10 @@ export default function Home() {
       const quantity = quantityFor(row, "stock");
       const total = readNumber(
         row,
+        "Val.utiliz.livre",
+        "Val. utiliz. livre",
+        "Valor utilizável livre",
+        "Valor utilizavel livre",
         "Valor total",
         "Valor Total",
         "Valor total estoque",
@@ -4507,8 +4586,13 @@ export default function Home() {
     const sourceBalance = selectedSourceBalance || 1;
     const sourcePallets =
       tripSourceMode === "coleta" ? 0 : selectedWarehouseStock?.pallets || 0;
+    const isVolumetricProduct = /\b\d+(?:[,.]\d+)?\s*(?:L|ML)\b/i.test(
+      sourceProduct,
+    );
     const sourceWeight =
-      tripSourceMode === "coleta" ? 0 : selectedWarehouseStock?.weightKg || 0;
+      tripSourceMode === "coleta" || isVolumetricProduct
+        ? 0
+        : selectedWarehouseStock?.weightKg || 0;
     const inferredWeight = inferredPackageWeightKg(
       sourceProduct,
       selectedLogisticsLine.unit,
@@ -4577,10 +4661,25 @@ export default function Home() {
   const selectedLogisticsVehicle = logistics.vehicles.find(
     (vehicle) => vehicle.id === tripVehicleId,
   );
+  const samePlateTripsOnDate = useMemo(
+    () =>
+      tripVehicleId && tripDate
+        ? logistics.trips.filter(
+            (trip) =>
+              trip.vehicleId === tripVehicleId &&
+              logisticsTripDate(trip) === tripDate,
+          )
+        : [],
+    [logistics.trips, tripDate, tripVehicleId],
+  );
   const routeLoad = useMemo(
     () => ({
       pallets: routeItems.reduce((sum, item) => sum + (item.pallets || 0), 0),
       weightKg: routeItems.reduce((sum, item) => sum + (item.weightKg || 0), 0),
+      itemsWithoutWeight: routeItems.filter(
+        (item) =>
+          !item.weightKg && !String(item.unit || "").toUpperCase().includes("KG"),
+      ).length,
       value: routeItems.reduce(
         (sum, item) => sum + (item.estimatedValue || 0),
         0,
@@ -5385,9 +5484,13 @@ export default function Home() {
   function selectLogisticsRequest(id: string) {
     const request = logisticsRequests.find((item) => item.id === id);
     const line = request?.lines[0];
-    const remaining = line
-      ? Math.max(0, line.quantity - (dispatchedByRequestLine.get(line.id) || 0))
-      : 0;
+    const remaining = request && line ? remainingForLogisticsLine(request, line) : 0;
+    if (!request || !line || remaining <= 0) {
+      setLogisticsMessage(
+        "Este pedido já foi totalmente reservado em viagens emitidas.",
+      );
+      return;
+    }
     setTripRequestId(id);
     setTripMaterialKey(line?.id || "");
     setTripFulfillmentStockId("");
@@ -5574,9 +5677,9 @@ export default function Home() {
       (item) => item.id === tripVehicleId,
     );
     const primary = routeItems[0];
-    if (!primary || !driver || !vehicle) {
+    if (!primary || !driver || !vehicle || !tripDate) {
       setLogisticsMessage(
-        "Adicione ao menos um material à rota e informe motorista e veículo.",
+        "Adicione ao menos um material à rota e informe data, motorista e veículo.",
       );
       return;
     }
@@ -5610,6 +5713,8 @@ export default function Home() {
       vehicleId: vehicle.id,
       invoiceNumber: "",
       invoiceNumbers: [],
+      status: "Em progresso",
+      tripDate,
       createdAt: new Date().toISOString(),
       items: routeItems,
     };
@@ -5623,13 +5728,31 @@ export default function Home() {
     setTripCollectionId("");
     setTripQuantity("");
     setRouteItems([]);
+    setTripDate(dateKey(new Date()));
     setLogisticsTab("viagens");
     setLogisticsMessage(
-      `Viagem ${trip.id.replace("viagem-", "")} emitida com ${routeItems.length} material(is) de ${new Set(routeItems.map((item) => item.requestId)).size} pedido(s) SAP. Vincule notas fiscais, solicitações WebAgil e receitas posteriormente.`,
+      `Viagem ${trip.id.replace("viagem-", "")} emitida para ${new Intl.DateTimeFormat("pt-BR").format(new Date(`${tripDate}T00:00:00`))} com ${routeItems.length} material(is) de ${new Set(routeItems.map((item) => item.requestId)).size} pedido(s) SAP.${samePlateTripsOnDate.length ? " Atenção: já existe outra rota para esta placa na mesma data." : ""} Vincule notas fiscais, solicitações WebAgil e receitas posteriormente.`,
     );
     recordAudit(
       "workspace",
       `Viagem emitida com ${routeItems.length} material(is) para ${new Set(routeItems.map((item) => item.requestId)).size} pedido(s) SAP.`,
+    );
+  }
+  function updateLogisticsTripStatus(
+    tripId: string,
+    status: NonNullable<LogisticsTrip["status"]>,
+  ) {
+    if (currentUser?.role !== "admin") return;
+    setLogistics((current) => ({
+      ...current,
+      trips: current.trips.map((trip) =>
+        trip.id === tripId ? { ...trip, status } : trip,
+      ),
+    }));
+    setLogisticsMessage(`Status da viagem atualizado para “${status}”.`);
+    recordAudit(
+      "workspace",
+      `Status da viagem ${tripId.replace("viagem-", "")} atualizado para ${status}.`,
     );
   }
   function attachTripRecipe() {
@@ -5768,6 +5891,16 @@ export default function Home() {
       );
       return;
     }
+    const linkedTrip = logistics.trips.find(
+      (trip) =>
+        trip.id !== tripId && (trip.webRequestIds || []).includes(request.id),
+    );
+    if (linkedTrip) {
+      setLogisticsMessage(
+        `A solicitação WebAgil ${request.requestNumber} já está vinculada à viagem ${linkedTrip.id.replace("viagem-", "")} e não pode ser usada em outra rota.`,
+      );
+      return;
+    }
     setLogistics((current) => ({
       ...current,
       trips: current.trips.map((trip) =>
@@ -5835,6 +5968,8 @@ export default function Home() {
     const rows = [
       [
         "Viagem",
+        "Data da viagem",
+        "Status da viagem",
         "Pedido SAP",
         "Solicitação WebAgil",
         "Data do pedido",
@@ -5863,6 +5998,8 @@ export default function Home() {
       ],
       ...logisticsTripItems(trip).map((item) => [
         trip.id.replace("viagem-", ""),
+        logisticsTripDate(trip),
+        trip.status || "Em progresso",
         item.requestId,
         (trip.webRequestIds || [])
           .map(
@@ -9201,7 +9338,7 @@ export default function Home() {
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
                 <Card
                   label="Pedidos SAP disponíveis"
-                  value={logisticsRequests.length}
+                  value={availableLogisticsRequests.length}
                   note="com saldo restante para expedição"
                 />
                 <Card
@@ -9274,7 +9411,7 @@ export default function Home() {
                 >
                   Vincular pedidos
                   <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs">
-                    {logisticsRequests.length}
+                    {availableLogisticsRequests.length}
                   </span>
                 </button>
               </section>
@@ -9316,13 +9453,13 @@ export default function Home() {
                         const line = selectedLogisticsRequest?.lines.find(
                           (item) => item.id === event.target.value,
                         );
-                        const pending = line
-                          ? Math.max(
-                              0,
-                              line.quantity -
-                                (dispatchedByRequestLine.get(line.id) || 0),
-                            )
-                          : 0;
+                        const pending =
+                          selectedLogisticsRequest && line
+                            ? remainingForLogisticsLine(
+                                selectedLogisticsRequest,
+                                line,
+                              )
+                            : 0;
                         setTripMaterialKey(event.target.value);
                         setTripFulfillmentStockId("");
                         setTripCollectionId("");
@@ -9332,10 +9469,9 @@ export default function Home() {
                     >
                       <option value="">Selecione o material</option>
                       {selectedLogisticsRequest?.lines.map((line) => {
-                        const pending = Math.max(
-                          0,
-                          line.quantity -
-                            (dispatchedByRequestLine.get(line.id) || 0),
+                        const pending = remainingForLogisticsLine(
+                          selectedLogisticsRequest,
+                          line,
                         );
                         return (
                           <option
@@ -9705,6 +9841,15 @@ export default function Home() {
                     </select>
                   </label>
                   <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
+                    Data da viagem
+                    <input
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                      onChange={(event) => setTripDate(event.target.value)}
+                      type="date"
+                      value={tripDate}
+                    />
+                  </label>
+                  <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
                     Motorista
                     <select
                       className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
@@ -9719,6 +9864,17 @@ export default function Home() {
                       ))}
                     </select>
                   </label>
+                  {samePlateTripsOnDate.length ? (
+                    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-950 lg:col-span-2">
+                      <strong>Placa já programada nesta data.</strong> Há{" "}
+                      {samePlateTripsOnDate.length} rota(s) para esta placa em{" "}
+                      {new Intl.DateTimeFormat("pt-BR").format(
+                        new Date(`${tripDate}T00:00:00`),
+                      )}
+                      . Você pode seguir, mas confirme a disponibilidade do
+                      veículo.
+                    </div>
+                  ) : null}
                 </div>
                 <div className="mt-5 rounded-xl border border-emerald-100 bg-emerald-50/50 p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -9755,12 +9911,16 @@ export default function Home() {
                         routeCapacity.weightExceeded ||
                           routeCapacity.palletExceeded
                           ? "bg-rose-100 text-rose-800"
+                          : routeLoad.itemsWithoutWeight
+                            ? "bg-amber-100 text-amber-900"
                           : "bg-white text-emerald-800",
                       )}
                     >
                       {routeCapacity.weightExceeded ||
                       routeCapacity.palletExceeded
                         ? "Capacidade excedida: revise a carga antes de emitir."
+                        : routeLoad.itemsWithoutWeight
+                          ? `Capacidade parcial: ${formatNumber(routeLoad.weightKg)} de ${formatNumber(selectedLogisticsVehicle?.capacity || 0)} kg. ${routeLoad.itemsWithoutWeight} material(is) sem peso em kg informado; informe o peso para validar a capacidade total.`
                         : `Capacidade validada: ${formatNumber(routeLoad.weightKg)} de ${formatNumber(selectedLogisticsVehicle?.capacity || 0)} kg${selectedLogisticsVehicle?.palletCapacity ? ` · ${formatNumber(routeLoad.pallets)} de ${formatNumber(selectedLogisticsVehicle.palletCapacity)} paletes` : ""}.`}
                     </p>
                   ) : (
@@ -9799,7 +9959,10 @@ export default function Home() {
                                 ? "Sem pedido"
                                 : `Pedido SAP ${item.requestId}`}{" "}
                               · {formatNumber(item.quantity)} {item.unit} ·{" "}
-                              {formatNumber(item.weightKg || 0)} kg ·{" "}
+                              {item.weightKg
+                                ? `${formatNumber(item.weightKg)} kg`
+                                : "peso não informado"}{" "}
+                              ·{" "}
                               {formatCurrency(item.estimatedValue || 0, "BRL")}{" "}
                               · {item.sourceWarehouse} → {item.destination}
                             </p>
@@ -9894,6 +10057,7 @@ export default function Home() {
                     className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50"
                     disabled={
                       !routeItems.length ||
+                      !tripDate ||
                       !tripDriverId ||
                       !tripVehicleId ||
                       Boolean(
@@ -9931,7 +10095,8 @@ export default function Home() {
                   "Pedidos SAP / WebAgil",
                   "Carga da rota",
                   "Rota",
-                  "Motorista / placa",
+                  "Data / motorista / placa",
+                  "Status",
                   "NF",
                   "Receita",
                   "Ações",
@@ -10000,12 +10165,42 @@ export default function Home() {
                       </small>
                     </span>,
                     <span key={`${trip.id}-driver`}>
+                      <strong>
+                        {new Intl.DateTimeFormat("pt-BR").format(
+                          new Date(`${logisticsTripDate(trip)}T00:00:00`),
+                        )}
+                      </strong>
+                      <br />
                       {driver?.fullName || "Cadastro removido"}
                       <br />
                       <small className="text-slate-500">
                         {vehicle?.plate || "Placa removida"}
                       </small>
                     </span>,
+                    <select
+                      aria-label={`Status da viagem ${trip.id}`}
+                      className={cn(
+                        "rounded-lg border px-2.5 py-2 text-xs font-bold",
+                        (trip.status || "Em progresso") === "Concluído"
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                          : (trip.status || "Em progresso") === "Rota ativa"
+                            ? "border-sky-200 bg-sky-50 text-sky-800"
+                            : "border-amber-200 bg-amber-50 text-amber-900",
+                      )}
+                      key={`${trip.id}-status`}
+                      onChange={(event) =>
+                        updateLogisticsTripStatus(
+                          trip.id,
+                          event.target
+                            .value as NonNullable<LogisticsTrip["status"]>,
+                        )
+                      }
+                      value={trip.status || "Em progresso"}
+                    >
+                      <option>Em progresso</option>
+                      <option>Rota ativa</option>
+                      <option>Concluído</option>
+                    </select>,
                     <span key={`${trip.id}-invoices`}>
                       {logisticsTripInvoices(trip).join(", ") || "—"}
                     </span>,
@@ -10039,14 +10234,15 @@ export default function Home() {
                       <button
                         className="rounded-lg border border-sky-700 px-2.5 py-1.5 text-xs font-bold text-sky-800"
                         onClick={() => {
+                          const firstItem = logisticsTripItems(trip)[0];
                           setRecipeTripId(trip.id);
                           setRecipeDraft({
                             culture: "",
-                            destination: trip.destination,
+                            destination: firstItem?.destination || trip.destination,
                             dose: "",
-                            product: logisticsTripItems(trip)[0]?.product || "",
+                            product: firstItem?.product || trip.product,
                             target: "",
-                            volume: 0,
+                            volume: firstItem?.quantity || trip.quantity,
                           });
                         }}
                         type="button"
@@ -10161,10 +10357,18 @@ export default function Home() {
                       <select
                         className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal"
                         onChange={(event) =>
-                          setRecipeDraft((current) => ({
-                            ...current,
-                            destination: event.target.value,
-                          }))
+                          setRecipeDraft((current) => {
+                            const volume = tripRecipeVolume(
+                              recipeTrip,
+                              event.target.value,
+                              current.product,
+                            );
+                            return {
+                              ...current,
+                              destination: event.target.value,
+                              volume,
+                            };
+                          })
                         }
                         value={recipeDraft.destination}
                       >
@@ -10185,10 +10389,18 @@ export default function Home() {
                       <select
                         className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal"
                         onChange={(event) =>
-                          setRecipeDraft((current) => ({
-                            ...current,
-                            product: event.target.value,
-                          }))
+                          setRecipeDraft((current) => {
+                            const volume = tripRecipeVolume(
+                              recipeTrip,
+                              current.destination,
+                              event.target.value,
+                            );
+                            return {
+                              ...current,
+                              product: event.target.value,
+                              volume,
+                            };
+                          })
                         }
                         value={recipeDraft.product}
                       >
@@ -10307,7 +10519,8 @@ export default function Home() {
                   </h4>
                   <p className="mt-1 text-xs leading-relaxed text-sky-900">
                     Após criar a rota pelos pedidos SAP, associe aqui uma ou
-                    mais solicitações processadas no WebAgil. Esse vínculo é
+                    mais solicitações processadas no WebAgil. Cada solicitação
+                    só pode ser vinculada a uma única viagem. Esse vínculo é
                     posterior e não altera o planejamento da viagem.
                   </p>
                 </div>
@@ -10393,13 +10606,18 @@ export default function Home() {
                                 <option value="">
                                   Selecione a solicitação WebAgil
                                 </option>
-                                {webAgilRequests.map((request) => (
+                                {webAgilRequests
+                                  .filter(
+                                    (request) =>
+                                      !linkedWebRequestIds.has(request.id),
+                                  )
+                                  .map((request) => (
                                   <option key={request.id} value={request.id}>
                                     {request.requestNumber} ·{" "}
                                     {request.destination ||
                                       "Destino não informado"}
                                   </option>
-                                ))}
+                                  ))}
                               </select>
                               <button
                                 className="rounded-lg border border-sky-700 px-3 py-2 text-sm font-bold text-sky-800 disabled:opacity-50"
@@ -10772,11 +10990,11 @@ export default function Home() {
                     </button>
                   ) : null}
                 </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <label className="grid gap-1 text-sm font-semibold text-slate-700">
+                <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_auto]">
+                  <label className="grid min-w-0 gap-1 text-sm font-semibold text-slate-700">
                     Centro, armazém ou núcleo
                     <select
-                      className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                      className="min-w-0 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
                       onChange={(event) =>
                         setLocationDraft((current) => ({
                           ...current,
@@ -10793,10 +11011,10 @@ export default function Home() {
                       ))}
                     </select>
                   </label>
-                  <label className="grid gap-1 text-sm font-semibold text-slate-700">
+                  <label className="grid min-w-0 gap-1 text-sm font-semibold text-slate-700">
                     Município
                     <input
-                      className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                      className="min-w-0 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
                       onChange={(event) =>
                         setLocationDraft((current) => ({
                           ...current,
@@ -10807,10 +11025,10 @@ export default function Home() {
                       value={locationDraft.municipality}
                     />
                   </label>
-                  <label className="grid gap-1 text-sm font-semibold text-slate-700">
+                  <label className="grid min-w-0 gap-1 text-sm font-semibold text-slate-700">
                     Link do endereço específico
                     <input
-                      className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                      className="min-w-0 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
                       onChange={(event) =>
                         setLocationDraft((current) => ({
                           ...current,
@@ -10823,7 +11041,7 @@ export default function Home() {
                     />
                   </label>
                   <button
-                    className="self-end rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700"
+                    className="min-w-[190px] self-end whitespace-nowrap rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700"
                     onClick={addLogisticsLocation}
                     type="button"
                   >
@@ -13032,7 +13250,7 @@ export default function Home() {
             <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3 text-xs text-slate-600 sm:px-6">
               <span>
                 <strong className="text-slate-900">
-                  {filteredLogisticsRequests.length}
+                  {availableFilteredLogisticsRequests.length}
                 </strong>{" "}
                 pedido(s) encontrado(s)
               </span>
@@ -13050,7 +13268,7 @@ export default function Home() {
               </button>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
-              <table className="w-full min-w-[1040px] text-left text-sm">
+              <table className="w-full min-w-[1120px] text-left text-sm">
                 <thead className="sticky top-0 z-10 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
                   <tr>
                     {[
@@ -13059,7 +13277,7 @@ export default function Home() {
                       "Data solicitada",
                       "Janela planejada",
                       "Planejado até a data",
-                      "Pedido",
+                      "Saldo restante",
                       "",
                     ].map((head) => (
                       <th className="px-4 py-3 font-semibold" key={head}>
@@ -13069,8 +13287,11 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredLogisticsRequests.map((request) => {
+                  {availableFilteredLogisticsRequests.map((request) => {
                     const line = request.lines[0];
+                    const remaining = line
+                      ? remainingForLogisticsLine(request, line)
+                      : 0;
                     const timing = line?.daysBeforePlanning;
                     const timingLabel = line?.planningDate
                       ? `${line.planningStatus} · ${timing !== null && timing !== undefined ? (timing >= 0 ? `${timing} dia(s) antes` : `${Math.abs(timing)} dia(s) após`) : "sem cálculo"}`
@@ -13113,7 +13334,11 @@ export default function Home() {
                           {line?.unit || ""}
                         </td>
                         <td className="px-4 py-3">
-                          {formatNumber(line?.quantity || 0)} {line?.unit || ""}
+                          <strong>{formatNumber(remaining)}</strong>{" "}
+                          {line?.unit || ""}
+                          <span className="mt-1 block text-xs text-slate-500">
+                            de {formatNumber(line?.quantity || 0)} solicitado
+                          </span>
                         </td>
                         <td className="px-4 py-3 text-right">
                           <button
@@ -13127,7 +13352,7 @@ export default function Home() {
                       </tr>
                     );
                   })}
-                  {!filteredLogisticsRequests.length ? (
+                  {!availableFilteredLogisticsRequests.length ? (
                     <tr>
                       <td
                         className="px-4 py-12 text-center text-sm text-slate-500"
