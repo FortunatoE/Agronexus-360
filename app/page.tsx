@@ -185,9 +185,11 @@ type TripRecipe = {
   dose: string;
   product: string;
   target: string;
+  unit?: string;
   volume: number;
 };
 type LogisticsTripItem = {
+  active?: string;
   id: string;
   requestId: string;
   requestDate: string;
@@ -201,16 +203,35 @@ type LogisticsTripItem = {
   destinationCode: string;
   requestProduct?: string;
   requestLineId?: string;
+  standardProduct?: string;
   sourceMode?: "armazem" | "coleta" | "manual";
   sourceNucleus?: string;
   stockReference?: string;
+  responsibleName?: string;
+  culture?: string;
   adjustmentRequired?: boolean;
   weightKg?: number;
   pallets?: number;
   estimatedValue?: number;
 };
+type LogisticsFiscalAllocation = {
+  batchId: string;
+  createdAt: string;
+  id: string;
+  invoiceNumber: string;
+  quantity: number;
+  requestId: string;
+  requestLineId: string;
+};
+type TripRecipeExemption = {
+  destination: string;
+  id: string;
+  product: string;
+  unit: string;
+};
 type LogisticsRequestLine = {
   active: string;
+  culture?: string;
   id: string;
   lot: string;
   product: string;
@@ -253,13 +274,46 @@ type LogisticsTrip = {
   status?: "Em progresso" | "Rota ativa" | "Concluído";
   recipe?: TripRecipe;
   recipes?: TripRecipe[];
+  recipeExemptions?: TripRecipeExemption[];
   items?: LogisticsTripItem[];
   invoiceNumbers?: string[];
+  invoiceBatchByNumber?: Record<string, string>;
+  fiscalAllocations?: LogisticsFiscalAllocation[];
+  fiscalEmailSentAtByBatch?: Record<string, string>;
+  appointmentNumber?: string;
+  appointmentRegisteredAt?: string;
   webRequestIds?: string[];
   webAgilLinkedAt?: string;
+  departureTime?: string;
+  routeGroupSentAt?: string;
+  recipeRequestSentAt?: string;
+};
+type LogisticsFiscalBatch = {
+  id: string;
+  destination: string;
+  invoices: string[];
+  items: LogisticsTripItem[];
+  responsibleName: string;
+};
+type LogisticsFiscalCandidate = {
+  available: number;
+  batchAvailable: number;
+  line: LogisticsRequestLine;
+  request: LogisticsRequest;
+};
+type TripRecipeOption = {
+  allocated: number;
+  available: number;
+  culture: string;
+  destination: string;
+  id: string;
+  product: string;
+  total: number;
+  unit: string;
 };
 type LogisticsState = {
   addressByLocation?: Record<string, string>;
+  addressSourceUrlByLocation?: Record<string, string>;
   drivers: RoadDriver[];
   trips: LogisticsTrip[];
   vehicles: RoadVehicle[];
@@ -389,6 +443,7 @@ const initialEmailSettings: EmailSettings = {
 const initialDashboardSettings: DashboardSettings = { daeCycle: "Safra" };
 const initialLogistics: LogisticsState = {
   addressByLocation: {},
+  addressSourceUrlByLocation: {},
   drivers: [],
   trips: [],
   vehicles: [],
@@ -434,6 +489,249 @@ function logisticsTripInvoices(trip: LogisticsTrip) {
 function logisticsTripDate(trip: LogisticsTrip) {
   return trip.tripDate || dateKey(new Date(trip.createdAt));
 }
+function logisticsFiscalBatchId(destination: string, responsibleName: string) {
+  return [normalizeMaterial(destination), normalizeMaterial(responsibleName)].join(
+    "|",
+  );
+}
+function logisticsTripFiscalBatches(trip: LogisticsTrip): LogisticsFiscalBatch[] {
+  const batches = new Map<string, LogisticsFiscalBatch>();
+  logisticsTripItems(trip).forEach((item) => {
+    const destination = item.destination || "Destino não informado";
+    const responsibleName =
+      item.responsibleName || "BOA ESPERANCA AGROPECUARIA LTDA";
+    const id = logisticsFiscalBatchId(destination, responsibleName);
+    const current = batches.get(id) || {
+      destination,
+      id,
+      invoices: [],
+      items: [],
+      responsibleName,
+    };
+    current.items.push(item);
+    batches.set(id, current);
+  });
+  const assignment = trip.invoiceBatchByNumber || {};
+  const allocatedInvoices = new Map<string, string[]>();
+  (trip.fiscalAllocations || []).forEach((allocation) => {
+    const current = allocatedInvoices.get(allocation.batchId) || [];
+    current.push(allocation.invoiceNumber);
+    allocatedInvoices.set(allocation.batchId, current);
+  });
+  logisticsTripInvoices(trip).forEach((invoice) => {
+    const batch = batches.get(assignment[invoice]);
+    if (batch) batch.invoices.push(invoice);
+  });
+  allocatedInvoices.forEach((invoices, batchId) => {
+    const batch = batches.get(batchId);
+    if (batch) batch.invoices.push(...invoices);
+  });
+  batches.forEach((batch) => {
+    batch.invoices = [...new Set(batch.invoices)];
+  });
+  return [...batches.values()].sort(
+    (left, right) =>
+      left.destination.localeCompare(right.destination, "pt-BR") ||
+      left.responsibleName.localeCompare(right.responsibleName, "pt-BR"),
+  );
+}
+function fiscalLineMatchesRouteItem(
+  line: LogisticsRequestLine,
+  item: LogisticsTripItem,
+) {
+  const lineMaterials = [line.product, line.standardProduct]
+    .map(normalizeMaterial)
+    .filter(Boolean);
+  const itemMaterials = [
+    item.product,
+    item.requestProduct || "",
+    item.standardProduct || "",
+  ]
+    .map(normalizeMaterial)
+    .filter(Boolean);
+  if (lineMaterials.some((material) => itemMaterials.includes(material))) {
+    return true;
+  }
+  const active = normalizeMaterial(line.active);
+  return Boolean(
+    active &&
+      active !== "NAOCONCILIADO" &&
+      active === normalizeMaterial(item.active || ""),
+  );
+}
+function logisticsFiscalCandidates(
+  trip: LogisticsTrip,
+  batch: LogisticsFiscalBatch,
+  requests: LogisticsRequest[],
+): LogisticsFiscalCandidate[] {
+  const linked = new Set(trip.webRequestIds || []);
+  const allocations = trip.fiscalAllocations || [];
+  const lineFor = (requestId: string, lineId: string) =>
+    requests
+      .find((request) => request.id === requestId)
+      ?.lines.find((line) => line.id === lineId);
+  return requests
+    .filter((request) => linked.has(request.id))
+    .flatMap((request) =>
+      request.lines.map((line) => {
+        const matchingItems = batch.items.filter((item) =>
+          fiscalLineMatchesRouteItem(line, item),
+        );
+        if (!matchingItems.length) return null;
+        const lineAllocated = allocations
+          .filter(
+            (allocation) =>
+              allocation.requestId === request.id &&
+              allocation.requestLineId === line.id,
+          )
+          .reduce((total, allocation) => total + allocation.quantity, 0);
+        const batchAllocated = allocations
+          .filter((allocation) => {
+            if (allocation.batchId !== batch.id) return false;
+            const allocationLine = lineFor(
+              allocation.requestId,
+              allocation.requestLineId,
+            );
+            return Boolean(
+              allocationLine &&
+                matchingItems.some((item) =>
+                  fiscalLineMatchesRouteItem(allocationLine, item),
+                ),
+            );
+          })
+          .reduce((total, allocation) => total + allocation.quantity, 0);
+        const batchTotal = matchingItems.reduce(
+          (total, item) => total + item.quantity,
+          0,
+        );
+        const available = Math.max(
+          0,
+          Math.min(line.quantity - lineAllocated, batchTotal - batchAllocated),
+        );
+        return {
+          available,
+          batchAvailable: Math.max(0, batchTotal - batchAllocated),
+          line,
+          request,
+        };
+      }),
+    )
+    .filter((candidate): candidate is LogisticsFiscalCandidate => Boolean(candidate))
+    .sort(
+      (left, right) =>
+        left.request.requestNumber.localeCompare(
+          right.request.requestNumber,
+          "pt-BR",
+          { numeric: true },
+        ) || left.line.product.localeCompare(right.line.product, "pt-BR"),
+    );
+}
+function logisticsFiscalBatchAllocated(
+  trip: LogisticsTrip,
+  batch: LogisticsFiscalBatch,
+) {
+  return (trip.fiscalAllocations || [])
+    .filter((allocation) => allocation.batchId === batch.id)
+    .reduce((total, allocation) => total + allocation.quantity, 0);
+}
+function logisticsRouteBrief(
+  trip: LogisticsTrip,
+  driverName: string,
+  plate: string,
+) {
+  const collectByLocation = new Map<string, LogisticsTripItem[]>();
+  const deliverByDestination = new Map<string, LogisticsTripItem[]>();
+  logisticsTripItems(trip).forEach((item) => {
+    const collection = collectByLocation.get(item.sourceWarehouse) || [];
+    collection.push(item);
+    collectByLocation.set(item.sourceWarehouse, collection);
+    const delivery = deliverByDestination.get(item.destination) || [];
+    delivery.push(item);
+    deliverByDestination.set(item.destination, delivery);
+  });
+  const formatItems = (items: LogisticsTripItem[]) =>
+    items
+      .map(
+        (item) => `* ${item.product} – ${formatNumber(item.quantity)} ${item.unit}`,
+      )
+      .join("\n");
+  const routeDate = new Intl.DateTimeFormat("pt-BR").format(
+    new Date(`${logisticsTripDate(trip)}T00:00:00`),
+  );
+  const heading = `ROTA ${routeDate}${trip.departureTime ? ` · ${trip.departureTime}` : ""}\n@${driverName || "Motorista"}${plate ? ` · ${plate}` : ""}`;
+  const collections = [...collectByLocation.entries()]
+    .map(
+      ([location, items]) =>
+        `📍${location}${trip.departureTime ? `  ⏰${trip.departureTime}` : ""}\n\nCOLETAR\n${formatItems(items)}`,
+    )
+    .join("\n\n");
+  const deliveries = [...deliverByDestination.entries()]
+    .map(
+      ([destination, items]) =>
+        `📍${destination}\n\nDESCARREGAR\n${formatItems(items)}`,
+    )
+    .join("\n\n");
+  return [heading, collections, deliveries].filter(Boolean).join("\n\n");
+}
+function logisticsRecipeRequestText(trip: LogisticsTrip) {
+  const rows = new Map<
+    string,
+    { culture: string; destination: string; product: string; quantity: number; unit: string }
+  >();
+  logisticsTripRecipes(trip).forEach((item) => {
+    const key = [
+      normalizeMaterial(item.destination),
+      normalizeMaterial(item.product),
+      normalizeMaterial(item.culture || "Sem cultura"),
+      normalizeMaterial(item.unit || "UN"),
+    ].join("|");
+    const current = rows.get(key) || {
+      culture: item.culture || "Sem cultura",
+      destination: item.destination || "Destino não informado",
+      product: item.product,
+      quantity: 0,
+      unit: item.unit || "UN",
+    };
+    current.quantity += item.volume;
+    rows.set(key, current);
+  });
+  const routeDate = new Intl.DateTimeFormat("pt-BR").format(
+    new Date(`${logisticsTripDate(trip)}T00:00:00`),
+  );
+  const body = [...rows.values()]
+    .sort(
+      (left, right) =>
+        left.destination.localeCompare(right.destination, "pt-BR") ||
+        left.product.localeCompare(right.product, "pt-BR"),
+    )
+    .map(
+      (row) =>
+        `${row.destination} | ${row.product} | ${formatNumber(row.quantity)} ${row.unit} | ${row.culture}`,
+    )
+    .join("\n");
+  return `SOLICITAÇÃO DE RECEITAS · ROTA ${routeDate}\n\nPor gentileza, emitir as receitas dos volumes abaixo.\n\nFazenda destino | Produto | Volume | Cultura\n${body || "Nenhuma receita registrada."}`;
+}
+function logisticsFiscalEmailText(
+  trip: LogisticsTrip,
+  batch: LogisticsFiscalBatch,
+  driverName: string,
+  plate: string,
+  webRequestNumbers: string[],
+) {
+  const rows = batch.items
+    .map(
+      (item) =>
+        `${item.product} | ${formatNumber(item.quantity)} ${item.unit} | ${item.destination}`,
+    )
+    .join("\n");
+  const invoices = batch.invoices.length
+    ? batch.invoices.join(", ")
+    : "Pendente de emissão fiscal";
+  const reference = trip.appointmentNumber
+    ? `AGENDAMENTO ${trip.appointmentNumber}`
+    : `ROTA ${trip.id.replace("viagem-", "")}`;
+  return `ASSUNTO: ${reference} · ${batch.destination}\n\nBoa tarde,\n\nSeguem solicitações e notas referentes à ${reference.toLowerCase()}.\n\nDestino: ${batch.destination}\nResponsável (AG): ${batch.responsibleName}\nMotorista / placa: ${driverName || "A definir"}${plate ? ` · ${plate}` : ""}\nSolicitações WebAgil: ${webRequestNumbers.join(", ") || "pendente de vínculo"}\nNotas fiscais: ${invoices}\n\nINSUMO | QUANTIDADE | DESTINO\n${rows}\n\nAnexar as notas fiscais deste bloco antes do envio.`;
+}
 function logisticsTripRecipes(trip: LogisticsTrip) {
   if (trip.recipes?.length) return trip.recipes;
   return trip.recipe
@@ -448,22 +746,82 @@ function logisticsTripRecipes(trip: LogisticsTrip) {
       ]
     : [];
 }
-function tripRecipeVolume(
+function isBoaEsperancaAg(responsibleName: string) {
+  return normalizeMaterial(responsibleName).includes(
+    "BOA ESPERANCA AGROPECUARIA",
+  );
+}
+function isRecipeExempt(
   trip: LogisticsTrip,
   destination: string,
   product: string,
+  unit = "",
 ) {
-  const normalizedDestination = normalizeMaterial(destination);
-  const normalizedProduct = normalizeMaterial(product);
-  if (!normalizedDestination || !normalizedProduct) return 0;
-  return logisticsTripItems(trip)
-    .filter(
-      (item) =>
-        normalizeMaterial(item.destination) === normalizedDestination &&
-        (normalizeMaterial(item.product) === normalizedProduct ||
-          normalizeMaterial(item.requestProduct || "") === normalizedProduct),
-    )
-    .reduce((total, item) => total + item.quantity, 0);
+  return (trip.recipeExemptions || []).some(
+    (item) =>
+      normalizeMaterial(item.destination) === normalizeMaterial(destination) &&
+      normalizeMaterial(item.product) === normalizeMaterial(product) &&
+      (!unit || normalizeMaterial(item.unit) === normalizeMaterial(unit)),
+  );
+}
+function logisticsTripRecipeOptions(trip: LogisticsTrip): TripRecipeOption[] {
+  const totals = new Map<
+    string,
+    Omit<TripRecipeOption, "allocated" | "available">
+  >();
+  logisticsTripItems(trip).forEach((item) => {
+    const destination = item.destination || "Destino não informado";
+    const product = item.product || "Produto não informado";
+    const unit = item.unit || "UN";
+    const id = [
+      normalizeMaterial(destination),
+      normalizeMaterial(product),
+      normalizeMaterial(unit),
+    ].join("|");
+    const current = totals.get(id) || {
+      culture: item.culture || "",
+      destination,
+      id,
+      product,
+      total: 0,
+      unit,
+    };
+    current.total += item.quantity;
+    if (!current.culture && item.culture) current.culture = item.culture;
+    totals.set(id, current);
+  });
+  const recipes = logisticsTripRecipes(trip);
+  return [...totals.values()]
+    .map((item) => {
+      const allocated = recipes
+        .filter(
+          (recipe) =>
+            normalizeMaterial(recipe.destination) ===
+              normalizeMaterial(item.destination) &&
+            normalizeMaterial(recipe.product) ===
+              normalizeMaterial(item.product) &&
+            (!recipe.unit ||
+              normalizeMaterial(recipe.unit) === normalizeMaterial(item.unit)),
+        )
+        .reduce((total, recipe) => total + recipe.volume, 0);
+      return {
+        ...item,
+        allocated,
+        available: Math.max(0, item.total - allocated),
+      };
+    })
+    .sort(
+      (left, right) =>
+        left.destination.localeCompare(right.destination, "pt-BR") ||
+        left.product.localeCompare(right.product, "pt-BR"),
+    );
+}
+function logisticsPendingRecipeOptions(trip: LogisticsTrip) {
+  return logisticsTripRecipeOptions(trip).filter(
+    (option) =>
+      option.available > 0.000001 &&
+      !isRecipeExempt(trip, option.destination, option.product, option.unit),
+  );
 }
 function logisticsMunicipalityFor(
   location: string,
@@ -491,6 +849,29 @@ function logisticsAddressFor(
     )?.[1] ||
     ""
   );
+}
+function isGoogleMapsUrl(value: string) {
+  try {
+    const url = new URL(String(value || "").trim());
+    const host = url.hostname.toLowerCase();
+    return (
+      host === "maps.app.goo.gl" ||
+      host === "goo.gl" ||
+      host.endsWith(".goo.gl") ||
+      host === "google.com" ||
+      host.endsWith(".google.com") ||
+      host === "google.com.br" ||
+      host.endsWith(".google.com.br")
+    );
+  } catch {
+    return false;
+  }
+}
+function googleMapsSearchUrl(value: string) {
+  const address = String(value || "").trim();
+  if (!address) return "";
+  if (isGoogleMapsUrl(address)) return address;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`;
 }
 function inferredPackageWeightKg(product: string, unit: string) {
   const normalized = `${product} ${unit}`.toUpperCase().replace(",", ".");
@@ -2060,16 +2441,27 @@ export default function Home() {
     municipality: "",
   });
   const [editingLocationKey, setEditingLocationKey] = useState("");
+  const [isResolvingLocation, setIsResolvingLocation] = useState(false);
+  const [locationResolution, setLocationResolution] = useState("");
   const [routeItems, setRouteItems] = useState<LogisticsTripItem[]>([]);
   const [tripDriverId, setTripDriverId] = useState("");
   const [tripVehicleId, setTripVehicleId] = useState("");
   const [tripDate, setTripDate] = useState(() => dateKey(new Date()));
+  const [tripDepartureTime, setTripDepartureTime] = useState("09:00");
   const [webLinkDrafts, setWebLinkDrafts] = useState<Record<string, string>>(
     {},
   );
   const [invoiceTripId, setInvoiceTripId] = useState("");
   const [tripInvoiceDraft, setTripInvoiceDraft] = useState("");
+  const [invoiceBatchKey, setInvoiceBatchKey] = useState("");
+  const [fiscalLinkDraft, setFiscalLinkDraft] = useState({
+    lineKey: "",
+    quantity: "",
+  });
+  const [appointmentTripId, setAppointmentTripId] = useState("");
+  const [appointmentDraft, setAppointmentDraft] = useState("");
   const [recipeTripId, setRecipeTripId] = useState("");
+  const [workflowTripId, setWorkflowTripId] = useState("");
   const [recipeDraft, setRecipeDraft] = useState<TripRecipe>({
     culture: "",
     destination: "",
@@ -4059,6 +4451,7 @@ export default function Home() {
       current.lines.push({
         id: key,
         active: dimension?.principleActive || "Não conciliado",
+        culture: cultureFor(signal.row, dimensions),
         lot: "",
         product: signal.physicalMaterial || signal.material,
         productCode: readText(
@@ -4253,10 +4646,18 @@ export default function Home() {
               "Nome Op. Logistico",
               "Armazém",
               "Armazem",
-              "AG",
               "Centro",
               "CEN",
             ) || "Armazém não identificado";
+          const responsibleName =
+            readText(
+              row,
+              "Nome do Responsável",
+              "Nome do Responsavel",
+              "Responsável",
+              "Responsavel",
+              "AG",
+            ) || "BOA ESPERANCA AGROPECUARIA LTDA";
           return {
             id: `${index}|${normalizeMaterial(product)}|${normalizeMaterial(readText(row, "Lote", "LOTE WEB", "Lote Web"))}`,
             active: dimension?.principleActive || "Não conciliado",
@@ -4277,6 +4678,7 @@ export default function Home() {
               "Pallets",
             ),
             product,
+            responsibleName,
             standardProduct: dimension?.aggregateMaterial || product,
             unit: readText(row, "UMB", "Und", "Unidade", "UM") || "UN",
             warehouse,
@@ -4302,6 +4704,7 @@ export default function Home() {
         id: string;
         pallets: number;
         product: string;
+        responsibleName: string;
         standardProduct: string;
         stockReferences: string[];
         unit: string;
@@ -4313,6 +4716,7 @@ export default function Home() {
       const key = [
         normalizeMaterial(stock.product),
         normalizeMaterial(stock.warehouse),
+        normalizeMaterial(stock.responsibleName),
         normalizeMaterial(stock.unit),
       ].join("|");
       const current = values.get(key) || {
@@ -4322,6 +4726,7 @@ export default function Home() {
         id: `saldo|${key}`,
         pallets: 0,
         product: stock.product,
+        responsibleName: stock.responsibleName,
         standardProduct: stock.standardProduct,
         stockReferences: [],
         unit: stock.unit,
@@ -4603,6 +5008,7 @@ export default function Home() {
     );
     return {
       id: taskId("rota"),
+      active: selectedLogisticsLine.active,
       requestId: selectedLogisticsRequest.requestNumber,
       requestDate: selectedLogisticsRequest.date,
       product: sourceProduct,
@@ -4623,6 +5029,8 @@ export default function Home() {
         : 0,
       requestLineId: selectedLogisticsLine.id,
       requestProduct: selectedLogisticsLine.product,
+      standardProduct: selectedLogisticsLine.standardProduct,
+      culture: selectedLogisticsLine.culture || "",
       sourceMode: tripSourceMode,
       sourceNucleus:
         tripSourceMode === "coleta" ? selectedCollection?.nucleus : "",
@@ -4636,6 +5044,11 @@ export default function Home() {
         tripSourceMode === "coleta"
           ? selectedCollection?.material
           : selectedWarehouseStock?.id,
+      responsibleName:
+        tripSourceMode === "coleta"
+          ? "BOA ESPERANCA AGROPECUARIA LTDA"
+          : selectedWarehouseStock?.responsibleName ||
+            "BOA ESPERANCA AGROPECUARIA LTDA",
       destination:
         selectedLogisticsRequest.destination || "Destino não identificado",
       destinationCode: selectedLogisticsRequest.destinationCode,
@@ -5589,6 +6002,7 @@ export default function Home() {
       sourceWarehouse: stock.warehouse,
       destination: manualDestination,
       destinationCode: manualDestination,
+      responsibleName: "BOA ESPERANCA AGROPECUARIA LTDA",
       sourceMode: "manual",
       stockReference: stock.id,
       pallets: 0,
@@ -5609,7 +6023,25 @@ export default function Home() {
       `${item.product} incluído na rota sem pedido vinculado.`,
     );
   }
-  function addLogisticsLocation() {
+  async function resolveGoogleMapsAddress(addressUrl: string) {
+    const response = await fetch("/api/resolve-map", {
+      body: JSON.stringify({ url: addressUrl }),
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    });
+    const result = (await response.json().catch(() => ({}))) as {
+      coordinates?: { latitude: number; longitude: number } | null;
+      error?: string;
+      query?: string;
+      resolvedUrl?: string;
+    };
+    if (!response.ok || !result.query) {
+      throw new Error(result.error || "Não foi possível resolver este link do Google Maps.");
+    }
+    return result;
+  }
+  async function addLogisticsLocation() {
     const location = locationDraft.location;
     const municipality = locationDraft.municipality.trim();
     const addressUrl = locationDraft.addressUrl.trim();
@@ -5620,29 +6052,120 @@ export default function Home() {
       return;
     }
     const key = editingLocationKey || normalizeMaterial(location);
+    let routeAddress = "";
+    let coordinates = "";
+    if (addressUrl) {
+      if (!isGoogleMapsUrl(addressUrl)) {
+        setLocationResolution("");
+        setLogisticsMessage(
+          "Use um link do Google Maps (maps.app.goo.gl ou google.com/maps) para converter o endereço da rota.",
+        );
+        return;
+      }
+      setIsResolvingLocation(true);
+      setLocationResolution("Resolvendo o link do Google Maps…");
+      try {
+        const result = await resolveGoogleMapsAddress(addressUrl);
+        routeAddress = result.query;
+        coordinates = result.coordinates
+          ? `${result.coordinates.latitude.toFixed(6)}, ${result.coordinates.longitude.toFixed(6)}`
+          : "endereço pesquisável";
+      } catch (error) {
+        setLocationResolution("");
+        setLogisticsMessage(
+          error instanceof Error
+            ? error.message
+            : "Não foi possível resolver o link do Google Maps.",
+        );
+        return;
+      } finally {
+        setIsResolvingLocation(false);
+      }
+    }
     setLogistics((current) => {
       const addresses = { ...(current.addressByLocation || {}) };
+      const sourceUrls = { ...(current.addressSourceUrlByLocation || {}) };
       const municipalities = { ...(current.municipalityByLocation || {}) };
-      if (addressUrl) addresses[key] = addressUrl;
-      else delete addresses[key];
+      if (routeAddress) {
+        addresses[key] = routeAddress;
+        sourceUrls[key] = addressUrl;
+      } else {
+        delete addresses[key];
+        delete sourceUrls[key];
+      }
       if (municipality) municipalities[key] = municipality;
       else delete municipalities[key];
       return {
         ...current,
         addressByLocation: addresses,
+        addressSourceUrlByLocation: sourceUrls,
         municipalityByLocation: municipalities,
       };
     });
     setLocationDraft({ addressUrl: "", location: "", municipality: "" });
     setEditingLocationKey("");
+    setLocationResolution(
+      routeAddress ? `Mapa salvo com ${coordinates}.` : "",
+    );
     setLogisticsMessage(
-      `Premissa de rota ${editingLocationKey ? "atualizada" : "vinculada"}: ${location}${municipality ? ` → ${municipality}` : ""}.`,
+      `Premissa de rota ${editingLocationKey ? "atualizada" : "vinculada"}: ${location}${routeAddress ? ` → ${coordinates}` : municipality ? ` → ${municipality}` : ""}.`,
+    );
+  }
+  async function resolveStoredRouteLinks() {
+    const entries = Object.entries(logistics.addressByLocation || {}).filter(
+      ([, address]) => isGoogleMapsUrl(address),
+    );
+    if (!entries.length) {
+      setLogisticsMessage("Não há links antigos do Google Maps pendentes de conversão.");
+      return;
+    }
+    setIsResolvingLocation(true);
+    setLocationResolution(`Convertendo ${entries.length} link(s) cadastrado(s)…`);
+    const converted: Array<[string, string, string]> = [];
+    let failures = 0;
+    for (const [location, address] of entries) {
+      try {
+        const result = await resolveGoogleMapsAddress(address);
+        converted.push([location, address, result.query]);
+      } catch {
+        failures += 1;
+      }
+    }
+    if (converted.length) {
+      setLogistics((current) => {
+        const addresses = { ...(current.addressByLocation || {}) };
+        const sourceUrls = { ...(current.addressSourceUrlByLocation || {}) };
+        converted.forEach(([location, sourceUrl, query]) => {
+          addresses[location] = query;
+          sourceUrls[location] ||= sourceUrl;
+        });
+        return {
+          ...current,
+          addressByLocation: addresses,
+          addressSourceUrlByLocation: sourceUrls,
+        };
+      });
+    }
+    setIsResolvingLocation(false);
+    setLocationResolution(
+      converted.length
+        ? `${converted.length} link(s) convertido(s)${failures ? `; ${failures} não puderam ser resolvido(s)` : ""}.`
+        : "Nenhum link pôde ser convertido.",
+    );
+    setLogisticsMessage(
+      converted.length
+        ? `${converted.length} endereço(s) convertido(s) para uso no mapa.${failures ? ` ${failures} link(s) precisam ser revisados.` : ""}`
+        : "Não foi possível converter os links cadastrados. Abra o link no Google Maps e salve um novo compartilhamento.",
     );
   }
   function editLogisticsLocation(location: string) {
     setEditingLocationKey(location);
+    setLocationResolution("");
     setLocationDraft({
-      addressUrl: logistics.addressByLocation?.[location] || "",
+      addressUrl:
+        logistics.addressSourceUrlByLocation?.[location] ||
+        logistics.addressByLocation?.[location] ||
+        "",
       location:
         routeLocationOptions.find(
           (item) => normalizeMaterial(item) === location,
@@ -5654,11 +6177,14 @@ export default function Home() {
     setLogistics((current) => {
       const municipalities = { ...(current.municipalityByLocation || {}) };
       const addresses = { ...(current.addressByLocation || {}) };
+      const sourceUrls = { ...(current.addressSourceUrlByLocation || {}) };
       delete municipalities[location];
       delete addresses[location];
+      delete sourceUrls[location];
       return {
         ...current,
         addressByLocation: addresses,
+        addressSourceUrlByLocation: sourceUrls,
         municipalityByLocation: municipalities,
       };
     });
@@ -5715,6 +6241,7 @@ export default function Home() {
       invoiceNumbers: [],
       status: "Em progresso",
       tripDate,
+      departureTime: tripDepartureTime,
       createdAt: new Date().toISOString(),
       items: routeItems,
     };
@@ -5729,6 +6256,7 @@ export default function Home() {
     setTripQuantity("");
     setRouteItems([]);
     setTripDate(dateKey(new Date()));
+    setTripDepartureTime("09:00");
     setLogisticsTab("viagens");
     setLogisticsMessage(
       `Viagem ${trip.id.replace("viagem-", "")} emitida para ${new Intl.DateTimeFormat("pt-BR").format(new Date(`${tripDate}T00:00:00`))} com ${routeItems.length} material(is) de ${new Set(routeItems.map((item) => item.requestId)).size} pedido(s) SAP.${samePlateTripsOnDate.length ? " Atenção: já existe outra rota para esta placa na mesma data." : ""} Vincule notas fiscais, solicitações WebAgil e receitas posteriormente.`,
@@ -5755,6 +6283,51 @@ export default function Home() {
       `Status da viagem ${tripId.replace("viagem-", "")} atualizado para ${status}.`,
     );
   }
+  async function copyLogisticsText(text: string, successMessage: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setLogisticsMessage(successMessage);
+    } catch {
+      setLogisticsMessage(
+        "O navegador não permitiu copiar o conteúdo. Selecione a prévia e copie manualmente.",
+      );
+    }
+  }
+  function markTripCommunication(
+    tripId: string,
+    type: "fiscal" | "route" | "recipe",
+    batchId = "",
+  ) {
+    if (currentUser?.role !== "admin") return;
+    const sentAt = new Date().toISOString();
+    setLogistics((current) => ({
+      ...current,
+      trips: current.trips.map((trip) => {
+        if (trip.id !== tripId) return trip;
+        if (type === "fiscal") {
+          return {
+            ...trip,
+            fiscalEmailSentAtByBatch: {
+              ...(trip.fiscalEmailSentAtByBatch || {}),
+              [batchId]: sentAt,
+            },
+          };
+        }
+        return type === "route"
+          ? { ...trip, routeGroupSentAt: sentAt }
+          : { ...trip, recipeRequestSentAt: sentAt };
+      }),
+    }));
+    const labels = {
+      fiscal: "E-mail fiscal externo preparado",
+      recipe: "Solicitação de receita preparada",
+      route: "Mensagem do grupo de rota preparada",
+    };
+    recordAudit(
+      "workspace",
+      `${labels[type]} para a viagem ${tripId.replace("viagem-", "")}.`,
+    );
+  }
   function attachTripRecipe() {
     if (currentUser?.role !== "admin") return;
     const trip = logistics.trips.find((item) => item.id === recipeTripId);
@@ -5772,6 +6345,25 @@ export default function Home() {
       );
       return;
     }
+    const recipeOption = logisticsTripRecipeOptions(trip).find(
+      (option) =>
+        normalizeMaterial(option.destination) ===
+          normalizeMaterial(recipeDraft.destination) &&
+        normalizeMaterial(option.product) ===
+          normalizeMaterial(recipeDraft.product),
+    );
+    if (!recipeOption) {
+      setLogisticsMessage(
+        "Selecione um destino + produto que esteja efetivamente carregado nesta viagem.",
+      );
+      return;
+    }
+    if (recipeDraft.volume > recipeOption.available + 0.000001) {
+      setLogisticsMessage(
+        `O volume informado ultrapassa o saldo disponível para receita: ${formatNumber(recipeOption.available)} ${recipeOption.unit}.`,
+      );
+      return;
+    }
     const recipe: TripRecipe = {
       ...recipeDraft,
       id: taskId("receita"),
@@ -5780,6 +6372,7 @@ export default function Home() {
       dose: recipeDraft.dose.trim(),
       product: recipeDraft.product.trim(),
       target: recipeDraft.target.trim(),
+      unit: recipeOption.unit,
     };
     setLogistics((current) => ({
       ...current,
@@ -5826,20 +6419,211 @@ export default function Home() {
       ),
     }));
   }
+  function exemptTripRecipeOption() {
+    if (currentUser?.role !== "admin") return;
+    const trip = logistics.trips.find((item) => item.id === recipeTripId);
+    const option = trip
+      ? logisticsTripRecipeOptions(trip).find(
+          (item) =>
+            normalizeMaterial(item.destination) ===
+              normalizeMaterial(recipeDraft.destination) &&
+            normalizeMaterial(item.product) ===
+              normalizeMaterial(recipeDraft.product),
+        )
+      : null;
+    if (!trip || !option) {
+      setLogisticsMessage(
+        "Selecione o destino + produto carregado que não exige receita.",
+      );
+      return;
+    }
+    if (option.allocated > 0.000001) {
+      setLogisticsMessage(
+        "Este produto já possui receita registrada. Remova as receitas antes de marcá-lo como dispensado.",
+      );
+      return;
+    }
+    setLogistics((current) => ({
+      ...current,
+      trips: current.trips.map((item) =>
+        item.id === trip.id
+          ? {
+              ...item,
+              recipeExemptions: [
+                ...(item.recipeExemptions || []),
+                {
+                  destination: option.destination,
+                  id: taskId("sem-receita"),
+                  product: option.product,
+                  unit: option.unit,
+                },
+              ],
+            }
+          : item,
+      ),
+    }));
+    setRecipeDraft({
+      culture: "",
+      destination: "",
+      dose: "",
+      product: "",
+      target: "",
+      volume: 0,
+    });
+    setLogisticsMessage(
+      `${option.product} — ${option.destination} marcado como sem necessidade de receita.`,
+    );
+  }
+  function removeTripRecipeExemption(tripId: string, exemptionId: string) {
+    if (currentUser?.role !== "admin") return;
+    setLogistics((current) => ({
+      ...current,
+      trips: current.trips.map((trip) =>
+        trip.id === tripId
+          ? {
+              ...trip,
+              recipeExemptions: (trip.recipeExemptions || []).filter(
+                (item) => item.id !== exemptionId,
+              ),
+            }
+          : trip,
+      ),
+    }));
+  }
+  function downloadRecipeEmail(trip: LogisticsTrip) {
+    const pending = logisticsPendingRecipeOptions(trip);
+    if (pending.length) {
+      setLogisticsMessage(
+        `Ainda há ${pending.length} produto(s) da carga sem receita ou dispensa registrada.`,
+      );
+      return;
+    }
+    const reference = trip.appointmentNumber
+      ? `Agendamento ${trip.appointmentNumber}`
+      : `Rota ${trip.id.replace("viagem-", "")}`;
+    const content = [
+      "To:",
+      `Subject: Solicitação de receitas — ${reference}`,
+      "MIME-Version: 1.0",
+      "Content-Type: text/plain; charset=UTF-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      logisticsRecipeRequestText(trip),
+    ].join("\r\n");
+    const blob = new Blob([content], { type: "message/rfc822;charset=utf-8" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = `receitas-${(trip.appointmentNumber || trip.id).replace(/[^a-z0-9]+/gi, "-")}.eml`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+    markTripCommunication(trip.id, "recipe");
+    setLogisticsMessage(
+      "Arquivo .eml de solicitação de receitas gerado para revisão e envio ao agrônomo.",
+    );
+  }
+  function openTripInvoices(trip: LogisticsTrip, fiscalBatchId = "") {
+    const batches = logisticsTripFiscalBatches(trip);
+    setInvoiceTripId(trip.id);
+    setTripInvoiceDraft("");
+    setInvoiceBatchKey(fiscalBatchId || batches[0]?.id || "");
+    setFiscalLinkDraft({ lineKey: "", quantity: "" });
+  }
+  function openTripAppointment(trip: LogisticsTrip) {
+    setAppointmentTripId(trip.id);
+    setAppointmentDraft(trip.appointmentNumber || "");
+  }
+  function saveTripAppointment() {
+    if (currentUser?.role !== "admin") return;
+    const trip = logistics.trips.find((item) => item.id === appointmentTripId);
+    const appointmentNumber = appointmentDraft.trim();
+    if (!trip || !appointmentNumber) {
+      setLogisticsMessage(
+        "Informe o número do agendamento criado no WebAgil.",
+      );
+      return;
+    }
+    if (!/^\d{7}$/.test(appointmentNumber)) {
+      setLogisticsMessage(
+        "O agendamento WebAgil deve conter exatamente 7 dígitos numéricos.",
+      );
+      return;
+    }
+    if (!(trip.webRequestIds || []).length) {
+      setLogisticsMessage(
+        "Vincule ao menos uma solicitação WebAgil antes de registrar o agendamento.",
+      );
+      return;
+    }
+    setLogistics((current) => ({
+      ...current,
+      trips: current.trips.map((item) =>
+        item.id === trip.id
+          ? {
+              ...item,
+              appointmentNumber,
+              appointmentRegisteredAt: new Date().toISOString(),
+            }
+          : item,
+      ),
+    }));
+    setAppointmentDraft("");
+    setAppointmentTripId("");
+    setLogisticsMessage(
+      `Agendamento ${appointmentNumber} registrado para a viagem. As solicitações WebAgil vinculadas permanecem reunidas neste único agendamento.`,
+    );
+    recordAudit(
+      "workspace",
+      `Agendamento WebAgil ${appointmentNumber} registrado na viagem ${trip.id.replace("viagem-", "")}.`,
+    );
+  }
   function attachTripInvoices() {
     if (currentUser?.role !== "admin") return;
     const trip = logistics.trips.find((item) => item.id === invoiceTripId);
-    const invoices = [
-      ...new Set(
-        tripInvoiceDraft
-          .split(/[\n,;]+/)
-          .map((value) => value.trim())
-          .filter(Boolean),
-      ),
-    ];
-    if (!trip || !invoices.length) {
+    const invoiceNumber = tripInvoiceDraft.trim();
+    if (!trip || !invoiceNumber) {
       setLogisticsMessage(
-        "Informe ao menos uma nota fiscal para vincular à viagem.",
+        "Informe a nota fiscal que será vinculada ao volume da solicitação.",
+      );
+      return;
+    }
+    const fiscalBatches = logisticsTripFiscalBatches(trip);
+    const fiscalBatch = fiscalBatches.find(
+      (batch) => batch.id === invoiceBatchKey,
+    );
+    if (!fiscalBatch) {
+      setLogisticsMessage(
+        "Selecione o destino e responsável (AG) que receberá estas notas fiscais.",
+      );
+      return;
+    }
+    const candidates = logisticsFiscalCandidates(
+      trip,
+      fiscalBatch,
+      webAgilRequests,
+    );
+    const candidate = candidates.find(
+      (item) => `${item.request.id}|${item.line.id}` === fiscalLinkDraft.lineKey,
+    );
+    const quantity = numberFrom(fiscalLinkDraft.quantity);
+    if (!candidate || quantity <= 0) {
+      setLogisticsMessage(
+        "Selecione a linha da solicitação WebAgil e informe o volume que será faturado.",
+      );
+      return;
+    }
+    if (quantity > candidate.available + 0.000001) {
+      setLogisticsMessage(
+        `O volume informado ultrapassa o saldo disponível da solicitação ou do bloco fiscal: ${formatNumber(candidate.available)} ${candidate.line.unit}.`,
+      );
+      return;
+    }
+    const assignedBatch = trip.invoiceBatchByNumber?.[invoiceNumber];
+    if (assignedBatch && assignedBatch !== fiscalBatch.id) {
+      setLogisticsMessage(
+        "Esta nota fiscal já está vinculada a outro destino ou responsável (AG) da viagem.",
       );
       return;
     }
@@ -5850,17 +6634,36 @@ export default function Home() {
           ? {
               ...item,
               invoiceNumbers: [
-                ...new Set([...logisticsTripInvoices(item), ...invoices]),
+                ...new Set([...logisticsTripInvoices(item), invoiceNumber]),
               ],
               invoiceNumber: [
-                ...new Set([...logisticsTripInvoices(item), ...invoices]),
+                ...new Set([...logisticsTripInvoices(item), invoiceNumber]),
               ].join(" · "),
+              invoiceBatchByNumber: {
+                ...(item.invoiceBatchByNumber || {}),
+                [invoiceNumber]: fiscalBatch.id,
+              },
+              fiscalAllocations: [
+                ...(item.fiscalAllocations || []),
+                {
+                  batchId: fiscalBatch.id,
+                  createdAt: new Date().toISOString(),
+                  id: taskId("fiscal"),
+                  invoiceNumber,
+                  quantity,
+                  requestId: candidate.request.id,
+                  requestLineId: candidate.line.id,
+                },
+              ],
             }
           : item,
       ),
     }));
     setTripInvoiceDraft("");
-    setLogisticsMessage("Nota(s) fiscal(is) vinculada(s) à viagem emitida.");
+    setFiscalLinkDraft({ lineKey: "", quantity: "" });
+    setLogisticsMessage(
+      `NF ${invoiceNumber} e solicitação ${candidate.request.requestNumber} vinculadas com ${formatNumber(quantity)} ${candidate.line.unit} no bloco ${fiscalBatch.destination}.`,
+    );
   }
   function removeTripInvoice(tripId: string, invoice: string) {
     if (currentUser?.role !== "admin") return;
@@ -5876,6 +6679,14 @@ export default function Home() {
               invoiceNumber: logisticsTripInvoices(trip)
                 .filter((value) => value !== invoice)
                 .join(" · "),
+              invoiceBatchByNumber: Object.fromEntries(
+                Object.entries(trip.invoiceBatchByNumber || {}).filter(
+                  ([number]) => number !== invoice,
+                ),
+              ),
+              fiscalAllocations: (trip.fiscalAllocations || []).filter(
+                (allocation) => allocation.invoiceNumber !== invoice,
+              ),
             }
           : trip,
       ),
@@ -5926,6 +6737,17 @@ export default function Home() {
   }
   function unlinkWebAgilRequest(tripId: string, requestId: string) {
     if (currentUser?.role !== "admin") return;
+    const trip = logistics.trips.find((item) => item.id === tripId);
+    if (
+      trip?.fiscalAllocations?.some(
+        (allocation) => allocation.requestId === requestId,
+      )
+    ) {
+      setLogisticsMessage(
+        "Esta solicitação possui volume e NF vinculados. Remova primeiro a nota fiscal para liberar o vínculo WebAgil.",
+      );
+      return;
+    }
     setLogistics((current) => ({
       ...current,
       trips: current.trips.map((trip) =>
@@ -5969,9 +6791,11 @@ export default function Home() {
       [
         "Viagem",
         "Data da viagem",
+        "Horário de saída",
         "Status da viagem",
         "Pedido SAP",
         "Solicitação WebAgil",
+        "Agendamento WebAgil",
         "Data do pedido",
         "Origem",
         "Modo",
@@ -5986,6 +6810,7 @@ export default function Home() {
         "Ajuste da fazenda",
         "Destino",
         "Cód. destino",
+        "Responsável fiscal (AG)",
         "Motorista",
         "CPF",
         "Placa",
@@ -5999,6 +6824,7 @@ export default function Home() {
       ...logisticsTripItems(trip).map((item) => [
         trip.id.replace("viagem-", ""),
         logisticsTripDate(trip),
+        trip.departureTime || "",
         trip.status || "Em progresso",
         item.requestId,
         (trip.webRequestIds || [])
@@ -6008,6 +6834,7 @@ export default function Home() {
                 ?.requestNumber || id,
           )
           .join(", ") || "Pendente pós-rota",
+        trip.appointmentNumber || "Pendente",
         item.requestDate,
         item.sourceWarehouse,
         item.sourceMode || "armazem",
@@ -6022,6 +6849,7 @@ export default function Home() {
         item.adjustmentRequired ? "Solicitar ajuste no sistema" : "",
         item.destination,
         item.destinationCode,
+        item.responsibleName || "BOA ESPERANCA AGROPECUARIA LTDA",
         driver?.fullName || "Motorista removido",
         driver?.cpf || "",
         vehicle?.plate || "Veículo removido",
@@ -9241,6 +10069,71 @@ export default function Home() {
       logistics.trips.find((trip) => trip.id === recipeTripId) || null;
     const invoiceTrip =
       logistics.trips.find((trip) => trip.id === invoiceTripId) || null;
+    const invoiceFiscalBatch = invoiceTrip
+      ? logisticsTripFiscalBatches(invoiceTrip).find(
+          (batch) => batch.id === invoiceBatchKey,
+        ) || null
+      : null;
+    const invoiceFiscalCandidates =
+      invoiceTrip && invoiceFiscalBatch
+        ? logisticsFiscalCandidates(
+            invoiceTrip,
+            invoiceFiscalBatch,
+            webAgilRequests,
+          )
+        : [];
+    const selectedFiscalCandidate = invoiceFiscalCandidates.find(
+      (candidate) =>
+        `${candidate.request.id}|${candidate.line.id}` ===
+        fiscalLinkDraft.lineKey,
+    );
+    const appointmentTrip =
+      logistics.trips.find((trip) => trip.id === appointmentTripId) || null;
+    const recipeOptions = recipeTrip
+      ? logisticsTripRecipeOptions(recipeTrip)
+      : [];
+    const selectableRecipeOptions = recipeTrip
+      ? recipeOptions.filter(
+          (option) =>
+            !isRecipeExempt(
+              recipeTrip,
+              option.destination,
+              option.product,
+              option.unit,
+            ),
+        )
+      : [];
+    const selectedRecipeOption = recipeOptions.find(
+      (option) =>
+        normalizeMaterial(option.destination) ===
+          normalizeMaterial(recipeDraft.destination) &&
+        normalizeMaterial(option.product) ===
+          normalizeMaterial(recipeDraft.product),
+    );
+    const pendingRecipeOptions = recipeTrip
+      ? logisticsPendingRecipeOptions(recipeTrip)
+      : [];
+    const workflowTrip =
+      logistics.trips.find((trip) => trip.id === workflowTripId) || null;
+    const workflowDriver = workflowTrip
+      ? logistics.drivers.find((driver) => driver.id === workflowTrip.driverId)
+      : null;
+    const workflowVehicle = workflowTrip
+      ? logistics.vehicles.find(
+          (vehicle) => vehicle.id === workflowTrip.vehicleId,
+        )
+      : null;
+    const workflowFiscalBatches = workflowTrip
+      ? logisticsTripFiscalBatches(workflowTrip)
+      : [];
+    const workflowExternalFiscalBatches = workflowFiscalBatches.filter(
+      (batch) => !isBoaEsperancaAg(batch.responsibleName),
+    );
+    const workflowLinkedWeb = workflowTrip
+      ? (workflowTrip.webRequestIds || [])
+          .map((id) => webAgilRequests.find((request) => request.id === id))
+          .filter((request): request is LogisticsRequest => Boolean(request))
+      : [];
     const selectedDriver = logistics.drivers.find(
       (driver) => driver.id === tripDriverId,
     );
@@ -9626,7 +10519,7 @@ export default function Home() {
                             <option key={stock.id} value={stock.id}>
                               {stock.product} · saldo disponível{" "}
                               {formatNumber(stock.balance)} {stock.unit} ·{" "}
-                              {stock.warehouse}
+                              {stock.warehouse} · AG {stock.responsibleName}
                             </option>
                           ))}
                         </select>
@@ -9850,6 +10743,15 @@ export default function Home() {
                     />
                   </label>
                   <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
+                    Horário previsto de saída
+                    <input
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                      onChange={(event) => setTripDepartureTime(event.target.value)}
+                      type="time"
+                      value={tripDepartureTime}
+                    />
+                  </label>
+                  <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
                     Motorista
                     <select
                       className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
@@ -10009,10 +10911,10 @@ export default function Home() {
                         routeMap.destinationAddress ? (
                           <a
                             className="rounded-lg border border-sky-300 bg-white px-3 py-2 text-xs font-bold text-sky-800"
-                            href={
+                            href={googleMapsSearchUrl(
                               routeMap.destinationAddress ||
-                              routeMap.originAddress
-                            }
+                                routeMap.originAddress,
+                            )}
                             rel="noreferrer"
                             target="_blank"
                           >
@@ -10092,7 +10994,7 @@ export default function Home() {
               <Table
                 empty="Nenhuma viagem emitida."
                 headers={[
-                  "Pedidos SAP / WebAgil",
+                  "Pedidos SAP / WebAgil / agendamento",
                   "Carga da rota",
                   "Rota",
                   "Data / motorista / placa",
@@ -10130,6 +11032,11 @@ export default function Home() {
                         {linkedWeb.length
                           ? `WebAgil: ${linkedWeb.map((request) => request.requestNumber).join(", ")}`
                           : "WebAgil pendente de vínculo"}
+                      </small>
+                      <small className="mt-1 block font-semibold text-violet-700">
+                        {trip.appointmentNumber
+                          ? `Agendamento: ${trip.appointmentNumber}`
+                          : "Agendamento pendente"}
                       </small>
                     </span>,
                     <span key={`${trip.id}-material`}>
@@ -10169,6 +11076,7 @@ export default function Home() {
                         {new Intl.DateTimeFormat("pt-BR").format(
                           new Date(`${logisticsTripDate(trip)}T00:00:00`),
                         )}
+                        {trip.departureTime ? ` · ${trip.departureTime}` : ""}
                       </strong>
                       <br />
                       {driver?.fullName || "Cadastro removido"}
@@ -10223,13 +11131,19 @@ export default function Home() {
                     >
                       <button
                         className="rounded-lg border border-sky-700 px-2.5 py-1.5 text-xs font-bold text-sky-800"
-                        onClick={() => {
-                          setInvoiceTripId(trip.id);
-                          setTripInvoiceDraft("");
-                        }}
+                        onClick={() => openTripInvoices(trip)}
                         type="button"
                       >
                         Notas fiscais
+                      </button>
+                      <button
+                        className="rounded-lg border border-violet-700 px-2.5 py-1.5 text-xs font-bold text-violet-800"
+                        onClick={() => openTripAppointment(trip)}
+                        type="button"
+                      >
+                        {trip.appointmentNumber
+                          ? "Agendamento"
+                          : "Registrar agendamento"}
                       </button>
                       <button
                         className="rounded-lg border border-sky-700 px-2.5 py-1.5 text-xs font-bold text-sky-800"
@@ -10237,7 +11151,7 @@ export default function Home() {
                           const firstItem = logisticsTripItems(trip)[0];
                           setRecipeTripId(trip.id);
                           setRecipeDraft({
-                            culture: "",
+                            culture: firstItem?.culture || "",
                             destination: firstItem?.destination || trip.destination,
                             dose: "",
                             product: firstItem?.product || trip.product,
@@ -10248,6 +11162,13 @@ export default function Home() {
                         type="button"
                       >
                         Receitas
+                      </button>
+                      <button
+                        className="rounded-lg border border-violet-700 px-2.5 py-1.5 text-xs font-bold text-violet-800"
+                        onClick={() => setWorkflowTripId(trip.id)}
+                        type="button"
+                      >
+                        Fluxo
                       </button>
                       <button
                         className="rounded-lg border border-emerald-700 px-2.5 py-1.5 text-xs font-bold text-emerald-700"
@@ -10267,6 +11188,388 @@ export default function Home() {
                   ];
                 })}
               />
+              {workflowTrip ? (
+                <section className="rounded-2xl border border-violet-200 bg-violet-50/60 p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-bold uppercase tracking-[.12em] text-violet-700">
+                        Fluxo operacional da viagem
+                      </p>
+                      <h4 className="mt-1 font-semibold text-violet-950">
+                        Viagem {workflowTrip.id.replace("viagem-", "")} ·{" "}
+                        {new Intl.DateTimeFormat("pt-BR").format(
+                          new Date(`${logisticsTripDate(workflowTrip)}T00:00:00`),
+                        )}
+                        {workflowTrip.departureTime
+                          ? ` · saída ${workflowTrip.departureTime}`
+                          : ""}
+                      </h4>
+                      <p className="mt-1 text-sm text-violet-900">
+                        {workflowDriver?.fullName || "Motorista não identificado"}
+                        {workflowVehicle?.plate
+                          ? ` · ${workflowVehicle.plate}`
+                          : ""}
+                      </p>
+                    </div>
+                    <button
+                      className="text-xs font-bold text-slate-600"
+                      onClick={() => setWorkflowTripId("")}
+                      type="button"
+                    >
+                      Fechar fluxo
+                    </button>
+                  </div>
+
+                  <div className="mt-5 grid gap-2 sm:grid-cols-2 xl:grid-cols-7">
+                    {[
+                      ["1", "Rota criada", true],
+                      [
+                        "2",
+                        "WebAgil",
+                        Boolean(workflowLinkedWeb.length),
+                      ],
+                      [
+                        "3",
+                        "Fiscal / NF",
+                        workflowFiscalBatches.every((batch) =>
+                          logisticsFiscalBatchAllocated(workflowTrip, batch) >=
+                          batch.items.reduce(
+                            (total, item) => total + item.quantity,
+                            0,
+                          ) - 0.000001,
+                        ),
+                      ],
+                      [
+                        "4",
+                        "E-mail externo",
+                        workflowExternalFiscalBatches.every((batch) =>
+                            Boolean(
+                              workflowTrip.fiscalEmailSentAtByBatch?.[batch.id],
+                            ),
+                          ),
+                      ],
+                      [
+                        "5",
+                        "Agendamento",
+                        Boolean(workflowTrip.appointmentNumber),
+                      ],
+                      ["6", "Grupo de rota", Boolean(workflowTrip.routeGroupSentAt)],
+                      [
+                        "7",
+                        "Pedido de receita",
+                        Boolean(workflowTrip.recipeRequestSentAt),
+                      ],
+                    ].map(([step, label, ready]) => (
+                      <div
+                        className={cn(
+                          "rounded-xl border px-3 py-2 text-sm",
+                          ready
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                            : "border-violet-200 bg-white text-slate-600",
+                        )}
+                        key={String(step)}
+                      >
+                        <span className="font-bold">{step}. </span>
+                        {label}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="mt-5 grid gap-4 xl:grid-cols-2">
+                    <article className="order-1 rounded-xl border border-sky-200 bg-white p-4">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <h5 className="font-semibold text-sky-950">
+                            2. Solicitações WebAgil
+                          </h5>
+                          <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                            Crie as solicitações no WebAgil com os volumes da
+                            rota. O lote é definido naquele sistema; depois,
+                            vincule cada solicitação uma única vez aqui.
+                          </p>
+                        </div>
+                        <button
+                          className="rounded-lg border border-sky-700 px-3 py-2 text-xs font-bold text-sky-800"
+                          onClick={() =>
+                            document
+                              .getElementById("logistics-webagil-links")
+                              ?.scrollIntoView({ behavior: "smooth", block: "center" })
+                          }
+                          type="button"
+                        >
+                          Vincular WebAgil
+                        </button>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {workflowLinkedWeb.length ? (
+                          workflowLinkedWeb.map((request) => (
+                            <span
+                              className="rounded-full bg-sky-100 px-3 py-1 text-xs font-bold text-sky-800"
+                              key={request.id}
+                            >
+                              Solicitação {request.requestNumber}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-sm text-slate-500">
+                            Nenhuma solicitação vinculada ainda.
+                          </span>
+                        )}
+                      </div>
+                    </article>
+
+                    <article className="order-3 rounded-xl border border-violet-200 bg-white p-4">
+                      <h5 className="font-semibold text-violet-950">
+                        5. Agendamento da carga no WebAgil
+                      </h5>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                        Depois de vincular as solicitações, crie no WebAgil um
+                        único agendamento para a carga do veículo e associe a
+                        ele todas as solicitações desta viagem. O sistema não
+                        escolhe lotes: essa distribuição continua no WebAgil.
+                      </p>
+                      <div className="mt-3 rounded-lg border border-violet-100 bg-violet-50/60 p-3 text-sm text-violet-950">
+                        {workflowTrip.appointmentNumber ? (
+                          <>
+                            <strong>Agendamento {workflowTrip.appointmentNumber}</strong>
+                            <br />
+                            {workflowLinkedWeb.length} solicitação(ões) WebAgil
+                            vinculada(s) a esta viagem.
+                          </>
+                        ) : (
+                          "Nenhum agendamento WebAgil registrado ainda."
+                        )}
+                      </div>
+                      <button
+                        className="mt-3 rounded-lg border border-violet-700 bg-white px-3 py-1.5 text-xs font-bold text-violet-800"
+                        onClick={() => openTripAppointment(workflowTrip)}
+                        type="button"
+                      >
+                        {workflowTrip.appointmentNumber
+                          ? "Editar agendamento"
+                          : "Registrar agendamento"}
+                      </button>
+                    </article>
+
+                    <article className="order-2 rounded-xl border border-amber-200 bg-white p-4">
+                      <h5 className="font-semibold text-amber-950">
+                        3–4. Fiscal e e-mail externo
+                      </h5>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                        Os blocos são separados por destino e responsável (AG).
+                        Quando o mesmo destino possui AG diferente, cada bloco
+                        recebe NF próprio. O e-mail com anexos é preparado
+                        somente para AG diferente de Boa Esperança Agropecuária.
+                      </p>
+                      <div className="mt-3 space-y-2">
+                        {workflowFiscalBatches.map((batch) => (
+                          <div
+                            className="rounded-lg border border-amber-100 bg-amber-50/60 p-3"
+                            key={batch.id}
+                          >
+                            <div className="flex flex-wrap items-start justify-between gap-2">
+                              <div>
+                                <strong className="text-sm text-amber-950">
+                                  {batch.destination}
+                                </strong>
+                                <p className="text-xs text-amber-900">
+                                  AG: {batch.responsibleName}
+                                </p>
+                                <p className="mt-1 text-xs text-slate-600">
+                                  {batch.items
+                                    .map(
+                                      (item) =>
+                                        `${item.product} (${formatNumber(item.quantity)} ${item.unit})`,
+                                    )
+                                    .join(" · ")}
+                                </p>
+                                <p className="mt-1 text-xs font-semibold text-amber-900">
+                                  Volume vinculado: {formatNumber(
+                                    logisticsFiscalBatchAllocated(
+                                      workflowTrip,
+                                      batch,
+                                    ),
+                                  )} de {formatNumber(
+                                    batch.items.reduce(
+                                      (total, item) => total + item.quantity,
+                                      0,
+                                    ),
+                                  )}
+                                </p>
+                              </div>
+                              <span
+                                className={cn(
+                                  "rounded-full px-2.5 py-1 text-xs font-bold",
+                                  batch.invoices.length
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : "bg-white text-amber-900",
+                                )}
+                              >
+                                {batch.invoices.length
+                                  ? `NF: ${batch.invoices.join(", ")}`
+                                  : "NF pendente"}
+                              </span>
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              <button
+                                className="rounded-lg border border-amber-700 bg-white px-3 py-1.5 text-xs font-bold text-amber-900"
+                                onClick={() => openTripInvoices(workflowTrip, batch.id)}
+                                type="button"
+                              >
+                                Vincular solicitação + NF
+                              </button>
+                              {isBoaEsperancaAg(batch.responsibleName) ? (
+                                <span className="px-1 py-1.5 text-xs font-semibold text-slate-500">
+                                  E-mail externo não necessário para Boa Esperança.
+                                </span>
+                              ) : (
+                                <button
+                                  className="rounded-lg border border-amber-700 bg-white px-3 py-1.5 text-xs font-bold text-amber-900 disabled:cursor-not-allowed disabled:opacity-45"
+                                  disabled={
+                                    !batch.invoices.length ||
+                                    logisticsFiscalBatchAllocated(
+                                      workflowTrip,
+                                      batch,
+                                    ) <
+                                      batch.items.reduce(
+                                        (total, item) => total + item.quantity,
+                                        0,
+                                      ) - 0.000001
+                                  }
+                                  onClick={() => {
+                                    void copyLogisticsText(
+                                      logisticsFiscalEmailText(
+                                        workflowTrip,
+                                        batch,
+                                        workflowDriver?.fullName || "",
+                                        workflowVehicle?.plate || "",
+                                        workflowLinkedWeb.map(
+                                          (request) => request.requestNumber,
+                                        ),
+                                      ),
+                                      "E-mail fiscal copiado. Anexe as NFs deste bloco antes de enviar.",
+                                    );
+                                    markTripCommunication(
+                                      workflowTrip.id,
+                                      "fiscal",
+                                      batch.id,
+                                    );
+                                  }}
+                                  type="button"
+                                >
+                                  {workflowTrip.fiscalEmailSentAtByBatch?.[batch.id]
+                                    ? "E-mail preparado"
+                                    : batch.invoices.length &&
+                                        logisticsFiscalBatchAllocated(
+                                          workflowTrip,
+                                          batch,
+                                        ) >=
+                                          batch.items.reduce(
+                                            (total, item) => total + item.quantity,
+                                            0,
+                                          ) - 0.000001
+                                      ? "Copiar e-mail"
+                                      : "Conclua os volumes e NFs"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </article>
+
+                    <article className="order-4 rounded-xl border border-emerald-200 bg-white p-4">
+                      <h5 className="font-semibold text-emerald-950">
+                        6. Grupo da rota
+                      </h5>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                        Mensagem preparada para informar armazém e unidades com
+                        pelo menos um dia de antecedência. Revise e envie no
+                        grupo oficial da rota.
+                      </p>
+                      <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-emerald-50 p-3 text-xs leading-relaxed text-emerald-950">
+                        {logisticsRouteBrief(
+                          workflowTrip,
+                          workflowDriver?.fullName || "",
+                          workflowVehicle?.plate || "",
+                        )}
+                      </pre>
+                      <button
+                        className="mt-3 rounded-lg border border-emerald-700 bg-white px-3 py-1.5 text-xs font-bold text-emerald-800"
+                        onClick={() => {
+                          void copyLogisticsText(
+                            logisticsRouteBrief(
+                              workflowTrip,
+                              workflowDriver?.fullName || "",
+                              workflowVehicle?.plate || "",
+                            ),
+                            "Mensagem de rota copiada para o grupo.",
+                          );
+                          markTripCommunication(workflowTrip.id, "route");
+                        }}
+                        type="button"
+                      >
+                        {workflowTrip.routeGroupSentAt
+                          ? "Mensagem preparada"
+                          : "Copiar mensagem da rota"}
+                      </button>
+                    </article>
+
+                    <article className="order-5 rounded-xl border border-emerald-200 bg-white p-4">
+                      <h5 className="font-semibold text-emerald-950">
+                        7. Emissão de receitas
+                      </h5>
+                      <p className="mt-1 text-xs leading-relaxed text-slate-600">
+                        A prévia abaixo usa somente as receitas registradas.
+                        Produtos dispensados não entram no e-mail. Complete cada
+                        destino, produto, cultura, alvo e dose antes de gerar o
+                        arquivo para o agrônomo.
+                      </p>
+                      <pre className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-emerald-50 p-3 text-xs leading-relaxed text-emerald-950">
+                        {logisticsRecipeRequestText(workflowTrip)}
+                      </pre>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          className="rounded-lg border border-emerald-700 bg-white px-3 py-1.5 text-xs font-bold text-emerald-800 disabled:cursor-not-allowed disabled:opacity-45"
+                          disabled={Boolean(logisticsPendingRecipeOptions(workflowTrip).length)}
+                          onClick={() => downloadRecipeEmail(workflowTrip)}
+                          type="button"
+                        >
+                          {workflowTrip.recipeRequestSentAt
+                            ? "E-mail .eml gerado"
+                            : "Gerar e-mail .eml"}
+                        </button>
+                        <button
+                          className="rounded-lg border border-emerald-700 bg-white px-3 py-1.5 text-xs font-bold text-emerald-800"
+                          onClick={() => {
+                            const firstItem = logisticsPendingRecipeOptions(
+                              workflowTrip,
+                            )[0];
+                            setRecipeTripId(workflowTrip.id);
+                            setRecipeDraft({
+                              culture: firstItem?.culture || "",
+                              destination:
+                                firstItem?.destination || workflowTrip.destination,
+                              dose: "",
+                              product: firstItem?.product || workflowTrip.product,
+                              target: "",
+                              volume: firstItem?.available || workflowTrip.quantity,
+                            });
+                          }}
+                          type="button"
+                        >
+                          Registrar receita
+                        </button>
+                        {logisticsPendingRecipeOptions(workflowTrip).length ? (
+                          <span className="self-center text-xs font-semibold text-amber-800">
+                            {logisticsPendingRecipeOptions(workflowTrip).length} produto(s) ainda precisam de receita ou dispensa.
+                          </span>
+                        ) : null}
+                      </div>
+                    </article>
+                  </div>
+                </section>
+              ) : null}
               {invoiceTrip ? (
                 <section className="rounded-2xl border border-amber-200 bg-amber-50 p-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -10287,23 +11590,134 @@ export default function Home() {
                       Fechar
                     </button>
                   </div>
-                  <div className="mt-4 flex flex-wrap gap-3">
+                  <div className="mt-4 grid gap-3 md:grid-cols-2">
+                    <label className="grid gap-1 text-sm font-semibold text-amber-950">
+                      Bloco fiscal: destino + responsável (AG)
+                      <select
+                        className="rounded-xl border border-amber-200 bg-white px-3 py-2.5 font-normal"
+                        onChange={(event) => {
+                          setInvoiceBatchKey(event.target.value);
+                          setFiscalLinkDraft({ lineKey: "", quantity: "" });
+                          setTripInvoiceDraft("");
+                        }}
+                        value={invoiceBatchKey}
+                      >
+                        {logisticsTripFiscalBatches(invoiceTrip).map((batch) => (
+                          <option key={batch.id} value={batch.id}>
+                            {batch.destination} · {batch.responsibleName} · {batch.items.length} item(ns)
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="rounded-xl border border-amber-200 bg-white px-3 py-2.5 text-sm text-amber-950">
+                      {(() => {
+                        const batch = logisticsTripFiscalBatches(invoiceTrip).find(
+                          (item) => item.id === invoiceBatchKey,
+                        );
+                        const allocated = batch
+                          ? logisticsFiscalBatchAllocated(invoiceTrip, batch)
+                          : 0;
+                        const total = batch
+                          ? batch.items.reduce(
+                              (sum, item) => sum + item.quantity,
+                              0,
+                            )
+                          : 0;
+                        return batch ? (
+                          <>
+                            <strong>
+                              {formatNumber(allocated)} de {formatNumber(total)}
+                              {" "}consumido(s) neste bloco.
+                            </strong>
+                            <br />
+                            Selecione uma linha WebAgil e o volume antes de liberar a NF.
+                          </>
+                        ) : (
+                          "Selecione o bloco fiscal para registrar as notas."
+                        );
+                      })()}
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-[minmax(0,1.5fr)_minmax(0,.7fr)_minmax(0,.9fr)_auto]">
+                    <label className="grid gap-1 text-sm font-semibold text-amber-950">
+                      Linha da solicitação WebAgil
+                      <select
+                        className="rounded-xl border border-amber-200 bg-white px-3 py-2.5 font-normal"
+                        disabled={!invoiceFiscalCandidates.length}
+                        onChange={(event) => {
+                          const candidate = invoiceFiscalCandidates.find(
+                            (item) =>
+                              `${item.request.id}|${item.line.id}` ===
+                              event.target.value,
+                          );
+                          setFiscalLinkDraft({
+                            lineKey: event.target.value,
+                            quantity: candidate
+                              ? String(candidate.available)
+                              : "",
+                          });
+                        }}
+                        value={fiscalLinkDraft.lineKey}
+                      >
+                        <option value="">
+                          {invoiceFiscalCandidates.length
+                            ? "Selecione a solicitação e o material"
+                            : "Nenhuma linha conciliada disponível"}
+                        </option>
+                        {invoiceFiscalCandidates.map((candidate) => (
+                          <option
+                            disabled={candidate.available <= 0}
+                            key={`${candidate.request.id}|${candidate.line.id}`}
+                            value={`${candidate.request.id}|${candidate.line.id}`}
+                          >
+                            {candidate.request.requestNumber} · {candidate.line.product} · disponível {formatNumber(candidate.available)} {candidate.line.unit}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="grid gap-1 text-sm font-semibold text-amber-950">
+                      Volume a faturar
+                      <input
+                        className="rounded-xl border border-amber-200 bg-white px-3 py-2.5 font-normal"
+                        disabled={!selectedFiscalCandidate}
+                        inputMode="decimal"
+                        onChange={(event) =>
+                          setFiscalLinkDraft((current) => ({
+                            ...current,
+                            quantity: event.target.value,
+                          }))
+                        }
+                        value={fiscalLinkDraft.quantity}
+                      />
+                    </label>
+                    <label className="grid gap-1 text-sm font-semibold text-amber-950">
+                      Nota fiscal
                     <input
-                      className="min-w-[240px] flex-1 rounded-xl border border-amber-200 bg-white px-3 py-2.5 text-sm"
+                      className="rounded-xl border border-amber-200 bg-white px-3 py-2.5 text-sm font-normal"
+                      disabled={!selectedFiscalCandidate}
                       onChange={(event) =>
                         setTripInvoiceDraft(event.target.value)
                       }
-                      placeholder="NF ou várias NFs separadas por vírgula"
+                      placeholder="Ex.: 7087-1"
                       value={tripInvoiceDraft}
                     />
+                    </label>
                     <button
-                      className="rounded-xl border border-amber-700 bg-white px-4 py-2.5 text-sm font-bold text-amber-900"
+                      className="self-end rounded-xl border border-amber-700 bg-white px-4 py-2.5 text-sm font-bold text-amber-900 disabled:cursor-not-allowed disabled:opacity-45"
+                      disabled={!selectedFiscalCandidate || !tripInvoiceDraft.trim()}
                       onClick={attachTripInvoices}
                       type="button"
                     >
-                      Vincular NF
+                      Vincular solicitação e NF
                     </button>
                   </div>
+                  {selectedFiscalCandidate ? (
+                    <p className="mt-3 text-xs text-amber-900">
+                      Solicitação {selectedFiscalCandidate.request.requestNumber}
+                      {" · "}{selectedFiscalCandidate.line.product}
+                      {" · "}saldo conciliado {formatNumber(selectedFiscalCandidate.available)} {selectedFiscalCandidate.line.unit}.
+                    </p>
+                  ) : null}
                   <div className="mt-3 flex flex-wrap gap-2">
                     {logisticsTripInvoices(invoiceTrip).length ? (
                       logisticsTripInvoices(invoiceTrip).map((invoice) => (
@@ -10331,6 +11745,60 @@ export default function Home() {
                   </div>
                 </section>
               ) : null}
+              {appointmentTrip ? (
+                <section className="rounded-2xl border border-violet-200 bg-violet-50 p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h4 className="font-semibold text-violet-950">
+                        Registrar agendamento WebAgil
+                      </h4>
+                      <p className="mt-1 max-w-3xl text-xs leading-relaxed text-violet-900">
+                        No WebAgil, vincule as solicitações desta viagem ao mesmo
+                        agendamento de carga. Depois, informe aqui o número gerado.
+                        Um agendamento pode conter várias solicitações, mas pertence
+                        a uma única viagem no AgroNexus.
+                      </p>
+                    </div>
+                    <button
+                      className="text-xs font-bold text-slate-600"
+                      onClick={() => setAppointmentTripId("")}
+                      type="button"
+                    >
+                      Fechar
+                    </button>
+                  </div>
+                  <div className="mt-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                    <label className="grid gap-1 text-sm font-semibold text-violet-950">
+                      Número do agendamento de carga
+                      <input
+                        className="rounded-xl border border-violet-200 bg-white px-3 py-2.5 font-normal"
+                        inputMode="numeric"
+                        maxLength={7}
+                        onChange={(event) =>
+                          setAppointmentDraft(
+                            event.target.value.replace(/\D/g, "").slice(0, 7),
+                          )
+                        }
+                        placeholder="7 dígitos · Ex.: 2969014"
+                        value={appointmentDraft}
+                      />
+                    </label>
+                    <button
+                      className="self-end rounded-xl border border-violet-700 bg-white px-4 py-2.5 text-sm font-bold text-violet-800"
+                      onClick={saveTripAppointment}
+                      type="button"
+                    >
+                      Salvar agendamento
+                    </button>
+                  </div>
+                  <p className="mt-3 text-xs text-violet-900">
+                    Solicitações WebAgil vinculadas: {appointmentTrip.webRequestIds?.length || 0}.
+                    {!appointmentTrip.webRequestIds?.length
+                      ? " Vincule pelo menos uma antes de salvar o agendamento."
+                      : ""}
+                  </p>
+                </section>
+              ) : null}
               {recipeTrip ? (
                 <section className="rounded-2xl border border-sky-200 bg-sky-50 p-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -10352,67 +11820,43 @@ export default function Home() {
                     </button>
                   </div>
                   <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                    <label className="grid gap-1 text-sm font-semibold text-slate-700">
-                      Fazenda destino
+                    <label className="grid gap-1 text-sm font-semibold text-slate-700 xl:col-span-2">
+                      Fazenda destino + produto carregado
                       <select
                         className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal"
-                        onChange={(event) =>
-                          setRecipeDraft((current) => {
-                            const volume = tripRecipeVolume(
-                              recipeTrip,
-                              event.target.value,
-                              current.product,
-                            );
-                            return {
-                              ...current,
-                              destination: event.target.value,
-                              volume,
-                            };
-                          })
-                        }
-                        value={recipeDraft.destination}
+                        onChange={(event) => {
+                          const selected = recipeOptions.find(
+                            (option) => option.id === event.target.value,
+                          );
+                          setRecipeDraft((current) =>
+                            selected
+                              ? {
+                                  ...current,
+                                  culture: selected.culture || current.culture,
+                                  destination: selected.destination,
+                                  product: selected.product,
+                                  volume: selected.available,
+                                }
+                              : {
+                                  ...current,
+                                  culture: "",
+                                  destination: "",
+                                  product: "",
+                                  volume: 0,
+                                },
+                          );
+                        }}
+                        value={selectedRecipeOption?.id || ""}
                       >
-                        <option value="">Selecione a fazenda</option>
-                        {[
-                          ...new Set(
-                            logisticsTripItems(recipeTrip)
-                              .map((item) => item.destination)
-                              .filter(Boolean),
-                          ),
-                        ].map((destination) => (
-                          <option key={destination}>{destination}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="grid gap-1 text-sm font-semibold text-slate-700">
-                      Produto
-                      <select
-                        className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 font-normal"
-                        onChange={(event) =>
-                          setRecipeDraft((current) => {
-                            const volume = tripRecipeVolume(
-                              recipeTrip,
-                              current.destination,
-                              event.target.value,
-                            );
-                            return {
-                              ...current,
-                              product: event.target.value,
-                              volume,
-                            };
-                          })
-                        }
-                        value={recipeDraft.product}
-                      >
-                        <option value="">Selecione o produto</option>
-                        {[
-                          ...new Set(
-                            logisticsTripItems(recipeTrip)
-                              .map((item) => item.product)
-                              .filter(Boolean),
-                          ),
-                        ].map((product) => (
-                          <option key={product}>{product}</option>
+                        <option value="">Selecione o destino e produto da carga</option>
+                        {selectableRecipeOptions.map((option) => (
+                          <option
+                            disabled={option.available <= 0}
+                            key={option.id}
+                            value={option.id}
+                          >
+                            {option.product} — {option.destination} · disponível {formatNumber(option.available)} {option.unit}
+                          </option>
                         ))}
                       </select>
                     </label>
@@ -10473,7 +11917,25 @@ export default function Home() {
                       />
                     </label>
                   </div>
+                  {selectedRecipeOption ? (
+                    <p className="mt-3 rounded-lg border border-sky-200 bg-white px-3 py-2 text-xs text-sky-900">
+                      Carga para receita: <strong>{formatNumber(selectedRecipeOption.total)} {selectedRecipeOption.unit}</strong>
+                      {selectedRecipeOption.allocated
+                        ? ` · já vinculado: ${formatNumber(selectedRecipeOption.allocated)} ${selectedRecipeOption.unit}`
+                        : ""}
+                      {` · saldo disponível: ${formatNumber(selectedRecipeOption.available)} ${selectedRecipeOption.unit}.`}
+                      O volume sugerido pode ser alterado para uma receita parcial.
+                    </p>
+                  ) : null}
                   <div className="mt-4 flex justify-end">
+                    <button
+                      className="mr-3 rounded-xl border border-slate-400 bg-white px-4 py-2.5 text-sm font-bold text-slate-700 disabled:cursor-not-allowed disabled:opacity-45"
+                      disabled={!selectedRecipeOption}
+                      onClick={exemptTripRecipeOption}
+                      type="button"
+                    >
+                      Produto não possui necessidade de receita
+                    </button>
                     <button
                       className="rounded-xl border border-sky-700 bg-white px-4 py-2.5 text-sm font-bold text-sky-800"
                       onClick={attachTripRecipe}
@@ -10490,7 +11952,7 @@ export default function Home() {
                       >
                         <span>
                           <strong>{recipe.destination}</strong> ·{" "}
-                          {recipe.product} · {formatNumber(recipe.volume)} ·{" "}
+                          {recipe.product} · {formatNumber(recipe.volume)} {recipe.unit || ""} ·{" "}
                           {recipe.culture} · {recipe.target} · {recipe.dose}
                         </span>
                         <button
@@ -10509,10 +11971,36 @@ export default function Home() {
                         Nenhuma receita vinculada à viagem.
                       </p>
                     ) : null}
+                    {(recipeTrip.recipeExemptions || []).map((exemption) => (
+                      <div
+                        className="flex flex-wrap items-center justify-between gap-3 px-3 py-2.5 text-sm text-slate-600"
+                        key={exemption.id}
+                      >
+                        <span>
+                          <strong>{exemption.destination}</strong> · {exemption.product}
+                          {" · "}<em>sem necessidade de receita</em>
+                        </span>
+                        <button
+                          className="text-xs font-bold text-sky-700"
+                          onClick={() =>
+                            removeTripRecipeExemption(
+                              recipeTrip.id,
+                              exemption.id,
+                            )
+                          }
+                          type="button"
+                        >
+                          Reativar
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </section>
               ) : null}
-              <section className="rounded-2xl border border-sky-200 bg-sky-50 p-5">
+              <section
+                className="rounded-2xl border border-sky-200 bg-sky-50 p-5"
+                id="logistics-webagil-links"
+              >
                 <div>
                   <h4 className="font-semibold text-sky-950">
                     Vincular solicitação WebAgil após a rota
@@ -10969,26 +12457,37 @@ export default function Home() {
                     <h3 className="font-semibold">Premissas de rota</h3>
                     <p className="mt-1 text-xs text-slate-500">
                       Selecione uma opção disponível de centro, armazém ou
-                      núcleo. Além do município, o endereço específico melhora a
-                      rota exibida no mapa.
+                      núcleo. Links do Google Maps são convertidos em coordenadas
+                      para a rota, sem usar a URL curta como endereço.
                     </p>
                   </div>
-                  {editingLocationKey ? (
+                  <div className="flex flex-wrap items-center justify-end gap-3">
                     <button
-                      className="text-xs font-bold text-slate-600"
-                      onClick={() => {
-                        setEditingLocationKey("");
-                        setLocationDraft({
-                          addressUrl: "",
-                          location: "",
-                          municipality: "",
-                        });
-                      }}
+                      className="text-xs font-bold text-sky-700 disabled:opacity-50"
+                      disabled={isResolvingLocation}
+                      onClick={() => void resolveStoredRouteLinks()}
                       type="button"
                     >
-                      Cancelar edição
+                      Converter links cadastrados
                     </button>
-                  ) : null}
+                    {editingLocationKey ? (
+                      <button
+                        className="text-xs font-bold text-slate-600"
+                        onClick={() => {
+                          setEditingLocationKey("");
+                          setLocationResolution("");
+                          setLocationDraft({
+                            addressUrl: "",
+                            location: "",
+                            municipality: "",
+                          });
+                        }}
+                        type="button"
+                      >
+                        Cancelar edição
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-[minmax(0,1.35fr)_minmax(0,1.2fr)_minmax(0,1.2fr)_auto]">
                   <label className="grid min-w-0 gap-1 text-sm font-semibold text-slate-700">
@@ -11026,7 +12525,7 @@ export default function Home() {
                     />
                   </label>
                   <label className="grid min-w-0 gap-1 text-sm font-semibold text-slate-700">
-                    Link do endereço específico
+                    Link do Google Maps
                     <input
                       className="min-w-0 w-full rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
                       onChange={(event) =>
@@ -11035,21 +12534,29 @@ export default function Home() {
                           addressUrl: event.target.value,
                         }))
                       }
-                      placeholder="https://maps.google.com/..."
+                      placeholder="https://maps.app.goo.gl/..."
                       type="url"
                       value={locationDraft.addressUrl}
                     />
                   </label>
                   <button
-                    className="min-w-[190px] self-end whitespace-nowrap rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700"
-                    onClick={addLogisticsLocation}
+                    className="min-w-[190px] self-end whitespace-nowrap rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700 disabled:opacity-50"
+                    disabled={isResolvingLocation}
+                    onClick={() => void addLogisticsLocation()}
                     type="button"
                   >
-                    {editingLocationKey
+                    {isResolvingLocation
+                      ? "Convertendo…"
+                      : editingLocationKey
                       ? "Salvar premissa"
                       : "Vincular premissa"}
                   </button>
                 </div>
+                {locationResolution ? (
+                  <p className="mt-3 rounded-lg border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+                    {locationResolution}
+                  </p>
+                ) : null}
                 <div className="mt-5">
                   <Table
                     empty="Nenhuma premissa de rota cadastrada."
@@ -11063,6 +12570,7 @@ export default function Home() {
                       ...new Set([
                         ...Object.keys(logistics.municipalityByLocation || {}),
                         ...Object.keys(logistics.addressByLocation || {}),
+                        ...Object.keys(logistics.addressSourceUrlByLocation || {}),
                       ]),
                     ]
                       .sort((left, right) => left.localeCompare(right))
@@ -11072,7 +12580,12 @@ export default function Home() {
                         logistics.addressByLocation?.[location] ? (
                           <a
                             className="text-xs font-bold text-sky-700"
-                            href={logistics.addressByLocation[location]}
+                            href={
+                              logistics.addressSourceUrlByLocation?.[location] ||
+                              googleMapsSearchUrl(
+                                logistics.addressByLocation[location],
+                              )
+                            }
                             key={`${location}-map`}
                             rel="noreferrer"
                             target="_blank"
