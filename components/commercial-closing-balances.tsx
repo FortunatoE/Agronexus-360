@@ -2,11 +2,25 @@
 
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { Fragment, useState } from "react";
-import type { CommercialClosingGroup, CommercialClosingProduct } from "@/lib/commercial-closings";
+import type { CommercialAveragePrice, CommercialClosingGroup, CommercialClosingProduct } from "@/lib/commercial-closings";
 
 const volumeFormat = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 4 });
 const volumeCell = "px-3 py-2 text-right tabular-nums";
-const headings = ["Nível / princípio ativo / material planejado", "Ciclo", "Planejado", "Fechado", "Falta fechar"];
+const headings = ["Nível / princípio ativo / material planejado", "Ciclo", "Preço médio", "Planejado", "Fechado", "Falta fechar"];
+
+function priceLabel(prices: CommercialAveragePrice[]) {
+  if (!prices.length) return "—";
+  return prices.map((price) => {
+    if (price.currency === "BRL" || price.currency === "USD") {
+      return new Intl.NumberFormat("pt-BR", {
+        style: "currency",
+        currency: price.currency,
+        maximumFractionDigits: 2,
+      }).format(price.average);
+    }
+    return `${volumeFormat.format(price.average)} ${price.currency}`;
+  }).join(" · ");
+}
 
 function productTotals(products: CommercialClosingProduct[]) {
   const plannedProducts = products.filter((product) => product.planned !== null);
@@ -32,7 +46,7 @@ export function CommercialClosingBalances({
   return (
     <section aria-labelledby="closing-balances-title" className="rounded-2xl border border-slate-200 bg-white p-5">
       <h3 className="font-semibold" id="closing-balances-title">Quanto falta fechar</h3>
-      <p className="mt-1 text-xs text-slate-500">Navegue por grupo, subgrupo, princípio ativo e material planejado. O último nível mostra os materiais fechados; a conversão usa o fator cadastrado em Premissas.</p>
+      <p className="mt-1 text-xs text-slate-500">Navegue por grupo, subgrupo, princípio ativo e material planejado. Cada nível mostra o preço médio ponderado; o último detalha material fechado por fornecedor. Falta fechar desconta fechado, aplicado e estoque conciliado, rateando o saldo entre ciclos quando necessário.</p>
       {groups.length ? (
         <div className="mt-4 overflow-x-auto">
           <table className="w-full min-w-[680px] text-sm">
@@ -63,6 +77,7 @@ export function CommercialClosingBalances({
                       </button>
                     </th>
                     <td className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-emerald-700">Consolidado</td>
+                    <td className={volumeCell}>{priceLabel(group.averagePrices)}</td>
                     <td className={volumeCell}>{groupTotals.planned === null ? "—" : volumeFormat.format(groupTotals.planned)}</td>
                     <td className={`${volumeCell} text-emerald-800`}>{volumeFormat.format(groupTotals.closed)}</td>
                     <td className={`${volumeCell} font-bold ${(groupTotals.remaining ?? 0) > 0 ? "text-rose-700" : "text-emerald-800"}`}>{groupTotals.remaining === null ? "—" : volumeFormat.format(groupTotals.remaining)}</td>
@@ -80,6 +95,7 @@ export function CommercialClosingBalances({
                           </button>
                         </th>
                         <td className="px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Consolidado</td>
+                        <td className={volumeCell}>{priceLabel(subgroup.averagePrices)}</td>
                         <td className={volumeCell}>{subgroupTotals.planned === null ? "—" : volumeFormat.format(subgroupTotals.planned)}</td>
                         <td className={`${volumeCell} text-emerald-800`}>{volumeFormat.format(subgroupTotals.closed)}</td>
                         <td className={`${volumeCell} font-bold ${(subgroupTotals.remaining ?? 0) > 0 ? "text-rose-700" : "text-emerald-800"}`}>{subgroupTotals.remaining === null ? "—" : volumeFormat.format(subgroupTotals.remaining)}</td>
@@ -91,14 +107,32 @@ export function CommercialClosingBalances({
                         return <Fragment key={product.key}>
                           <tr className="border-t border-slate-100 text-slate-900">
                             <th className="py-2 pr-3 pl-14 text-left font-semibold" scope="row">
-                              {showDetails ? <button aria-expanded={productOpen} className="flex items-center gap-1.5 text-left hover:underline" onClick={() => setExpandedProducts((current) => ({ ...current, [product.key]: !productOpen }))} type="button"><ProductIcon aria-hidden="true" className="size-3.5 shrink-0" /><span>{active.active}<span className="ml-2 font-normal text-slate-500">| {product.product}</span></span></button> : <span className="pl-5">{active.active}<span className="ml-2 font-normal text-slate-500">| {product.product}</span></span>}
+                              {showDetails ? <button aria-expanded={productOpen} className="flex items-center gap-1.5 text-left hover:underline" onClick={() => setExpandedProducts((current) => ({ ...current, [product.key]: !productOpen }))} type="button"><ProductIcon aria-hidden="true" className="size-3.5 shrink-0" /><span>{active.active}<span className="ml-2 font-normal text-slate-500">| {product.product}</span>{product.covered ? <span className="mt-0.5 block text-[11px] font-normal text-violet-700">Cobertura atual: {volumeFormat.format(product.covered)} (estoque + aplicado)</span> : null}</span></button> : <span className="pl-5">{active.active}<span className="ml-2 font-normal text-slate-500">| {product.product}</span>{product.covered ? <span className="mt-0.5 block text-[11px] font-normal text-violet-700">Cobertura atual: {volumeFormat.format(product.covered)} (estoque + aplicado)</span> : null}</span>}
                             </th>
                             <td className="px-3 py-2">{product.cycle}</td>
+                            <td className={volumeCell}>{priceLabel(product.averagePrices)}</td>
                             <td className={volumeCell}>{product.planned === null ? "—" : volumeFormat.format(product.planned)}</td>
                             <td className={`${volumeCell} text-emerald-800`}>{volumeFormat.format(product.closed)}</td>
                             <td className={`${volumeCell} font-bold ${(product.remaining ?? 0) > 0 ? "text-rose-700" : "text-emerald-800"}`}>{product.remaining === null ? "—" : volumeFormat.format(product.remaining)}</td>
                           </tr>
-                          {productOpen ? product.details.map((detail) => <tr className="border-t border-slate-100 bg-slate-50 text-xs text-slate-600" key={JSON.stringify([product.key, detail.product, detail.unit])}><th className="py-2 pr-3 pl-20 text-left font-medium" scope="row"><span className="text-emerald-700">Material fechado · </span>{detail.product}</th><td /><td /><td className={volumeCell}><span className="font-semibold text-emerald-800">{volumeFormat.format(detail.amount)}{detail.converted ? " convertido" : detail.unit ? ` ${detail.unit}` : ""}</span>{detail.converted ? <span className="mt-0.5 block text-[11px]">Saldo físico: {volumeFormat.format(detail.physical)}{detail.unit ? ` ${detail.unit}` : ""}</span> : null}</td><td /></tr>) : null}
+                          {productOpen ? product.details.flatMap((detail) => [
+                            <tr className="border-t border-slate-100 bg-slate-50 text-xs text-slate-600" key={JSON.stringify([product.key, detail.product, detail.unit])}>
+                              <th className="py-2 pr-3 pl-20 text-left font-medium" scope="row"><span className="text-emerald-700">Material fechado · </span>{detail.product}</th>
+                              <td />
+                              <td className={volumeCell}>{priceLabel(detail.averagePrices)}</td>
+                              <td />
+                              <td className={volumeCell}><span className="font-semibold text-emerald-800">{volumeFormat.format(detail.amount)}{detail.converted ? " convertido" : detail.unit ? ` ${detail.unit}` : ""}</span>{detail.converted ? <span className="mt-0.5 block text-[11px]">Saldo físico: {volumeFormat.format(detail.physical)}{detail.unit ? ` ${detail.unit}` : ""}</span> : null}</td>
+                              <td />
+                            </tr>,
+                            ...detail.suppliers.map((supplier) => <tr className="border-t border-slate-100 bg-white text-xs text-slate-500" key={JSON.stringify([product.key, detail.product, supplier.supplier, supplier.currency])}>
+                              <th className="py-2 pr-3 pl-28 text-left font-medium" scope="row">Fornecedor · {supplier.supplier}</th>
+                              <td />
+                              <td className={volumeCell}>{priceLabel([supplier])}</td>
+                              <td />
+                              <td className={volumeCell}>{volumeFormat.format(supplier.volume)} {detail.unit}</td>
+                              <td />
+                            </tr>),
+                          ]) : null}
                         </Fragment>;
                       })) : null}
                     </Fragment>;

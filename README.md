@@ -71,16 +71,16 @@ O objetivo não é apenas exibir indicadores: é deixar explícitas as regras de
 
 | Módulo | Entrega operacional |
 | --- | --- |
-| Visão geral | Prioridades do dia, riscos, pedidos urgentes, execução por subgrupo, cultura e DAE por núcleo. |
+| Visão geral | Prioridades do dia, riscos, pedidos urgentes, execução por subgrupo, cultura e DAE por núcleo; avisa rotas ativas e direciona à logística. |
 | Calendarização | Provisionamento por intervalo de datas com demanda, saldo, trânsito, armazém, apoio entre núcleos e volume solicitado. |
-| Acompanhamento | Visão por princípio ativo, material padrão, material físico e localização; totais e estoque convertido/físico. |
+| Acompanhamento | Visão por princípio ativo, material padrão, material físico e localização; totais, estoque convertido/físico e saldo a faturar por ciclo, núcleo e pedido vinculado. |
 | Execução | Planejado x aplicado, percentual executado, dose planejada x utilizada e impacto da diferença de dose. |
 | Importações | Validação de fontes, metadados, data de arquivo, frescor da base e relatório de itens não conciliados. |
 | Alertas | Repasse em até 30 dias, risco de disponibilidade, variação expressiva de dose e vencimento de estoque. |
 | Tarefas | Farol de pedidos, filtros, histórico de ações, vínculo a pedido/material e exportação. |
 | Premissas | Visão tabulada e editável de dimensões, conversões, centros, núcleos, culturas e regras operacionais. |
-| Logística | Reservas por saldo de pedido SAP, veículos, motoristas, rota multi-item, status, NF, receita e documento Excel. |
-| Fechamentos | Distribuições comercialmente fechadas, calendarização mensal, anotações e vínculo posterior aos pedidos de compra. |
+| Logística | Reservas por saldo de pedido SAP, veículos, motoristas, rota multi-item, status, solicitação WebAgil, NF, agendamento, receitas, sequência de paradas e documentos `.eml`/Excel. |
+| Fechamentos | Distribuições comercialmente fechadas, calendarização mensal, preço médio hierárquico, forma de pagamento, anotações e vínculo posterior aos pedidos de compra. |
 | Usuários | Login, sessão, administração de contas e recorte de acesso para operadores por núcleo. |
 
 ## Arquitetura atual
@@ -125,6 +125,7 @@ plataforma/
 │   ├── auth.js                     # Login, sessão atual e logout
 │   ├── users.js                    # Administração de usuários
 │   ├── workspace.js                # Leitura/gravação do workspace central
+│   ├── resolve-map.js              # Resolve links Google Maps para rota utilizável
 │   └── send-alert.js               # Integração de alerta por e-mail quando configurada
 ├── components/
 │   └── dimension-upload.tsx        # Importação e edição de dimensões/premissas
@@ -280,6 +281,7 @@ O sistema privilegia ausência explícita de conciliação em vez de transformar
 - Execução por grupo e subgrupo, separando Safra e Safrinha.
 - Área planejada baseada no Planejamento filtrado por `Classificação = Atividade` e `Atividade = PLANTIO SEM ADUBO`, evitando duplicação de hectares.
 - DAE por núcleo, cultura e data de plantio, respeitando o ciclo configurado.
+- Aviso de rotas em status **Rota ativa**, com atalho direto para Logística.
 
 ### Calendarização e provisionamento
 
@@ -296,6 +298,7 @@ O sistema privilegia ausência explícita de conciliação em vez de transformar
 - Expansão progressiva: padrão → material em estoque → localização.
 - Identificação de saldo convertido e saldo físico do material quando há fator de conversão.
 - Armazém em linha própria com descrição de cidade/localização.
+- Coluna **A faturar** calculada pelo saldo do fornecedor (`Saldo Forn`) do pedido de compra vinculado, respeitando ciclo e destino da distribuição.
 
 ### Execução
 
@@ -343,6 +346,8 @@ Vincular NF, solicitação webAgil e receitas posteriormente
 
 Cada item da rota preserva seu pedido SAP, data solicitada, produto solicitado, produto físico, código, quantidade, origem e destino. O lote não é reservado durante o planejamento: ele é definido no carregamento físico. A viagem concentra a data operacional, motorista, veículo, status, notas fiscais e receitas.
 
+O ciclo configurado da plataforma também orienta a leitura de necessidade. Quando o material do pedido só está planejado em outro ciclo, a tela mantém o pedido disponível, mas mostra o aviso de divergência para que a expedição não seja interpretada com uma demanda incorreta.
+
 ### Regras de reserva, capacidade e valor
 
 | Regra | Comportamento operacional |
@@ -358,10 +363,15 @@ Cada item da rota preserva seu pedido SAP, data solicitada, produto solicitado, 
 ### Pós-emissão e rastreabilidade
 
 - Status de operação por viagem: **Em progresso** (fiscal/agendamento), **Rota ativa** (veículo em deslocamento) e **Concluído**.
-- Notas fiscais são vinculadas após a emissão e uma viagem pode registrar várias NFs.
-- A solicitação webAgil é vinculada apenas depois que a rota SAP existe. Uma mesma solicitação pode pertencer a somente uma viagem, evitando duplicidade de expedição.
-- A receita permite várias recomendações por viagem. Ao selecionar destino e produto, o volume lançado na carga é sugerido automaticamente, mas continua editável.
+- A solicitação webAgil é vinculada apenas depois que a rota SAP existe. Uma mesma solicitação pode pertencer a somente uma viagem, e o volume de cada linha é consumido na vinculação para impedir uso infinito de uma solicitação.
+- Notas fiscais são vinculadas após a emissão, no bloco fiscal de **destino + responsável (AG)**. A NF só é liberada após selecionar a linha/volume da solicitação WebAgil correspondente; blocos concluídos saem da fila de vínculo e podem ser alterados somente pela edição da viagem.
+- O e-mail externo é gerado como arquivo `.eml`, com seleção de todos ou somente dos blocos externos concluídos. O conteúdo só contempla blocos cujo AG difere de Boa Esperança Agropecuária.
+- O agendamento é único por viagem, recebe o número de sete dígitos informado pelo usuário e pode reunir várias solicitações.
+- O roteiro de grupo possui sequência ajustável de coleta e destinos; a mensagem operacional é reconstruída na mesma ordem escolhida.
+- A receita permite várias recomendações por viagem. O seletor único `Fazenda destino · Produto` consome o volume da carga e evita indicar material que não segue para aquela unidade. Cultura e alvo são registrados por recomendação; itens sem receita podem ser marcados e ficam fora do pedido ao agrônomo.
+- Ao concluir a etapa de receita, a plataforma prepara um `.eml` com tabela `Fazenda destino | Produto | Volume | Cultura | Alvo` e assunto `CARREGAMENTO <MOTORISTA> - <DATA>`.
 - O documento Excel é gerado com **uma linha por item da rota** e inclui data, status, pedido, origem, destino, motorista, placa, NF e dados de receita.
+- Operadores não criam ou editam viagens: veem somente viagens em **Rota ativa**, para qualquer unidade, com a tabela operacional `Fazenda destino | Produto | Volume` e sem valores financeiros.
 
 Viagens legadas de uma única solicitação continuam compatíveis com o modelo novo.
 
@@ -383,6 +393,8 @@ Pedido de compra é criado e vinculado posteriormente
 
 As distribuições históricas do arquivo **Resumo fechamentos 26-27** foram carregadas diretamente na base central, sem criar uma nova opção de importação. Cada distribuição conserva fornecedor, vencimento, destino, local de entrega, cultura, princípio ativo, produto, unidade, preço, embalagem, total e volumes mensais.
 
+No cadastro, destino e princípio ativo são oferecidos a partir das premissas vigentes. A forma de pagamento é obrigatória e aceita o detalhamento negociado — por exemplo, barter, caixa ou outra modalidade. Ao vincular um pedido de compra, a lista é filtrada pelo produto conciliado, reduzindo escolhas indevidas.
+
 Os vínculos a pedido permanecem propositalmente vazios até que o administrativo relacione a distribuição ao pedido de compra correspondente. A carga é idempotente: identificadores estáveis impedem duplicação em novas aberturas da aplicação.
 
 ### Perguntas respondidas
@@ -393,6 +405,22 @@ Os vínculos a pedido permanecem propositalmente vazios até que o administrativ
 - Em qual mês o volume está calendarizado?
 - Quanto foi fornecido pelo pedido vinculado e quanto ainda falta fechar?
 - Quais observações comerciais, fiscais ou de faturamento acompanham o fechamento?
+
+### Saldo comercial e preço médio
+
+A visão comercial não considera apenas o volume fechado. Para cada chave de planejamento (material, ciclo e destino), ela desconta o que já foi fechado, o estoque alocado e o aplicado, evitando tratar uma cobertura já disponível como necessidade de nova compra.
+
+O detalhamento usa a sequência abaixo, com preço médio ponderado por volume e moeda em cada nível:
+
+```text
+Grupo
+  └── Subgrupo
+        └── Princípio ativo / material planejado
+              └── Material fechado
+                    └── Fornecedor
+```
+
+Assim, a operação visualiza tanto o valor médio agregado da categoria quanto o preço efetivamente negociado por fornecedor e material.
 
 ## Segurança, perfis e persistência
 
@@ -408,7 +436,7 @@ Os vínculos a pedido permanecem propositalmente vazios até que o administrativ
 | Perfil | Acesso |
 | --- | --- |
 | Administrador | Importações, dimensões, configurações, usuários, logística, fechamentos, edição de premissas e gestão completa. |
-| Operador | Leitura restrita ao núcleo definido para visão geral, alertas, calendarização e execução; acompanhamento permanece disponível de forma ampliada. |
+| Operador | Leitura restrita ao núcleo definido para visão geral, alertas, calendarização e execução; acompanhamento permanece disponível de forma ampliada e Logística mostra apenas rotas ativas sem valores ou ações de edição. |
 
 O administrador pode criar, editar e excluir usuários. A aplicação impede remover o próprio usuário logado ou eliminar o último administrador.
 
@@ -504,6 +532,7 @@ vercel logs https://agronexus-360.vercel.app --level error --since 1h
 5. Rodar calendarização para a janela de interesse.
 6. Revisar alertas, tarefas e apoio de armazém/outros núcleos.
 7. Registrar ações e compartilhar os documentos necessários com a operação.
+8. Na Logística, emitir a rota, vincular solicitações WebAgil e NFs por bloco fiscal, informar o agendamento, revisar o grupo de rota e gerar a solicitação de receitas.
 
 ## Roadmap técnico
 
