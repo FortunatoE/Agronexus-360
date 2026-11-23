@@ -198,7 +198,7 @@ function mimeSubject(subject: string) {
   return words.join("\r\n ");
 }
 
-export function buildOutlookEml(email: ReturnType<typeof buildTaskNotification>, to: string[], cc: string[]) {
+export function buildOutlookEml(email: Pick<ReturnType<typeof buildTaskNotification>, "subject" | "html" | "text">, to: string[], cc: string[]) {
   const boundary = "agronexus-task-notification";
   const lines = [
     "X-Unsent: 1",

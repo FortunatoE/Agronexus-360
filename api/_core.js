@@ -3,6 +3,7 @@ import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from "node:util";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "../lib/pending-order-fields.mjs";
+import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapUnitHeaders } from "../lib/sap-logistics-fields.mjs";
 
 const scrypt = promisify(scryptCallback);
 let schemaReady;
@@ -167,7 +168,7 @@ const compactSources = {
   consumo: { product: ["Texto material", "Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Qtd.retirada", "Qtd retirada", "Quantidade", "Saldo ajustado"] },
   estoque: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"] },
   estoqueMb52: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"] },
-  transito: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: ["Quantidade", "Qtd.pedido", "Qtd pedido", "Saldo ajustado"] },
+  transito: { product: ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"], quantity: sapTransitQuantityHeaders },
   pedidos: { product: ["Descrição Material", "Descricao Material", "Produto solicitado", "Material solicitado", "Texto material", "Texto breve material"], quantity: pendingOrderQuantityAliases },
 };
 
@@ -213,7 +214,15 @@ function compactRow(row, source) {
   assign("ad", "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data"); assign("rd", "DtRemPed", "Dt. Rem. Ped", "Data remessa", "Previsão de utilização", "Previsao de utilizacao");
   assign("or", "Pedido", "Nº pedido", "No pedido", "Documento", "Doc. compra", "Solicitação", "Solicitacao"); assign("ex", "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade");
   assign("va", "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque"); assign("el", "Eliminado?", "Eliminado", "Cancelado");
+  if (["estoque", "estoqueMb52", "transito", "pedidos"].includes(source)) assign("um", ...sapUnitHeaders);
+  if (source === "estoque" || source === "estoqueMb52") assign("lot", ...sapLotHeaders);
+  if (source === "transito") {
+    assign("or", ...sapOrderHeaders);
+    assign("oi", ...sapItemHeaders);
+    assign("tc", ...sapTransitDestinationHeaders);
+  }
   if (source === "pedidos") {
+    assign("or", ...sapOrderHeaders);
     for (const { key, aliases } of Object.values(pendingOrderDetailFields)) assign(key, ...aliases);
   }
   return compact;

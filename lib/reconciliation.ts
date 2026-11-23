@@ -1,5 +1,6 @@
 import { normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
 import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "./pending-order-fields.mjs";
+import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapUnitHeaders } from "./sap-logistics-fields.mjs";
 
 export type OperationalRow = Record<string, unknown>;
 export type ProductSource = "planning" | "stock" | "transit" | "consumption" | "pending";
@@ -76,7 +77,7 @@ const productFields: Record<ProductSource, string[]> = {
 const quantityFields: Record<ProductSource, string[]> = {
   planning: ["Qtde. talhão", "Qtde talhão", "Volume ajustado (produto) padrão", "Quantidade"],
   stock: ["Util.livre", "Utilização livre", "Utiliza��o livre", "Utilizacao livre", "Saldo ajustado", "Estoque"],
-  transit: ["Quantidade", "Qtd.pedido", "Qtd pedido", "Saldo ajustado"],
+  transit: sapTransitQuantityHeaders,
   consumption: ["Qtd.retirada", "Qtd retirada", "Quantidade", "Saldo ajustado"],
   pending: pendingOrderQuantityAliases,
 };
@@ -143,7 +144,17 @@ export function compactOperationalRow(row: OperationalRow, source: CompactSource
   assign("ex", "Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade");
   assign("va", "Valor total", "Valor Total", "Valor", "Val. total", "Valor estoque");
   assign("el", "Eliminado?", "Eliminado", "Cancelado");
+  if (source === "stock" || source === "transit" || source === "pending") {
+    assign("um", ...sapUnitHeaders);
+  }
+  if (source === "stock") assign("lot", ...sapLotHeaders);
+  if (source === "transit") {
+    assign("or", ...sapOrderHeaders);
+    assign("oi", ...sapItemHeaders);
+    assign("tc", ...sapTransitDestinationHeaders);
+  }
   if (source === "pending") {
+    assign("or", ...sapOrderHeaders);
     for (const { key, aliases } of Object.values(pendingOrderDetailFields)) assign(key, ...aliases);
   }
   return compact;
@@ -167,6 +178,11 @@ export function headerKey(value: unknown) {
 }
 
 const compactAliasMap: Record<string, string> = {
+  ...Object.fromEntries(sapOrderHeaders.map((alias) => [headerKey(alias), "or"])),
+  ...Object.fromEntries(sapUnitHeaders.map((alias) => [headerKey(alias), "um"])),
+  ...Object.fromEntries(sapLotHeaders.map((alias) => [headerKey(alias), "lot"])),
+  ...Object.fromEntries(sapTransitQuantityHeaders.map((alias) => [headerKey(alias), "q"])),
+  ...Object.fromEntries(sapTransitDestinationHeaders.map((alias) => [headerKey(alias), "tc"])),
   STATUS: "s", SITUACAO: "s", CLASSIFICACAO: "cl", TIPO: "cl",
   PRODUTO: "p", MATERIALPLANEJADO: "p", PRODUTOPLANEJADO: "p", TEXTOMATERIAL: "p", DESCRICAOMATERIAL: "p", TEXTOBREVEMATERIAL: "p", INSUMO: "p", PRODUTOSOLICITADO: "p", MATERIALSOLICITADO: "p",
   QTDETALHAO: "q", QUANTIDADE: "q", UTILLIVRE: "q", UTILIZACAOLIVRE: "q", SALDOAJUSTADO: "q", ESTOQUE: "q", QTDRETIRADA: "q", SALDOFORN: "q", SALDOFORNECEDOR: "q", QTDPEDIDO: "q", VOLUMESOLICITADO: "q",
