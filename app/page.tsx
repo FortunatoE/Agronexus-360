@@ -12,8 +12,10 @@ import {
 } from "react";
 import {
   buildCommercialClosingOverview,
+  commercialPlanningKey,
   matchesCommercialClosing,
   resolveCommercialClosings,
+  type CommercialPlanningCoverage,
 } from "@/lib/commercial-closings";
 import {
   buildNotificationMailto,
@@ -31,6 +33,10 @@ import {
   CommercialClosingCalendar,
   type ClosingCalendarPeriod,
 } from "@/components/commercial-closing-calendar";
+import {
+  CommercialDeliveryTracker,
+  type CommercialDeliveryTrackingRow,
+} from "@/components/commercial-delivery-tracker";
 import { DimensionUpload } from "@/components/dimension-upload";
 import {
   emptyDimensionBundle,
@@ -367,6 +373,8 @@ type CommercialClosing = {
   distribution: ClosingDistribution;
   orderKey: string;
   orderNumber: string;
+  orderItem?: string;
+  invoicedVolume?: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -2518,7 +2526,7 @@ export default function Home() {
   const [commercialClosings, setCommercialClosings] =
     useState<CommercialClosingsState>(initialCommercialClosings);
   const [closingTab, setClosingTab] = useState<
-    "calendario" | "painel" | "distribuicoes" | "anotacoes"
+    "calendario" | "painel" | "entregas" | "distribuicoes" | "anotacoes"
   >("calendario");
   const [closingDraft, setClosingDraft] = useState({
     supplier: "",
@@ -3208,6 +3216,24 @@ export default function Home() {
             "Produto",
           );
           const dimension = dimensions.materials[normalizeMaterial(product)];
+          const ordered = readNumber(
+            row,
+            "Qtd.pedido",
+            "Qtd pedido",
+            "Quantidade pedido",
+          );
+          const supplied = readNumber(
+            row,
+            "Qtde. Forn",
+            "Qtde. Fornecida",
+            "Quantidade fornecida",
+          );
+          const balanceText = readText(
+            row,
+            "Saldo Forn",
+            "Saldo fornecer",
+            "Saldo fornecedor",
+          );
           return {
             key: `${orderNumber}|${item}|${normalizeMaterial(product)}`,
             orderNumber,
@@ -3228,24 +3254,18 @@ export default function Home() {
               "Preço líq.",
               "Preco liq.",
             ),
-            ordered: readNumber(
-              row,
-              "Qtd.pedido",
-              "Qtd pedido",
-              "Quantidade pedido",
-            ),
-            supplied: readNumber(
-              row,
-              "Qtde. Forn",
-              "Qtde. Fornecida",
-              "Quantidade fornecida",
-            ),
-            balance: readNumber(
-              row,
-              "Saldo Forn",
-              "Saldo fornecer",
-              "Saldo fornecedor",
-            ),
+            ordered,
+            supplied,
+            // Quando a coluna Saldo Forn não existir, o saldo aberto ainda
+            // pode ser reconciliado pelo pedido menos o já fornecido.
+            balance: balanceText
+              ? readNumber(
+                  row,
+                  "Saldo Forn",
+                  "Saldo fornecer",
+                  "Saldo fornecedor",
+                )
+              : Math.max(0, ordered - supplied),
             center: readText(row, "Centro"),
             status: readText(
               row,
@@ -3289,7 +3309,7 @@ export default function Home() {
       const product = productFor(row, "planning", dimensions);
       const cycle = cycleFor(row, dimensions);
       const culture = cultureFor(row);
-      const key = `${product.canonicalKey}|${cycle}`;
+      const key = commercialPlanningKey(product.canonicalKey, cycle, culture);
       const current = values.get(key) || {
         active: product.active,
         cycle,
@@ -3327,31 +3347,48 @@ export default function Home() {
       dimensions,
     );
     return planningDistribution.get(
-      `${product.canonicalKey}|${closingDraft.cycle}`,
+      commercialPlanningKey(
+        product.canonicalKey,
+        closingDraft.cycle,
+        closingDraft.culture,
+      ),
     );
   }, [
     closingDraft.cycle,
+    closingDraft.culture,
     closingDraft.product,
     dimensions,
     planningDistribution,
   ]);
   const commercialCoverageByPlanningKey = useMemo(() => {
-    const cyclesByMaterial = new Map<string, Set<string>>();
+    const planningKeysByMaterial = new Map<string, string[]>();
     planningDistribution.forEach((schedule, key) => {
-      const separator = key.lastIndexOf("|");
-      const material = separator >= 0 ? key.slice(0, separator) : key;
-      const cycles = cyclesByMaterial.get(material) || new Set<string>();
-      cycles.add(schedule.cycle);
-      cyclesByMaterial.set(material, cycles);
+      const material = key.split("|", 1)[0];
+      const keys = planningKeysByMaterial.get(material) || [];
+      keys.push(key);
+      planningKeysByMaterial.set(material, keys);
     });
-    const covered = new Map<string, number>();
+    const coverage = new Map<string, CommercialPlanningCoverage>();
+    const addCoverage = (
+      key: string,
+      field: keyof CommercialPlanningCoverage,
+      amount: number,
+    ) => {
+      if (!amount) return;
+      const current = coverage.get(key) || { applied: 0, stock: 0 };
+      coverage.set(key, { ...current, [field]: current[field] + amount });
+    };
     datasets.consumo.forEach((row) => {
       const product = productFor(row, "consumption", dimensions);
-      const key = `${product.canonicalKey}|${cycleFor(row, dimensions)}`;
-      covered.set(
+      const key = commercialPlanningKey(
+        product.canonicalKey,
+        cycleFor(row, dimensions),
+        cultureFor(row),
+      );
+      addCoverage(
         key,
-        (covered.get(key) || 0) +
-          standardQuantity(row, "consumption", product, dimensions),
+        "applied",
+        standardQuantity(row, "consumption", product, dimensions),
       );
     });
     const stockByMaterial = new Map<string, number>();
@@ -3364,23 +3401,22 @@ export default function Home() {
       );
     });
     stockByMaterial.forEach((amount, material) => {
-      const cycles = [...(cyclesByMaterial.get(material) || [])];
-      const totalPlanned = cycles.reduce(
-        (total, cycle) =>
-          total + (planningDistribution.get(`${material}|${cycle}`)?.planned || 0),
+      const planningKeys = planningKeysByMaterial.get(material) || [];
+      const totalPlanned = planningKeys.reduce(
+        (total, key) => total + (planningDistribution.get(key)?.planned || 0),
         0,
       );
       if (!totalPlanned) return;
-      cycles.forEach((cycle) => {
-        const planned = planningDistribution.get(`${material}|${cycle}`)?.planned || 0;
-        const key = `${material}|${cycle}`;
-        covered.set(
+      planningKeys.forEach((key) => {
+        const planned = planningDistribution.get(key)?.planned || 0;
+        addCoverage(
           key,
-          (covered.get(key) || 0) + (amount * planned) / totalPlanned,
+          "stock",
+          (amount * planned) / totalPlanned,
         );
       });
     });
-    return covered;
+    return coverage;
   }, [datasets.consumo, dimensions, planningDistribution, stockRows]);
   const registeredClosingMonths = useMemo(() => {
     const months = new Set<string>();
@@ -3451,21 +3487,72 @@ export default function Home() {
       resolvedCommercialClosings,
     ],
   );
-  const commercialToInvoiceByMonitoringKey = useMemo(() => {
+  const commercialOrderForClosing = useMemo(() => {
     const ordersByKey = new Map(commercialOrders.map((order) => [order.key, order]));
+    const ordersByNumber = new Map<string, typeof commercialOrders>();
+    const orderNumberKey = (value: unknown) =>
+      String(value ?? "").replace(/[^0-9]/g, "");
+    commercialOrders.forEach((order) => {
+      const key = orderNumberKey(order.orderNumber);
+      if (!key) return;
+      const current = ordersByNumber.get(key) || [];
+      current.push(order);
+      ordersByNumber.set(key, current);
+    });
+    const orderForClosing = (
+      entry: (typeof resolvedCommercialClosings)[number],
+    ) => {
+      const direct = ordersByKey.get(entry.closing.orderKey);
+      if (direct) return direct;
+      const candidates =
+        ordersByNumber.get(orderNumberKey(entry.closing.orderNumber)) || [];
+      // O item de um pedido pode mudar depois da distribuição comercial.
+      // Por isso, o material é a chave determinante dentro do documento; o
+      // item só desempata quando há mais de uma linha do mesmo material.
+      const productCandidates = candidates.filter((order) => {
+        const orderProducts = [order.product, order.standardProduct].map(
+          normalizeMaterial,
+        );
+        return [
+          entry.closing.product,
+          entry.physicalProduct,
+          entry.standardProduct,
+        ].some((product) => orderProducts.includes(normalizeMaterial(product)));
+      });
+      if (productCandidates.length === 1) return productCandidates[0];
+      if (!entry.closing.orderItem) return undefined;
+      return productCandidates.find(
+        (order) =>
+          normalizeMaterial(order.item) ===
+          normalizeMaterial(entry.closing.orderItem),
+      );
+    };
+    return orderForClosing;
+  }, [commercialOrders]);
+  const commercialToInvoiceByMonitoringKey = useMemo(() => {
+    const orderForClosing = commercialOrderForClosing;
     const linkedVolumeByOrder = new Map<string, number>();
     resolvedCommercialClosings.forEach((entry) => {
-      if (!entry.closing.orderKey) return;
+      const order = orderForClosing(entry);
+      if (!order) return;
       linkedVolumeByOrder.set(
-        entry.closing.orderKey,
-        (linkedVolumeByOrder.get(entry.closing.orderKey) || 0) +
+        order.key,
+        (linkedVolumeByOrder.get(order.key) || 0) +
           entry.closing.totalVolume,
       );
     });
     const values = new Map<string, number>();
     resolvedCommercialClosings.forEach((entry) => {
-      const order = ordersByKey.get(entry.closing.orderKey);
-      if (!order || !entry.plannedKey || order.balance <= 0) return;
+      const order = orderForClosing(entry);
+      const remainingToInvoice = order
+        ? order.balance
+        : typeof entry.closing.invoicedVolume === "number"
+          ? Math.max(
+              0,
+              entry.closing.totalVolume - entry.closing.invoicedVolume,
+            )
+          : 0;
+      if (!entry.plannedKey || remainingToInvoice <= 0) return;
       const destinationKey = normalizeMaterial(entry.closing.destination);
       const nucleus =
         destinationKey === "0714"
@@ -3474,15 +3561,95 @@ export default function Home() {
             farmToNucleus[destinationKey] ||
             entry.closing.destination;
       if (!nucleus) return;
-      const totalLinked = linkedVolumeByOrder.get(entry.closing.orderKey) || 0;
-      const share = totalLinked
-        ? (order.balance * entry.closing.totalVolume) / totalLinked
-        : order.balance;
+      const totalLinked = order
+        ? linkedVolumeByOrder.get(order.key) || 0
+        : 0;
+      // Saldo Forn é físico/comercial. Não aplicar conversão de dose: a
+      // coluna A faturar deve espelhar o volume pendente no pedido de compra.
+      const share = order && totalLinked
+        ? (remainingToInvoice * entry.closing.totalVolume) /
+          totalLinked
+        : remainingToInvoice;
       const key = `${entry.plannedKey}|${normalizeMaterial(nucleus)}`;
       values.set(key, (values.get(key) || 0) + share);
     });
     return values;
-  }, [commercialOrders, dimensions.centerToNucleus, farmToNucleus, resolvedCommercialClosings]);
+  }, [commercialOrderForClosing, dimensions.centerToNucleus, farmToNucleus, resolvedCommercialClosings]);
+  const commercialDeliveryTracking = useMemo(() => {
+    const now = new Date();
+    const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const entries = filteredCommercialClosings.map((entry) => ({
+      entry,
+      order: commercialOrderForClosing(entry),
+    }));
+    const closingVolumeByOrder = new Map<string, number>();
+    entries.forEach(({ entry, order }) => {
+      if (!order) return;
+      closingVolumeByOrder.set(
+        order.key,
+        (closingVolumeByOrder.get(order.key) || 0) + entry.closing.totalVolume,
+      );
+    });
+    const rows: CommercialDeliveryTrackingRow[] = entries.map(({ entry, order }) => {
+      const { closing } = entry;
+      const linkedVolume = order
+        ? closingVolumeByOrder.get(order.key) || 0
+        : 0;
+      const pending = order
+        ? Math.min(
+            closing.totalVolume,
+            Math.max(0, order.balance) *
+              (linkedVolume > 0 ? closing.totalVolume / linkedVolume : 1),
+          )
+        : null;
+      const received = pending === null
+        ? null
+        : Math.max(0, closing.totalVolume - pending);
+      const scheduledMonths = Object.entries(closing.distribution || {})
+        .filter(([, volume]) => Number(volume) > 0)
+        .sort(([left], [right]) => left.localeCompare(right));
+      const expectedToDate = scheduledMonths.reduce(
+        (total, [month, volume]) =>
+          month <= currentMonth ? total + Number(volume) : total,
+        0,
+      );
+      const calendarGap = received === null
+        ? null
+        : Math.max(0, expectedToDate - received);
+      const status: CommercialDeliveryTrackingRow["status"] = !order
+        ? "Sem pedido"
+        : pending <= 0.0001
+          ? "Entregue"
+          : expectedToDate <= 0.0001
+            ? "Previsto"
+            : calendarGap <= 0.0001
+              ? "No prazo"
+              : "Atrasado";
+      return {
+        active: entry.active,
+        calendarGap,
+        closed: closing.totalVolume,
+        cycle: closing.cycle,
+        expectedToDate,
+        group: entry.merchandiseGroup,
+        id: closing.id,
+        nextScheduledMonth:
+          scheduledMonths.find(([month]) => month >= currentMonth)?.[0] ||
+          scheduledMonths.at(-1)?.[0] ||
+          "",
+        orderNumber: order?.orderNumber || closing.orderNumber,
+        pending,
+        physicalProduct: entry.physicalProduct,
+        product: entry.standardProduct,
+        received,
+        status,
+        subgroup: entry.subgroup,
+        supplier: closing.supplier,
+        unit: closing.unit?.trim().toUpperCase() || "",
+      };
+    });
+    return { currentMonth, rows };
+  }, [commercialOrderForClosing, filteredCommercialClosings]);
 
   const materialResolution = useMemo(() => {
     const input: Array<[Row[], "stock" | "transit" | "consumption"]> = [
@@ -3961,51 +4128,83 @@ export default function Home() {
       context.set(row.canonicalKey, current);
     });
     const values = new Map<string, MonitoringRow>();
+    const ensureWarehouseRow = (
+      row: ReconciliationRow,
+      cycles: string[],
+      cultures: string[],
+    ) => {
+      const id = row.canonicalKey + "|ARMAZEM";
+      const current = values.get(id) || {
+        active: row.active,
+        applied: 0,
+        available: 0,
+        canonicalKey: row.canonicalKey,
+        codes: [],
+        cultures: [...cultures].sort(),
+        cycles: [...cycles].sort(),
+        farmBalance: 0,
+        id,
+        isWarehouseView: true,
+        locations: [],
+        merchandiseGroup: row.merchandiseGroup,
+        nucleus: "ARMAZÉM",
+        pendingOrder: 0,
+        planned: 0,
+        plannedMaterials: [],
+        shortage: 0,
+        standardMaterial: row.standardMaterial,
+        stockMaterials: [],
+        subgroup: row.subgroup,
+        transit: 0,
+        warehouseBalance: 0,
+      };
+      cycles.forEach((cycle) => {
+        if (!current.cycles.includes(cycle)) current.cycles.push(cycle);
+      });
+      cultures.forEach((culture) => {
+        if (!current.cultures.includes(culture)) current.cultures.push(culture);
+      });
+      current.cycles.sort();
+      current.cultures.sort();
+      values.set(id, current);
+      return current;
+    };
     monitoringLedger.forEach((row) =>
       row.locations
         .filter(
           (location) => location.type === "Armazém" && location.amount !== 0,
         )
         .forEach((location) => {
-          const id = row.canonicalKey + "|ARMAZEM";
           const sourceContext = context.get(row.canonicalKey);
-          const current = values.get(id) || {
-            active: row.active,
-            applied: 0,
-            available: 0,
-            canonicalKey: row.canonicalKey,
-            codes: [],
-            cultures: [...(sourceContext?.cultures || [])].sort(),
-            cycles: [...(sourceContext?.cycles || [])].sort(),
-            farmBalance: 0,
-            id,
-            isWarehouseView: true,
-            locations: [],
-            merchandiseGroup: row.merchandiseGroup,
-            nucleus: "ARMAZÉM",
-            pendingOrder: 0,
-            planned: 0,
-            plannedMaterials: [],
-            shortage: 0,
-            standardMaterial: row.standardMaterial,
-            stockMaterials: [],
-            subgroup: row.subgroup,
-            transit: 0,
-            warehouseBalance: 0,
-          };
+          const current = ensureWarehouseRow(
+            row,
+            [...(sourceContext?.cycles || [])],
+            [...(sourceContext?.cultures || [])],
+          );
           current.warehouseBalance += location.amount;
           current.locations.push({ ...location });
           if (!current.stockMaterials.includes(location.material))
             current.stockMaterials.push(location.material);
-          values.set(id, current);
         }),
+    );
+    // O saldo a faturar pertence ao centro/armazém e precisa continuar
+    // visível antes da chegada física do material.
+    monitoringLedger.forEach((row) =>
+      row.cycles.forEach((cycle) =>
+        row.cultures.forEach((culture) => {
+          const toInvoice = commercialToInvoiceByMonitoringKey.get(
+            `${row.canonicalKey}|${normalizeMaterial(cycle)}|${normalizeMaterial(culture)}|ARMAZEM`,
+          ) || 0;
+          if (toInvoice > 0) ensureWarehouseRow(row, [cycle], [culture]);
+        }),
+      ),
     );
     return [...values.values()].map((row) => ({
       ...row,
       available: row.warehouseBalance,
       stockMaterials: row.stockMaterials.sort(),
     }));
-  }, [monitoringLedger]);
+  }, [commercialToInvoiceByMonitoringKey, monitoringLedger]);
 
   const monitoringNuclei = useMemo(
     () => [
@@ -4095,12 +4294,23 @@ export default function Home() {
         : row.cycles.includes(cycleFilter)
           ? [cycleFilter]
           : [];
+    const cultures =
+      cultureFilter === "Todos"
+        ? row.cultures
+        : row.cultures.includes(cultureFilter)
+          ? [cultureFilter]
+          : [];
     return cycles.reduce(
       (total, cycle) =>
         total +
-        (commercialToInvoiceByMonitoringKey.get(
-          `${row.canonicalKey}|${cycle}|${normalizeMaterial(row.nucleus)}`,
-        ) || 0),
+        cultures.reduce(
+          (byCulture, culture) =>
+            byCulture +
+            (commercialToInvoiceByMonitoringKey.get(
+              `${row.canonicalKey}|${normalizeMaterial(cycle)}|${normalizeMaterial(culture)}|${normalizeMaterial(row.nucleus)}`,
+            ) || 0),
+          0,
+        ),
       0,
     );
   };
@@ -10133,6 +10343,7 @@ export default function Home() {
               [
                 ["calendario", "Calendário"],
                 ["painel", "Visão comercial"],
+                ["entregas", "Entregas"],
                 ["distribuicoes", "Distribuições"],
                 ["anotacoes", "Anotações"],
               ] as const
@@ -10286,6 +10497,12 @@ export default function Home() {
               />
             </section>
           ) : null}
+          {closingTab === "entregas" ? (
+            <CommercialDeliveryTracker
+              currentMonth={commercialDeliveryTracking.currentMonth}
+              rows={commercialDeliveryTracking.rows}
+            />
+          ) : null}
           {closingTab === "distribuicoes" ? (
             <section className="space-y-5">
               <section className="rounded-2xl border border-slate-200 bg-white p-5">
@@ -10341,7 +10558,7 @@ export default function Home() {
                     />
                   </label>
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                    Forma de pagamento <span className="text-rose-700">*</span>
+                    Origem do recurso <span className="text-rose-700">*</span>
                     <input
                       className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
                       onChange={(event) =>
@@ -10350,12 +10567,12 @@ export default function Home() {
                           paymentMethod: event.target.value,
                         }))
                       }
-                      placeholder="Ex.: Barter, via caixa ou à vista"
+                      placeholder="Ex.: Caixa, barter ou bonificação"
                       value={closingDraft.paymentMethod}
                     />
                   </label>
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                    Destino
+                    Centro / filial
                     <input
                       className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
                       list="commercial-destinations"
@@ -10642,8 +10859,8 @@ export default function Home() {
                             "Ativo / produto",
                             "Ciclo",
                             "Preço",
-                            "Pagamento",
-                            "Entrega",
+                            "Recurso / vencimento",
+                            "Centro / entrega",
                             "Programado",
                             "Pedido",
                             "Fornecido",

@@ -15,7 +15,7 @@ function seedLegacyCommercialClosings(payload) {
   const workspace = decodePayload(payload);
   if (!workspace || typeof workspace !== "object") return { changed: false, payload };
   const existing = Array.isArray(workspace.commercialClosings?.closings) ? workspace.commercialClosings.closings : [];
-  if (existing.some((closing) => String(closing?.id || "").startsWith("legado-fechamento-26-27-"))) return { changed: false, payload };
+  if (existing.some((closing) => String(closing?.id || "").startsWith("legado-fechamento-26-27-") || closing?.sourceType === "compras-26-27")) return { changed: false, payload };
   return {
     changed: true,
     payload: encodedPayload({

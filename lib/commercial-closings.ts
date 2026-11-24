@@ -4,6 +4,7 @@ import { productFor, registeredConversionFactor } from "@/lib/reconciliation";
 type ClosingRecord = {
   active: string;
   cycle: string;
+  culture: string;
   destination: string;
   orderKey: string;
   orderNumber: string;
@@ -16,7 +17,32 @@ type ClosingRecord = {
 };
 
 type LinkedOrder = { product: string; standardProduct: string; unit: string };
-type PlannedClosingProduct = { active: string; cycle: string; merchandiseGroup: string; planned: number; product: string; subgroup: string };
+export type PlannedClosingProduct = {
+  active: string;
+  cycle: string;
+  culture: string;
+  merchandiseGroup: string;
+  planned: number;
+  product: string;
+  subgroup: string;
+};
+
+export type CommercialPlanningCoverage = {
+  applied: number;
+  stock: number;
+};
+
+export function commercialPlanningKey(
+  material: string,
+  cycle: string,
+  culture: string,
+) {
+  return [
+    normalizeMaterial(material),
+    normalizeMaterial(cycle) || "SEM_CICLO",
+    normalizeMaterial(culture) || "SEM_CULTURA",
+  ].join("|");
+}
 
 type ResolvedClosing<T extends ClosingRecord> = {
   closing: T;
@@ -52,8 +78,10 @@ export type CommercialClosingProduct = {
   key: string;
   product: string;
   cycle: string;
+  culture: string;
   planned: number | null;
-  covered: number;
+  applied: number;
+  stockCoverage: number;
   closed: number;
   remaining: number | null;
   details: ClosedProduct[];
@@ -144,12 +172,20 @@ export function resolveCommercialClosings<T extends ClosingRecord>(
       && normalizeMaterial(closing.unit) === normalizeMaterial(order.unit);
     const physicalProduct = usesLinkedOrderMaterial ? order.product : closing.product;
     let product = productFor({ Produto: physicalProduct }, "planning", dimensions);
-    let key = `${product.canonicalKey}|${closing.cycle}`;
+    let key = commercialPlanningKey(
+      product.canonicalKey,
+      closing.cycle,
+      closing.culture,
+    );
     let schedule = planning.get(key);
 
     if (!schedule) {
       const targets = targetsByPhysicalProduct.get(normalizeMaterial(physicalProduct));
-      const candidates = [...(targets ?? [])].map((target) => `${target}|${closing.cycle}`).filter((candidate) => planning.has(candidate));
+      const candidates = [...(targets ?? [])]
+        .map((target) =>
+          commercialPlanningKey(target, closing.cycle, closing.culture),
+        )
+        .filter((candidate) => planning.has(candidate));
       if (candidates.length === 1) {
         key = candidates[0];
         schedule = planning.get(key);
@@ -184,12 +220,13 @@ export function buildCommercialClosingOverview<T extends ClosingRecord>(
   closings: ResolvedClosing<T>[],
   cycle: string,
   normalizedQuery: string,
-  coveredByPlanningKey: ReadonlyMap<string, number> = new Map(),
+  coverageByPlanningKey: ReadonlyMap<string, CommercialPlanningCoverage> = new Map(),
 ) {
   const inCycle = (value: string) => cycle === "Todos" || value === cycle;
   type Balance = {
     active: string;
     cycle: string;
+    culture: string;
     entries: ResolvedClosing<T>[];
     merchandiseGroup: string;
     planned: number | null;
@@ -213,11 +250,17 @@ export function buildCommercialClosingOverview<T extends ClosingRecord>(
   }
   for (const entry of closings) {
     if (!inCycle(entry.closing.cycle)) continue;
-    const key = entry.plannedKey ?? `sem-planejamento|${normalizeMaterial(entry.active)}|${entry.closing.cycle}`;
+    const key = entry.plannedKey ?? [
+      "sem-planejamento",
+      normalizeMaterial(entry.active),
+      normalizeMaterial(entry.closing.cycle),
+      normalizeMaterial(entry.closing.culture),
+    ].join("|");
     const balance = balances.get(key) ?? {
       active: entry.active,
       product: "Sem vínculo com o planejamento",
       cycle: entry.closing.cycle,
+      culture: entry.closing.culture,
       merchandiseGroup: entry.merchandiseGroup,
       planned: null,
       subgroup: entry.subgroup,
@@ -301,14 +344,21 @@ export function buildCommercialClosingOverview<T extends ClosingRecord>(
       active,
       products: [],
     };
+    const coverage = balance.planned === null
+      ? { applied: 0, stock: 0 }
+      : coverageByPlanningKey.get(key) || { applied: 0, stock: 0 };
     const product = {
       key,
       product: balance.product,
       cycle: balance.cycle,
+      culture: balance.culture,
       planned: balance.planned,
-      covered: balance.planned === null ? 0 : coveredByPlanningKey.get(key) || 0,
+      applied: coverage.applied,
+      stockCoverage: coverage.stock,
       closed,
-      remaining: balance.planned === null ? null : Math.max(0, balance.planned - closed - (coveredByPlanningKey.get(key) || 0)),
+      remaining: balance.planned === null
+        ? null
+        : Math.max(0, balance.planned - closed - coverage.applied - coverage.stock),
       details: resolvedDetails,
       averagePrices: averagePrices(pricingEntries),
     };
