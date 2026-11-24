@@ -1,6 +1,7 @@
 import { normalizeMaterial } from "@/lib/material-dimension";
+import { logisticsUnit, sapIdentifier } from "@/lib/logistics-sap";
 import { headerKey, quantityFor, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
-import { sapOrderHeaders, sapTransitDestinationHeaders, sapTransitSupplierHeaders } from "@/lib/sap-logistics-fields.mjs";
+import { sapOrderHeaders, sapTransitDestinationHeaders, sapTransitSupplierHeaders, sapUnitHeaders } from "@/lib/sap-logistics-fields.mjs";
 
 type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow; dueDate: Date | null };
 type OrderMaterial = { code: string; material: string };
@@ -17,17 +18,20 @@ type OrderEmailRow = {
   remaining: number | null;
   recordedQuantity: number | null;
 };
+type TransitNotificationRow = {
+  center: string;
+  reference: string;
+  supplierCenter: string;
+  material: string;
+  quantity: number;
+  unit: string;
+};
 
 const headers = ["DATA PED", "PEDIDO", "ITEM PED", "INSUMO", "QTD PEDIDO", "QTD ENTREGUE", "FALTA ENTREGAR"];
 const dateFormat = new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" });
 const volumeFormat = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 4 });
 const missingValue = "—";
 const encoder = new TextEncoder();
-
-function sapIdentifier(value: string) {
-  const key = normalizeMaterial(value);
-  return /^\d+$/.test(key) ? key.replace(/^0+(?=\d)/, "") : key;
-}
 
 function orderMaterialCode(row: OperationalRow) {
   return sapIdentifier(readText(row, "Código material", "Código do material", "MAT", "Material"));
@@ -168,31 +172,51 @@ export function buildTaskNotification(nucleus: string, minimumDays: number, rows
 }
 
 export function listTransitNotificationOrders(rows: OperationalRow[]) {
-  const orders = new Map<string, { center: string; reference: string; supplierCenter: string }>();
+  const orders = new Map<string, TransitNotificationRow>();
   for (const row of rows) {
-    if (quantityFor(row, "transit") <= 0 || ["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Cancelado")))) continue;
+    const quantity = quantityFor(row, "transit");
+    if (quantity <= 0 || ["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Cancelado")))) continue;
     const center = readText(row, ...sapTransitDestinationHeaders, "Cen.", "Centro");
     const reference = readText(row, ...sapOrderHeaders, "Documento");
     if (!center || !reference) continue;
     const supplierCenter = readText(row, ...sapTransitSupplierHeaders);
-    const key = [headerKey(center), sapIdentifier(reference), headerKey(supplierCenter)].join("|");
-    orders.set(key, { center, reference, supplierCenter });
+    const material = readText(row, "Texto breve material", "Descrição material", "Insumo", "Produto");
+    const code = sapIdentifier(readText(row, "Material", "Código material", "MAT"));
+    const unit = readText(row, ...sapUnitHeaders);
+    const materialKey = code ? `codigo:${code}` : `descricao:${headerKey(material)}`;
+    const key = [headerKey(center), sapIdentifier(reference), headerKey(supplierCenter), materialKey, logisticsUnit(unit)].join("|");
+    const existing = orders.get(key);
+    if (existing) {
+      existing.quantity += quantity;
+      existing.material ||= material;
+    } else {
+      orders.set(key, { center, reference, supplierCenter, material, quantity, unit });
+    }
   }
   return [...orders.values()].sort((left, right) =>
     left.center.localeCompare(right.center, "pt-BR", { numeric: true }) ||
     left.reference.localeCompare(right.reference, "pt-BR", { numeric: true }) ||
-    left.supplierCenter.localeCompare(right.supplierCenter, "pt-BR", { numeric: true }),
+    left.supplierCenter.localeCompare(right.supplierCenter, "pt-BR", { numeric: true }) ||
+    left.material.localeCompare(right.material, "pt-BR") ||
+    left.unit.localeCompare(right.unit, "pt-BR"),
   );
 }
 
-export const transitNotificationHeaders = ["Centro", "Pedido", "Centro fornecedor"];
+export const transitNotificationHeaders = ["Centro destino", "Pedido", "Centro fornecedor", "Material", "Quantidade"];
 
-export function buildTransitNotification(center: string, rows: ReturnType<typeof listTransitNotificationOrders>) {
+export function formatTransitNotificationCells(row: TransitNotificationRow) {
+  return [
+    row.center, row.reference, row.supplierCenter || missingValue, row.material || missingValue,
+    row.unit ? `${volumeFormat.format(row.quantity)} ${row.unit}` : volumeFormat.format(row.quantity),
+  ];
+}
+
+export function buildTransitNotification(center: string, rows: TransitNotificationRow[]) {
   const subject = `Pedidos em trânsito pendentes de aceite - ${center || "Todos os centros"}`;
   const intro = "Podem verificar o aceite no destino dos pedidos em trânsito listados abaixo?";
-  const cells = rows.map((row) => [row.center, row.reference, row.supplierCenter || missingValue]);
-  const incompleteRows = rows.filter((row) => !row.supplierCenter).length;
-  const missingNote = incompleteRows ? "O traço (—) indica um centro fornecedor indisponível na MB5T importada." : "";
+  const cells = rows.map(formatTransitNotificationCells);
+  const incompleteRows = rows.filter((row) => !row.supplierCenter || !row.material).length;
+  const missingNote = incompleteRows ? "O traço (—) indica um campo indisponível na MB5T importada." : "";
   const cellStyle = "border:1px solid #9cb8d0;padding:5px 10px;text-align:left;white-space:nowrap";
   const headings = transitNotificationHeaders.map((label) =>
     `<th scope="col" bgcolor="#367bb8" style="${cellStyle};color:#fff">${label}</th>`,

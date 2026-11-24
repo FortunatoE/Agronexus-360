@@ -22,6 +22,7 @@ import {
   buildOutlookEml,
   buildTaskNotification,
   buildTransitNotification,
+  formatTransitNotificationCells,
   listTransitNotificationOrders,
   parseNotificationRecipients,
   resolveTaskNotificationOrders,
@@ -16233,7 +16234,7 @@ export default function Home() {
             <Table
               empty={datasets.transito.length ? "Nenhum pedido em trânsito no seu filtro." : "Aguardando a importação da MB5T."}
               headers={transitNotificationHeaders}
-              rows={visibleTransitOrders.map(({ center, reference, supplierCenter }) => [center, reference, supplierCenter || "—"])}
+              rows={visibleTransitOrders.map(formatTransitNotificationCells)}
             />
           </section>
         )}
@@ -16575,7 +16576,7 @@ export default function Home() {
                 <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-amber-900">
                   <p>
                     {isTransitNotification
-                      ? "Há registros sem centro fornecedor. Reimporte a MB5T para atualizar esses campos."
+                      ? "Há registros com campos ausentes. Reimporte a MB5T para atualizar esses campos."
                       : notificationDraft.incompleteRows === 1
                       ? "Uma linha tem campos ausentes na base."
                       : `${notificationDraft.incompleteRows} linhas têm campos ausentes na base.`}
