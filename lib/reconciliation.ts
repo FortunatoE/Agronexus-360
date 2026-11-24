@@ -1,6 +1,6 @@
 import { normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
 import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "./pending-order-fields.mjs";
-import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapUnitHeaders } from "./sap-logistics-fields.mjs";
+import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapTransitSupplierHeaders, sapUnitHeaders } from "./sap-logistics-fields.mjs";
 
 export type OperationalRow = Record<string, unknown>;
 export type ProductSource = "planning" | "stock" | "transit" | "consumption" | "pending";
@@ -152,6 +152,7 @@ export function compactOperationalRow(row: OperationalRow, source: CompactSource
     assign("or", ...sapOrderHeaders);
     assign("oi", ...sapItemHeaders);
     assign("tc", ...sapTransitDestinationHeaders);
+    assign("sc", ...sapTransitSupplierHeaders);
   }
   if (source === "pending") {
     assign("or", ...sapOrderHeaders);
@@ -183,6 +184,7 @@ const compactAliasMap: Record<string, string> = {
   ...Object.fromEntries(sapLotHeaders.map((alias) => [headerKey(alias), "lot"])),
   ...Object.fromEntries(sapTransitQuantityHeaders.map((alias) => [headerKey(alias), "q"])),
   ...Object.fromEntries(sapTransitDestinationHeaders.map((alias) => [headerKey(alias), "tc"])),
+  ...Object.fromEntries(sapTransitSupplierHeaders.map((alias) => [headerKey(alias), "sc"])),
   STATUS: "s", SITUACAO: "s", CLASSIFICACAO: "cl", TIPO: "cl",
   PRODUTO: "p", MATERIALPLANEJADO: "p", PRODUTOPLANEJADO: "p", TEXTOMATERIAL: "p", DESCRICAOMATERIAL: "p", TEXTOBREVEMATERIAL: "p", INSUMO: "p", PRODUTOSOLICITADO: "p", MATERIALSOLICITADO: "p",
   QTDETALHAO: "q", QUANTIDADE: "q", UTILLIVRE: "q", UTILIZACAOLIVRE: "q", SALDOAJUSTADO: "q", ESTOQUE: "q", QTDRETIRADA: "q", SALDOFORN: "q", SALDOFORNECEDOR: "q", QTDPEDIDO: "q", VOLUMESOLICITADO: "q",

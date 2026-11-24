@@ -3,7 +3,7 @@ import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } fr
 import { promisify } from "node:util";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { pendingOrderDetailFields, pendingOrderQuantityAliases } from "../lib/pending-order-fields.mjs";
-import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapUnitHeaders } from "../lib/sap-logistics-fields.mjs";
+import { sapItemHeaders, sapLotHeaders, sapOrderHeaders, sapTransitDestinationHeaders, sapTransitQuantityHeaders, sapTransitSupplierHeaders, sapUnitHeaders } from "../lib/sap-logistics-fields.mjs";
 
 const scrypt = promisify(scryptCallback);
 let schemaReady;
@@ -220,6 +220,7 @@ function compactRow(row, source) {
     assign("or", ...sapOrderHeaders);
     assign("oi", ...sapItemHeaders);
     assign("tc", ...sapTransitDestinationHeaders);
+    assign("sc", ...sapTransitSupplierHeaders);
   }
   if (source === "pedidos") {
     assign("or", ...sapOrderHeaders);

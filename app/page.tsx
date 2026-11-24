@@ -21,8 +21,11 @@ import {
   buildNotificationMailto,
   buildOutlookEml,
   buildTaskNotification,
+  buildTransitNotification,
+  listTransitNotificationOrders,
   parseNotificationRecipients,
   resolveTaskNotificationOrders,
+  transitNotificationHeaders,
 } from "@/lib/task-notification";
 import { base64ToBytes } from "@/lib/workspace-base64";
 import { buildLogisticsEmail, type LogisticsEmailKind, type LogisticsEmailRow } from "@/lib/logistics-email";
@@ -2663,11 +2666,14 @@ export default function Home() {
   const [taskOrderFilter, setTaskOrderFilter] = useState("Todos");
   const [taskNucleusFilter, setTaskNucleusFilter] = useState("Todos");
   const [taskMaterialFilter, setTaskMaterialFilter] = useState("");
+  const [taskView, setTaskView] = useState<"pendentes" | "transito">("pendentes");
+  const [taskTransitCenter, setTaskTransitCenter] = useState("");
   const [alertNucleusFilter, setAlertNucleusFilter] = useState("Todos");
   const [alertMaterialFilter, setAlertMaterialFilter] = useState("");
   const [alertGroupFilter, setAlertGroupFilter] = useState("Todos");
   const [alertSubgroupFilter, setAlertSubgroupFilter] = useState("Todos");
-  const [showNotification, setShowNotification] = useState(false);
+  const [notificationKind, setNotificationKind] = useState<"pendentes" | "transito" | null>(null);
+  const [notificationCenter, setNotificationCenter] = useState("");
   const [notificationNucleus, setNotificationNucleus] = useState("Todos");
   const [notificationDays, setNotificationDays] = useState("7");
   const [notificationTo, setNotificationTo] = useState("");
@@ -5825,8 +5831,22 @@ export default function Home() {
     taskOrderFilter,
     taskSignalFilter,
   ]);
+  const transitOrders = useMemo(() => {
+    const orders = listTransitNotificationOrders(datasets.transito);
+    if (!isOperator) return orders;
+    return orders.filter(({ center }) =>
+      operatorHasNucleus && (farmToNucleus[normalizeMaterial(center)] || center) === operatorNucleus,
+    );
+  }, [datasets.transito, farmToNucleus, isOperator, operatorHasNucleus, operatorNucleus]);
+  const transitCenters = useMemo(() => [...new Set(transitOrders.map(({ center }) => center))], [transitOrders]);
+  const taskTransitDestination = transitCenters.includes(taskTransitCenter) ? taskTransitCenter : "";
+  const isTransitNotification = notificationKind === "transito";
   const notificationDraft = useMemo(() => {
-    if (!showNotification) return null;
+    if (!notificationKind) return null;
+    if (notificationKind === "transito") {
+      const rows = transitOrders.filter(({ center }) => !notificationCenter || center === notificationCenter);
+      return rows.length ? buildTransitNotification(notificationCenter, rows) : null;
+    }
     const minimumDays = Number(notificationDays);
     const candidates = scopedPendingSignals.filter(
       (signal) =>
@@ -5851,12 +5871,14 @@ export default function Home() {
       : null;
   }, [
     datasets.pedidosCompra,
+    notificationCenter,
     notificationDays,
+    notificationKind,
     notificationNucleus,
     notificationSource,
     pendingSignals,
     scopedPendingSignals,
-    showNotification,
+    transitOrders,
   ]);
   const notificationRecipients = parseNotificationRecipients(notificationTo);
   const notificationCopy = parseNotificationRecipients(notificationCc);
@@ -8307,13 +8329,24 @@ export default function Home() {
     setNotificationTo(emailSettings.nucleusRecipients[nucleus] || "");
     setNotificationCc(emailSettings.defaultCopy || "");
     setNotificationMessage(null);
-    setShowNotification(true);
+    setNotificationKind("pendentes");
+  }
+  function selectTransitNotificationCenter(center: string) {
+    const nucleus = farmToNucleus[normalizeMaterial(center)] || center;
+    setNotificationCenter(center);
+    setNotificationTo(center ? emailSettings.nucleusRecipients[nucleus] || "" : "");
+    setNotificationMessage(null);
+  }
+  function openTransitNotification() {
+    selectTransitNotificationCenter(taskTransitDestination || (transitCenters.length === 1 ? transitCenters[0] : ""));
+    setNotificationCc(emailSettings.defaultCopy || "");
+    setNotificationKind("transito");
   }
   function closeNotification() {
     notificationSourceRequest.current += 1;
     setNotificationSource(null);
     setNotificationSourceLoading(false);
-    setShowNotification(false);
+    setNotificationKind(null);
   }
   async function loadNotificationSource(file: File) {
     const request = ++notificationSourceRequest.current;
@@ -8366,9 +8399,11 @@ export default function Home() {
     }
   }
   function downloadNotificationDraft() {
-    if (!notificationRecipients?.length || !notificationCopy) {
+    if (!notificationRecipients || !notificationCopy || (!isTransitNotification && !notificationRecipients.length)) {
       setNotificationMessage({
-        text: "Informe um destinatário válido e confira os endereços em cópia.",
+        text: isTransitNotification
+          ? "Confira os endereços de destinatário e cópia."
+          : "Informe um destinatário válido e confira os endereços em cópia.",
       });
       return;
     }
@@ -8388,7 +8423,7 @@ export default function Home() {
     );
     const launcher = document.createElement("a");
     launcher.href = url;
-    launcher.download = "controle-de-pedidos.eml";
+    launcher.download = isTransitNotification ? "pedidos-em-transito.eml" : "controle-de-pedidos.eml";
     launcher.hidden = true;
     document.body.appendChild(launcher);
     launcher.click();
@@ -16137,6 +16172,75 @@ export default function Home() {
     );
   }
 
+  if (active === "Tarefas") {
+    const pendingTasks = content;
+    const visibleTransitOrders = transitOrders.filter(({ center }) => !taskTransitDestination || center === taskTransitDestination);
+    content = (
+      <section className="space-y-5">
+        <nav aria-label="Visões de Tarefas" className="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
+          {([
+            ["pendentes", "Pedidos pendentes"],
+            ["transito", "Pedidos em trânsito"],
+          ] as const).map(([view, label]) => (
+            <button
+              aria-pressed={taskView === view}
+              className={cn(
+                "rounded-xl px-4 py-2 text-sm font-semibold",
+                taskView === view ? "bg-emerald-700 text-white" : "bg-white text-slate-600 hover:bg-slate-100",
+              )}
+              key={view}
+              onClick={() => setTaskView(view)}
+              type="button"
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+        {taskView === "pendentes" ? pendingTasks : (
+          <section className="rounded-2xl border border-slate-200 bg-white p-5">
+            <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <h2 className="font-semibold">Pedidos em trânsito</h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  {visibleTransitOrders.length} {visibleTransitOrders.length === 1 ? "registro na" : "registros na"} MB5T
+                  {imports.transito?.importedAt ? ` · importada em ${formatDateTime(imports.transito.importedAt)}` : ""}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                  Centro de destino
+                  <select
+                    aria-label="Centro de destino"
+                    className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal"
+                    onChange={(event) => setTaskTransitCenter(event.target.value)}
+                    value={taskTransitDestination}
+                  >
+                    <option value="">Todos os centros</option>
+                    {transitCenters.map((center) => <option key={center}>{center}</option>)}
+                  </select>
+                </label>
+                <button
+                  className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-3 py-2 text-sm font-semibold text-white disabled:opacity-50"
+                  disabled={!visibleTransitOrders.length}
+                  onClick={openTransitNotification}
+                  type="button"
+                >
+                  <Bell aria-hidden="true" className="h-4 w-4" />
+                  Notificar pedidos em trânsito
+                </button>
+              </div>
+            </div>
+            <Table
+              empty={datasets.transito.length ? "Nenhum pedido em trânsito no seu filtro." : "Aguardando a importação da MB5T."}
+              headers={transitNotificationHeaders}
+              rows={visibleTransitOrders.map(({ center, reference, supplierCenter }) => [center, reference, supplierCenter || "—"])}
+            />
+          </section>
+        )}
+      </section>
+    );
+  }
+
   if (!authReady || (currentUser && !storageReady))
     return (
       <main className="login-screen grid min-h-screen place-items-center p-5">
@@ -16319,7 +16423,7 @@ export default function Home() {
         </div>
       ) : null}
 
-      {showNotification ? (
+      {notificationKind ? (
         <div
           aria-labelledby="task-notification-title"
           aria-modal="true"
@@ -16329,7 +16433,7 @@ export default function Home() {
           <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-100 px-6 py-5">
               <h2 className="font-semibold" id="task-notification-title">
-                Notificar pedidos pendentes
+                {isTransitNotification ? "Notificar pedidos em trânsito" : "Notificar pedidos pendentes"}
               </h2>
               <button
                 aria-label="Fechar notificação"
@@ -16341,42 +16445,59 @@ export default function Home() {
               </button>
             </div>
             <div className="grid gap-4 p-6 sm:grid-cols-2">
-              <label className="grid gap-1.5 text-sm font-medium">
-                Núcleo
-                <select
-                  className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
-                  onChange={(event) => {
-                    const nucleus = event.target.value;
-                    setNotificationNucleus(nucleus);
-                    setNotificationTo(
-                      emailSettings.nucleusRecipients[nucleus] || "",
-                    );
-                    setNotificationMessage(null);
-                  }}
-                  value={notificationNucleus}
-                >
-                  {taskNuclei.map((nucleus) => (
-                    <option key={nucleus}>{nucleus}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="grid gap-1.5 text-sm font-medium">
-                Atraso a partir de
-                <select
-                  className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
-                  onChange={(event) => {
-                    setNotificationDays(event.target.value);
-                    setNotificationMessage(null);
-                  }}
-                  value={notificationDays}
-                >
-                  {[1, 3, 5, 7, 10].map((days) => (
-                    <option key={days} value={days}>
-                      {days} {days === 1 ? "dia" : "dias"}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {isTransitNotification ? (
+                <label className="grid gap-1.5 text-sm font-medium sm:col-span-2">
+                  Centro de destino
+                  <select
+                    aria-label="Centro de destino"
+                    className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                    onChange={(event) => selectTransitNotificationCenter(event.target.value)}
+                    value={notificationCenter}
+                  >
+                    <option value="">Todos os centros</option>
+                    {transitCenters.map((center) => <option key={center}>{center}</option>)}
+                  </select>
+                </label>
+              ) : (
+                <>
+                  <label className="grid gap-1.5 text-sm font-medium">
+                    Núcleo
+                    <select
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                      onChange={(event) => {
+                        const nucleus = event.target.value;
+                        setNotificationNucleus(nucleus);
+                        setNotificationTo(
+                          emailSettings.nucleusRecipients[nucleus] || "",
+                        );
+                        setNotificationMessage(null);
+                      }}
+                      value={notificationNucleus}
+                    >
+                      {taskNuclei.map((nucleus) => (
+                        <option key={nucleus}>{nucleus}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-1.5 text-sm font-medium">
+                    Atraso a partir de
+                    <select
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 font-normal"
+                      onChange={(event) => {
+                        setNotificationDays(event.target.value);
+                        setNotificationMessage(null);
+                      }}
+                      value={notificationDays}
+                    >
+                      {[1, 3, 5, 7, 10].map((days) => (
+                        <option key={days} value={days}>
+                          {days} {days === 1 ? "dia" : "dias"}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              )}
               <label className="grid gap-1.5 text-sm font-medium sm:col-span-2">
                 Para
                 <input
@@ -16395,9 +16516,8 @@ export default function Home() {
                   value={notificationCc}
                 />
               </label>
-              {notificationDraft?.incompleteRows ||
-              notificationSource ||
-              notificationSourceLoading ? (
+              {!isTransitNotification &&
+              (notificationDraft?.incompleteRows || notificationSource || notificationSourceLoading) ? (
                 <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 p-3 sm:col-span-2">
                   <p
                     className="min-w-0 break-words text-xs text-slate-600"
@@ -16438,7 +16558,7 @@ export default function Home() {
                     className="mt-2 h-72 w-full rounded-lg bg-white"
                     sandbox=""
                     srcDoc={notificationDraft.html}
-                    title="Corpo do e-mail de pedidos pendentes"
+                    title={isTransitNotification ? "Corpo do e-mail de pedidos em trânsito" : "Corpo do e-mail de pedidos pendentes"}
                   />
                 </details>
               ) : null}
@@ -16447,12 +16567,16 @@ export default function Home() {
               <p className="text-sm text-slate-600">
                 {notificationDraft
                   ? `${notificationDraft.count} ${notificationDraft.count === 1 ? "linha de pedido no rascunho" : "linhas de pedido no rascunho"}.`
-                  : "Nenhum pedido pendente na faixa e no núcleo selecionados."}
+                  : isTransitNotification
+                    ? "Nenhum pedido em trânsito para o centro selecionado."
+                    : "Nenhum pedido pendente na faixa e no núcleo selecionados."}
               </p>
               {notificationDraft?.incompleteRows ? (
                 <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-amber-900">
                   <p>
-                    {notificationDraft.incompleteRows === 1
+                    {isTransitNotification
+                      ? "Há registros sem centro fornecedor. Reimporte a MB5T para atualizar esses campos."
+                      : notificationDraft.incompleteRows === 1
                       ? "Uma linha tem campos ausentes na base."
                       : `${notificationDraft.incompleteRows} linhas têm campos ausentes na base.`}
                   </p>

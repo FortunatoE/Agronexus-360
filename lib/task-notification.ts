@@ -1,5 +1,6 @@
 import { normalizeMaterial } from "@/lib/material-dimension";
-import { headerKey, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
+import { headerKey, quantityFor, readPendingOrderDetails, readText, type OperationalRow } from "@/lib/reconciliation";
+import { sapOrderHeaders, sapTransitDestinationHeaders, sapTransitSupplierHeaders } from "@/lib/sap-logistics-fields.mjs";
 
 type PendingEmailOrder = { reference: string; physicalMaterial: string; nucleus: string; row: OperationalRow; dueDate: Date | null };
 type OrderMaterial = { code: string; material: string };
@@ -164,6 +165,53 @@ export function buildTaskNotification(nucleus: string, minimumDays: number, rows
     instruction, `Observação: ${partialDelivery}`, textTable, missingNote, volumeNote,
   ].filter(Boolean).join("\r\n\r\n") + "\r\n\r\n";
   return { subject, html, text, incompleteRows };
+}
+
+export function listTransitNotificationOrders(rows: OperationalRow[]) {
+  const orders = new Map<string, { center: string; reference: string; supplierCenter: string }>();
+  for (const row of rows) {
+    if (quantityFor(row, "transit") <= 0 || ["SIM", "S", "X", "TRUE"].includes(headerKey(readText(row, "Eliminado?", "Cancelado")))) continue;
+    const center = readText(row, ...sapTransitDestinationHeaders, "Cen.", "Centro");
+    const reference = readText(row, ...sapOrderHeaders, "Documento");
+    if (!center || !reference) continue;
+    const supplierCenter = readText(row, ...sapTransitSupplierHeaders);
+    const key = [headerKey(center), sapIdentifier(reference), headerKey(supplierCenter)].join("|");
+    orders.set(key, { center, reference, supplierCenter });
+  }
+  return [...orders.values()].sort((left, right) =>
+    left.center.localeCompare(right.center, "pt-BR", { numeric: true }) ||
+    left.reference.localeCompare(right.reference, "pt-BR", { numeric: true }) ||
+    left.supplierCenter.localeCompare(right.supplierCenter, "pt-BR", { numeric: true }),
+  );
+}
+
+export const transitNotificationHeaders = ["Centro", "Pedido", "Centro fornecedor"];
+
+export function buildTransitNotification(center: string, rows: ReturnType<typeof listTransitNotificationOrders>) {
+  const subject = `Pedidos em trânsito pendentes de aceite - ${center || "Todos os centros"}`;
+  const intro = "Podem verificar o aceite no destino dos pedidos em trânsito listados abaixo?";
+  const cells = rows.map((row) => [row.center, row.reference, row.supplierCenter || missingValue]);
+  const incompleteRows = rows.filter((row) => !row.supplierCenter).length;
+  const missingNote = incompleteRows ? "O traço (—) indica um centro fornecedor indisponível na MB5T importada." : "";
+  const cellStyle = "border:1px solid #9cb8d0;padding:5px 10px;text-align:left;white-space:nowrap";
+  const headings = transitNotificationHeaders.map((label) =>
+    `<th scope="col" bgcolor="#367bb8" style="${cellStyle};color:#fff">${label}</th>`,
+  ).join("");
+  const body = cells.map((row) => `<tr>${row.map((value) =>
+    `<td bgcolor="#e2f2fc" style="${cellStyle}">${escapeHtml(value)}</td>`,
+  ).join("")}</tr>`).join("");
+  const html = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"></head><body style="font-family:Calibri,Arial,sans-serif;font-size:14px;color:#1a1a1a">
+    <p>Bom dia,</p>
+    <p>${intro}</p>
+    <table style="border-collapse:collapse"><thead><tr>${headings}</tr></thead><tbody>${body}</tbody></table>
+    ${missingNote ? `<p style="font-size:12px;color:#4b5563">${missingNote}</p>` : ""}
+    <p>Atenciosamente,</p><p><br></p>
+  </body></html>`;
+  const table = [transitNotificationHeaders, ...cells].map((row) =>
+    row.map((value) => value.replace(/[\t\r\n]+/g, " ")).join("\t"),
+  ).join("\r\n");
+  const text = ["Bom dia,", intro, table, missingNote, "Atenciosamente,"].filter(Boolean).join("\r\n\r\n") + "\r\n\r\n";
+  return { subject, html, text, incompleteRows, count: rows.length };
 }
 
 export function parseNotificationRecipients(value: string) {
