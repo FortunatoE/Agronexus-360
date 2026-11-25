@@ -446,46 +446,31 @@ export function registeredConversionFactor(product: ResolvedProduct, bundle: Dim
 }
 
 /**
- * Expresses a physical material in the unit of its material agregado. The
- * Premissas sheet stores conversions as `material padrão|apresentação física`.
- * The factor is multiplicative: 0.5 means that 1,600 physical become 800 in
- * the unit of the aggregated material.
+ * Expresses a physical quantity in the standard material's unit.
+ * Excel Premissas stores the divisor as material padrão|apresentação física:
+ * fator = dose do substituto / dose do produto padrão.
+ * E.g. 24.8 physical / 3 = 8.2666... standard.
  */
 export function conversionFactor(product: ResolvedProduct, bundle: DimensionBundle) {
   const explicit = registeredConversionFactor(product, bundle);
   if (explicit !== undefined) return explicit;
-  // Fallback seguro para dimensões que já trazem as duas doses, mas ainda não
-  // receberam a premissa de conversão explícita.
-  const physicalDose = bundle.materials[normalizeMaterial(product.rawName)]?.standardDose || 0;
-  const aggregateDose = bundle.materials[normalizeMaterial(product.canonicalName)]?.standardDose || 0;
-  if (physicalDose > 0 && aggregateDose > 0 && Math.abs(physicalDose - aggregateDose) > 0.000_001) return physicalDose / aggregateDose;
+  const physicalKey = normalizeMaterial(product.rawName);
+  const referenceKey = normalizeMaterial(product.canonicalName);
+  if (physicalKey === referenceKey) return 1;
+  const physical = bundle.materials[physicalKey];
+  const reference = bundle.materials[referenceKey];
+  const physicalDose = physical?.standardDose ?? 0;
+  const referenceDose = reference?.standardDose ?? 0;
+  // An aggregate lookup alias is not a separate reference dose.
+  if (physicalDose > 0 && referenceDose > 0 && normalizeMaterial(reference?.material) === referenceKey) {
+    const factor = physicalDose / referenceDose;
+    if (Number.isFinite(factor) && factor > 0) return factor;
+  }
   return 1;
 }
 
 export function standardAmount(amount: number, product: ResolvedProduct, bundle: DimensionBundle) {
-  return amount * conversionFactor(product, bundle);
-}
-
-/**
- * Planning is reconciled with the Excel model: its adjusted volume, when
- * supplied, is already in the reference material's unit. Otherwise convert
- * the physical quantity once using the registered multiplier, or the inverse
- * of the Excel dose divisor (reference dose / substitute dose).
- */
-export function standardPlanningAmount(amount: number, product: ResolvedProduct, bundle: DimensionBundle) {
-  if (normalizeMaterial(product.rawName) === normalizeMaterial(product.canonicalName)) return amount;
-  const multiplier = registeredConversionFactor(product, bundle);
-  if (multiplier !== undefined) return amount * multiplier;
-  const physical = bundle.materials[normalizeMaterial(product.rawName)];
-  const reference = bundle.materials[normalizeMaterial(product.canonicalName)];
-  const physicalDose = physical?.standardDose ?? 0;
-  const referenceDose = reference?.standardDose ?? 0;
-  // The aggregate entry can be a lookup alias for the physical material.
-  // An alias is not evidence of a separate reference dose.
-  if (physicalDose > 0 && referenceDose > 0 && normalizeMaterial(reference?.material) === normalizeMaterial(product.canonicalName)) {
-    return amount / (physicalDose / referenceDose);
-  }
-  return amount;
+  return amount / conversionFactor(product, bundle);
 }
 
 export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {
@@ -496,10 +481,6 @@ export function standardQuantity(row: OperationalRow, source: ProductSource, pro
   // An adjusted quantity supplied by Excel is the authoritative equivalent;
   // this also prevents converting an older compacted adjusted-only row twice.
   if (hasAdjusted) return numberFrom(adjusted);
-  if (source === "planning") {
-    const physical = quantityFor(row, source);
-    return standardPlanningAmount(physical, product, bundle);
-  }
   return standardAmount(quantityFor(row, source), product, bundle);
 }
 
