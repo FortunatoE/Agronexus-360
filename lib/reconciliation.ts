@@ -466,35 +466,40 @@ export function standardAmount(amount: number, product: ResolvedProduct, bundle:
   return amount * conversionFactor(product, bundle);
 }
 
+/**
+ * Planning is reconciled with the Excel model: its adjusted volume, when
+ * supplied, is already in the reference material's unit. Otherwise convert
+ * the physical quantity once using the registered multiplier, or the inverse
+ * of the Excel dose divisor (reference dose / substitute dose).
+ */
+export function standardPlanningAmount(amount: number, product: ResolvedProduct, bundle: DimensionBundle) {
+  if (normalizeMaterial(product.rawName) === normalizeMaterial(product.canonicalName)) return amount;
+  const multiplier = registeredConversionFactor(product, bundle);
+  if (multiplier !== undefined) return amount * multiplier;
+  const physical = bundle.materials[normalizeMaterial(product.rawName)];
+  const reference = bundle.materials[normalizeMaterial(product.canonicalName)];
+  const physicalDose = physical?.standardDose ?? 0;
+  const referenceDose = reference?.standardDose ?? 0;
+  // The aggregate entry can be a lookup alias for the physical material.
+  // An alias is not evidence of a separate reference dose.
+  if (physicalDose > 0 && referenceDose > 0 && normalizeMaterial(reference?.material) === normalizeMaterial(product.canonicalName)) {
+    return amount / (physicalDose / referenceDose);
+  }
+  return amount;
+}
+
 export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {
   const adjusted = readValue(row, "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
-  const hasAdjusted = adjusted !== undefined && String(adjusted).trim() !== "";
-  if (source === "planning") {
-    const hasQuantity = (value: unknown) => typeof value === "number"
-      ? Number.isFinite(value)
-      : /\d/.test(String(value ?? ""));
-    let physical: unknown;
-    if (row._c === 1) {
-      const candidate = row.q;
-      // Em cargas legadas q podia conter o próprio aq. Se forem iguais,
-      // sem a marca de origem, não é seguro converter novamente.
-      if (hasQuantity(candidate) && (row.qr === 1 || !hasAdjusted || numberFrom(candidate) !== numberFrom(adjusted))) {
-        physical = candidate;
-      }
-    } else {
-      physical = readValue(row, "Qtde. talhão", "Qtde talhão");
-      if (!hasQuantity(physical)) {
-        // Não confundir Quantidade com Quantidade necessária ou executada.
-        const key = Object.keys(row).find((header) => headerKey(header) === "QUANTIDADE");
-        physical = key === undefined ? undefined : row[key];
-      }
-    }
-    if (hasQuantity(physical)) return standardAmount(numberFrom(physical), product, bundle);
-    // Sem quantidade física confiável, preserve a equivalência importada.
-    if (hasAdjusted) return numberFrom(adjusted);
-    return 0;
-  }
+  const hasAdjusted = typeof adjusted === "number"
+    ? Number.isFinite(adjusted)
+    : /\d/.test(String(adjusted ?? ""));
+  // An adjusted quantity supplied by Excel is the authoritative equivalent;
+  // this also prevents converting an older compacted adjusted-only row twice.
   if (hasAdjusted) return numberFrom(adjusted);
+  if (source === "planning") {
+    const physical = quantityFor(row, source);
+    return standardPlanningAmount(physical, product, bundle);
+  }
   return standardAmount(quantityFor(row, source), product, bundle);
 }
 
