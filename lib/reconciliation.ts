@@ -119,7 +119,18 @@ export function compactOperationalRow(row: OperationalRow, source: CompactSource
   assign("s", "Status", "Situação", "Situacao");
   assign("cl", "Classificação", "Classificacao", "Classificac�o", "Tipo");
   assign("p", ...productFields[productSource]);
-  assign("q", ...quantityFields[quantitySource]);
+  // No planejamento, preserve a quantidade física separada da já ajustada.
+  // A marca qr identifica a origem de q nas novas cargas; cargas antigas
+  // podiam copiar aq para q quando não existia quantidade física.
+  if (source === "planning") {
+    const raw = valueFor("Qtde. talhão", "Qtde talhão") ?? values.get("QUANTIDADE");
+    if (raw !== undefined && raw !== null && (typeof raw === "number" || String(raw).trim())) {
+      compact.q = raw;
+      compact.qr = 1;
+    }
+  } else {
+    assign("q", ...quantityFields[quantitySource]);
+  }
   assign("aq", "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
   assign("c", "Material", "Código material", "Codigo material", "MAT");
   assign("w", "WBS element", "WBS", "Elemento PEP", "Elemento WBS", "Def.proj.", "Def proj", "Projeto");
@@ -457,7 +468,33 @@ export function standardAmount(amount: number, product: ResolvedProduct, bundle:
 
 export function standardQuantity(row: OperationalRow, source: ProductSource, product: ResolvedProduct, bundle: DimensionBundle) {
   const adjusted = readValue(row, "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
-  if (adjusted !== undefined && String(adjusted).trim()) return numberFrom(adjusted);
+  const hasAdjusted = adjusted !== undefined && String(adjusted).trim() !== "";
+  if (source === "planning") {
+    const hasQuantity = (value: unknown) => typeof value === "number"
+      ? Number.isFinite(value)
+      : /\d/.test(String(value ?? ""));
+    let physical: unknown;
+    if (row._c === 1) {
+      const candidate = row.q;
+      // Em cargas legadas q podia conter o próprio aq. Se forem iguais,
+      // sem a marca de origem, não é seguro converter novamente.
+      if (hasQuantity(candidate) && (row.qr === 1 || !hasAdjusted || numberFrom(candidate) !== numberFrom(adjusted))) {
+        physical = candidate;
+      }
+    } else {
+      physical = readValue(row, "Qtde. talhão", "Qtde talhão");
+      if (!hasQuantity(physical)) {
+        // Não confundir Quantidade com Quantidade necessária ou executada.
+        const key = Object.keys(row).find((header) => headerKey(header) === "QUANTIDADE");
+        physical = key === undefined ? undefined : row[key];
+      }
+    }
+    if (hasQuantity(physical)) return standardAmount(numberFrom(physical), product, bundle);
+    // Sem quantidade física confiável, preserve a equivalência importada.
+    if (hasAdjusted) return numberFrom(adjusted);
+    return 0;
+  }
+  if (hasAdjusted) return numberFrom(adjusted);
   return standardAmount(quantityFor(row, source), product, bundle);
 }
 
