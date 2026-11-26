@@ -22,6 +22,13 @@ const blank = (): Draft => ({ code: "", material: "", quantity: "", unit: "KG", 
 const labels: Record<DocKind, string> = { devolucao: "NF de devolução", transferencia: "NF de transferência", receituario: "Receituário" };
 const stageTone = (stage: Transfer["stage"]) => stage === "done" ? "bg-emerald-100 text-emerald-800" : stage === "recipe" ? "bg-blue-100 text-blue-800" : "bg-amber-100 text-amber-900";
 const number = (value: number) => value.toLocaleString("pt-BR", { maximumFractionDigits: 6 });
+function quantityInput(value: string) {
+  const raw = value.trim();
+  if (!/^\d+(?:[.,]\d+)*$/.test(raw)) return NaN;
+  if (raw.includes(",")) return /^\d+(?:\.\d{3})*,\d+$/.test(raw) ? Number(raw.replace(/\./g, "").replace(",", ".")) : NaN;
+  if (/^\d{1,3}(?:\.\d{3})+$/.test(raw)) return Number(raw.replace(/\./g, ""));
+  return /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+}
 const date = (value: string) => new Date(value).toLocaleString("pt-BR");
 const field = "w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm";
 const button = "rounded-lg border border-slate-200 px-3 py-2 text-sm font-semibold disabled:opacity-50";
@@ -66,7 +73,7 @@ export function FarmTransfers({ user }: { user: User }) {
     finally { setLoading(false); }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
-  const origins = data.units.filter((unit) => user.role === "admin" || unit.nucleus === user.nucleus);
+  const origins = data.units.filter((unit) => user.role === "admin" || unit.nucleus.toUpperCase() === user.nucleus?.toUpperCase());
   const selectedRows = data.rows.filter((row) =>
     (status === "Todos" || row.stage === status) &&
     (!search.trim() || [row.origin, row.destination, row.originNucleus, row.destinationNucleus, row.requester, ...row.items.flatMap((item) => [item.code, item.material, item.lot])].join(" ").toLowerCase().includes(search.trim().toLowerCase())));
@@ -85,7 +92,9 @@ export function FarmTransfers({ user }: { user: User }) {
   }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const result = await execute({ action: "create", origin, destination, requester, observation, items: items.map((item) => ({ ...item, quantity: Number(item.quantity.replace(",", ".")) })) }, "Solicitação registrada na fila de Insumos.");
+    const normalizedItems = items.map((item) => ({ ...item, quantity: quantityInput(item.quantity) }));
+    if (normalizedItems.some((item) => !Number.isFinite(item.quantity) || item.quantity <= 0)) { setError("Informe quantidades positivas. Exemplo: 2.160 ou 1.692,50."); return; }
+    const result = await execute({ action: "create", origin, destination, requester, observation, items: normalizedItems }, "Solicitação registrada na fila de Insumos.");
     if (result) { setCreate(false); setSelectedId(result.id); setItems([blank()]); setObservation(""); setDestination(""); }
   }
   async function upload(kind: DocKind, file: File | undefined) {
