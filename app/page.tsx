@@ -1571,6 +1571,238 @@ function planningProduct(row: Row, excluded: string) {
   return !classification || headerKey(classification).includes("PRODUTO");
 }
 
+
+function plannedApplicationDate(row: Row) {
+  const value = readText(row, "DT_Aplicacao", "Data prevista", "Data planejada", "Data aplicação", "Data");
+  const iso = /^(\d{4})-(\d{2})-(\d{2})(?:T|$)/.exec(value);
+  if (iso) {
+    const date = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+    return dateKey(date) === iso[1] + "-" + iso[2] + "-" + iso[3] ? date : null;
+  }
+  return dateFromPlan(value);
+}
+
+function applicationCulture(row: Row) {
+  const culture = cultureFor(row);
+  const key = headerKey(culture);
+  if (key.startsWith("SOJA")) return "Soja";
+  if (key.startsWith("ALGODAO")) return "Algodão";
+  if (key.startsWith("MILHO")) return "Milho";
+  return culture;
+}
+
+type ApplicationCalendarEvent = {
+  id: string;
+  day: string;
+  cycle: string;
+  culture: string;
+  nucleus: string;
+  operation: string;
+  products: Set<string>;
+  fields: Set<string>;
+};
+
+function calendarCycleTone(cycle: string) {
+  return cycle === "Safra"
+    ? "border-emerald-600 bg-emerald-50 text-emerald-950"
+    : cycle === "Safrinha"
+      ? "border-amber-500 bg-amber-50 text-amber-950"
+      : "border-slate-400 bg-slate-100 text-slate-800";
+}
+
+function calendarAddDays(date: Date, days: number) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+}
+
+function calendarMonday(date: Date) {
+  return calendarAddDays(date, -((date.getDay() + 6) % 7));
+}
+
+function PlanningApplicationCalendar({
+  rows, dimensions, farmToNucleus, operatorNucleus,
+}: {
+  rows: Row[];
+  dimensions: DimensionBundle;
+  farmToNucleus: Record<string, string>;
+  operatorNucleus: string;
+}) {
+  const [view, setView] = useState<"Anual" | "Mensal" | "Semanal">("Mensal");
+  const [cursor, setCursor] = useState(() => new Date());
+  const [selectedDay, setSelectedDay] = useState(() => dateKey(new Date()));
+  const [cycle, setCycle] = useState("Todos");
+  const [culture, setCulture] = useState("Todas");
+  const [nucleus, setNucleus] = useState("Todos");
+  const [search, setSearch] = useState("");
+  const data = useMemo(() => {
+    const entries = new Map<string, ApplicationCalendarEvent>();
+    const cultures = new Set<string>();
+    const nuclei = new Set<string>();
+    let missingDates = 0;
+    rows.forEach((row) => {
+      const unit = planningNucleusFor(row, dimensions, farmToNucleus);
+      if (operatorNucleus && unit !== operatorNucleus) return;
+      const product = productFor(row, "planning", dimensions);
+      if (product.rawName === "Sem descrição") return;
+      const crop = applicationCulture(row);
+      const season = cycleFor(row, dimensions);
+      cultures.add(crop);
+      nuclei.add(unit);
+      const date = plannedApplicationDate(row);
+      if (!date) { missingDates += 1; return; }
+      const day = dateKey(date);
+      const operation = readText(row, "Atividade", "Operação", "Tar.") || product.subgroup || "Aplicação";
+      const id = JSON.stringify([day, season, crop, unit, operation]);
+      const event = entries.get(id) || {
+        id, day, cycle: season, culture: crop, nucleus: unit, operation,
+        products: new Set<string>(), fields: new Set<string>(),
+      };
+      event.products.add(product.rawName);
+      const field = readText(row, "Talhão", "Talhao");
+      if (field) {
+        const farm = readText(row, "Fazenda", "Centro") || readText(row, "WBS element", "WBS").split(".")[1] || "";
+        event.fields.add([farm, field].filter(Boolean).join(" / "));
+      }
+      entries.set(id, event);
+    });
+    return {
+      events: [...entries.values()].sort((a,b) => a.day.localeCompare(b.day) || a.nucleus.localeCompare(b.nucleus) || a.operation.localeCompare(b.operation)),
+      cultures: [...cultures].sort(), nuclei: [...nuclei].sort(), missingDates,
+    };
+  }, [rows, dimensions, farmToNucleus, operatorNucleus]);
+  const filtered = useMemo(() => {
+    const term = headerKey(search);
+    const days = new Map<string, ApplicationCalendarEvent[]>();
+    const months = new Map<string, ApplicationCalendarEvent[]>();
+    data.events.forEach((event) => {
+      if (cycle !== "Todos" && event.cycle !== cycle) return;
+      if (culture !== "Todas" && event.culture !== culture) return;
+      if (nucleus !== "Todos" && event.nucleus !== nucleus) return;
+      if (term && !headerKey([event.operation, ...event.products, ...event.fields, event.nucleus].join(" ")).includes(term)) return;
+      const dayEvents = days.get(event.day) || [];
+      dayEvents.push(event);
+      days.set(event.day, dayEvents);
+      const month = event.day.slice(0, 7);
+      const monthEvents = months.get(month) || [];
+      monthEvents.push(event);
+      months.set(month, monthEvents);
+    });
+    return { days, months };
+  }, [data.events, cycle, culture, nucleus, search]);
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  const first = view === "Semanal" ? calendarMonday(cursor) : calendarMonday(new Date(year, month, 1));
+  const count = view === "Semanal" ? 7 : Math.ceil(((new Date(year, month, 1).getDay() + 6) % 7 + new Date(year, month + 1, 0).getDate()) / 7) * 7;
+  const days = Array.from({ length: count }, (_, index) => calendarAddDays(first, index));
+  const shortDate = (date: Date) => date.toLocaleDateString("pt-BR", { day: "2-digit", month: "short" });
+  const heading = view === "Anual" ? String(year) : view === "Mensal"
+    ? cursor.toLocaleDateString("pt-BR", { month: "long", year: "numeric" })
+    : shortDate(first) + " – " + shortDate(calendarAddDays(first, 6)) + " de " + calendarAddDays(first, 6).getFullYear();
+  const today = dateKey(new Date());
+  const changeDate = (next: Date) => { setCursor(next); setSelectedDay(dateKey(next)); };
+  const move = (direction: number) => changeDate(view === "Semanal" ? calendarAddDays(cursor, direction * 7) : new Date(year + (view === "Anual" ? direction : 0), view === "Anual" ? month : month + direction, 1));
+  const chooseDay = (date: Date) => changeDate(date);
+  const monthName = (date: Date) => date.toLocaleDateString("pt-BR", { month: "long" });
+  const visibleEvents = filtered.days.get(selectedDay) || [];
+  return (
+    <div className="mt-6 space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-5">
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" aria-label="Período anterior" className="rounded-lg border border-slate-200 px-3 py-2" onClick={() => move(-1)}>‹</button>
+          <button type="button" aria-label="Próximo período" className="rounded-lg border border-slate-200 px-3 py-2" onClick={() => move(1)}>›</button>
+          <button type="button" className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-semibold" onClick={() => changeDate(new Date())}>Hoje</button>
+          <h3 className="text-lg font-semibold capitalize">{heading}</h3>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex rounded-lg border border-slate-200 p-1" aria-label="Visão do calendário">
+            {(["Anual", "Mensal", "Semanal"] as const).map((mode) => (
+              <button key={mode} type="button" aria-pressed={view === mode} onClick={() => setView(mode)} className={cn("rounded-md px-3 py-1.5 text-xs font-semibold", view === mode ? "bg-emerald-700 text-white" : "text-slate-600")}>{mode}</button>
+            ))}
+          </div>
+          <input aria-label="Data do calendário" type="date" className="rounded-lg border border-slate-200 px-3 py-2 text-sm" value={dateKey(cursor)} onChange={(event) => { if (event.target.value) changeDate(new Date(event.target.value + "T00:00:00")); }} />
+        </div>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <label className="grid gap-1 text-xs font-medium">Ciclo
+          <select className="rounded-lg border border-slate-200 px-3 py-2 text-sm" value={cycle} onChange={(event) => setCycle(event.target.value)}>{["Todos","Safra","Safrinha","Sem ciclo"].map((item) => <option key={item}>{item}</option>)}</select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium">Cultura
+          <select className="rounded-lg border border-slate-200 px-3 py-2 text-sm" value={culture} onChange={(event) => setCulture(event.target.value)}>{["Todas", ...data.cultures].map((item) => <option key={item}>{item}</option>)}</select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium">Núcleo
+          <select className="rounded-lg border border-slate-200 px-3 py-2 text-sm" value={nucleus} onChange={(event) => setNucleus(event.target.value)}>{["Todos", ...data.nuclei].map((item) => <option key={item}>{item}</option>)}</select>
+        </label>
+        <label className="grid gap-1 text-xs font-medium">Buscar operação ou produto
+          <input className="rounded-lg border border-slate-200 px-3 py-2 text-sm" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Produto, operação, talhão..." />
+        </label>
+      </div>
+      {view === "Anual" ? (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          {Array.from({ length: 12 }, (_, index) => {
+            const date = new Date(year, index, 1);
+            const events = filtered.months.get(monthKey(date)) || [];
+            const seasons = new Map<string, number>();
+            events.forEach((event) => seasons.set(event.cycle, (seasons.get(event.cycle) || 0) + 1));
+            return (
+              <button key={index} type="button" onClick={() => { changeDate(date); setView("Mensal"); }} className="min-h-32 rounded-xl border border-slate-200 p-4 text-left hover:border-emerald-600">
+                <div className="flex items-center justify-between gap-2"><span className="font-semibold capitalize">{monthName(date)}</span><span className="text-xs text-slate-500">{events.length} grupos</span></div>
+                <div className="mt-3 flex flex-wrap gap-1">{[...seasons].map(([season, total]) => <span key={season} className={cn("rounded border-l-2 px-2 py-1 text-xs", calendarCycleTone(season))}>{season}: {total}</span>)}</div>
+                <p className="mt-2 text-xs text-slate-500">{events.length ? [...new Set(events.map((event) => event.culture))].sort().join(" · ") : "Sem aplicações"}</p>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-xl border border-slate-200">
+          <div className="grid min-w-[770px] grid-cols-7">
+            {["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"].map((day) => <div key={day} className="border-b border-r border-slate-200 bg-slate-50 px-2 py-3 text-center text-xs font-semibold">{day}</div>)}
+            {days.map((date) => {
+              const key = dateKey(date);
+              const events = filtered.days.get(key) || [];
+              const limit = view === "Semanal" ? 5 : 2;
+              return (
+                <div key={key} className={cn("min-w-0 border-b border-r border-slate-200 p-2", view === "Semanal" ? "min-h-56" : "min-h-32", view === "Mensal" && date.getMonth() !== month && "bg-slate-50/80", key === selectedDay && "ring-2 ring-inset ring-emerald-600")}>
+                  <button type="button" className={cn("mb-2 flex w-full items-center justify-between gap-1 rounded px-1 py-1 text-left text-xs font-semibold", key === today ? "text-emerald-700" : "text-slate-600")} onClick={() => chooseDay(date)}><span>{String(date.getDate()).padStart(2,"0")}/{String(date.getMonth()+1).padStart(2,"0")}{key === today ? " · Hoje" : ""}</span><span>{events.length || ""}</span></button>
+                  <div className="space-y-1">
+                    {events.slice(0,limit).map((event) => (
+                      <button key={event.id} type="button" onClick={() => chooseDay(date)} title={event.operation + " · " + [...event.products].join(", ")} className={cn("block w-full overflow-hidden rounded-md border-l-2 px-2 py-1.5 text-left text-xs", calendarCycleTone(event.cycle))}>
+                        <span className="block truncate font-semibold">{event.operation}</span>
+                        <span className="block truncate">{event.culture} · {event.cycle}</span>
+                        <span className="block truncate opacity-80">{event.nucleus}</span>
+                      </button>
+                    ))}
+                    {events.length > limit && <button type="button" className="text-xs font-semibold text-emerald-700" onClick={() => chooseDay(date)}>+{events.length - limit} grupos · Ver dia</button>}
+                    {!events.length && view === "Semanal" && <p className="text-xs text-slate-400">Sem aplicações</p>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        {["Safra", "Safrinha", "Sem ciclo"].map((item) => <span key={item} className={cn("rounded border-l-2 px-2 py-1", calendarCycleTone(item))}>{item}</span>)}
+        <span className="text-slate-500">Agrupamento por dia, ciclo, cultura, núcleo e operação. Datas previstas, não execução confirmada.</span>
+      </div>
+      {data.missingDates > 0 && <p className="text-xs text-amber-700">{data.missingDates} registros de planejamento sem data reconhecida no escopo de acesso não aparecem no calendário.</p>}
+      {view !== "Anual" && (
+        <div className="rounded-xl border border-slate-200 p-4">
+          <h4 className="font-semibold">Aplicações de {new Date(selectedDay + "T00:00:00").toLocaleDateString("pt-BR")} <span className="text-xs font-normal text-slate-500">· {visibleEvents.length} grupos</span></h4>
+          <div className="mt-3 grid gap-2 lg:grid-cols-2">
+            {visibleEvents.map((event) => (
+              <details key={event.id} className={cn("rounded-lg border-l-4 p-3 text-sm", calendarCycleTone(event.cycle))}>
+                <summary className="cursor-pointer font-semibold">{event.operation} · {event.culture} · {event.cycle} · {event.nucleus}</summary>
+                <p className="mt-2 text-xs"><strong>Produtos:</strong> {[...event.products].sort().join(", ")}</p>
+                <p className="mt-2 text-xs"><strong>Fazendas / talhões ({event.fields.size}):</strong> {[...event.fields].sort().join("; ") || "Não informado"}</p>
+              </details>
+            ))}
+            {!visibleEvents.length && <p className="text-sm text-slate-500">Sem aplicações para este dia e filtros.</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function mergePremises(
   bundle: DimensionBundle,
   items: DimensionPremise[],
@@ -2709,6 +2941,8 @@ export default function Home() {
   const [evaluationDate, setEvaluationDate] = useState(() =>
     dateKey(new Date()),
   );
+  const [provisionCycle, setProvisionCycle] = useState("Todos");
+  const [provisionCulture, setProvisionCulture] = useState("Todas");
   const [provisionUntil, setProvisionUntil] = useState(() => {
     const end = new Date();
     end.setDate(end.getDate() + 15);
@@ -4556,31 +4790,40 @@ export default function Home() {
   const provision = useMemo(() => {
     const start = new Date(evaluationDate + "T00:00:00");
     const finish = new Date(provisionUntil + "T23:59:59");
-    const dated = plans.map((row) => ({
-      row,
-      date: dateFromPlan(
-        readText(
-          row,
-          "DT_Aplicacao",
-          "Data prevista",
-          "Data planejada",
-          "Data aplicação",
-          "Data",
-        ),
-      ),
-    }));
+    const matchesScope = (row: Row) =>
+      (provisionCycle === "Todos" || cycleFor(row, dimensions) === provisionCycle) &&
+      (provisionCulture === "Todas" || applicationCulture(row) === provisionCulture);
+    const scopedPlans = plans.filter(matchesScope);
+    const dated = scopedPlans.map((row) => ({ row, date: plannedApplicationDate(row) }));
     const scheduled = dated.filter((item) => item.date);
     const windowPlans = scheduled.length
       ? scheduled
           .filter((item) => item.date! >= start && item.date! <= finish)
           .map((item) => item.row)
-      : plans;
+      : scopedPlans;
+    // Keep stock and warehouse pooled per material / nucleus. The culture
+    // breakdown identifies planned demand without duplicating availability.
+    type CultureDemand = { cycle: string; culture: string; planned: number };
+    const breakdown = new Map<string, Map<string, CultureDemand>>();
+    windowPlans.forEach((row) => {
+      const product = productFor(row, "planning", dimensions);
+      if (product.rawName === "Sem descrição") return;
+      const id = product.canonicalKey + "|" + normalizeMaterial(planningNucleusFor(row, dimensions, farmToNucleus));
+      const cycle = cycleFor(row, dimensions);
+      const culture = applicationCulture(row);
+      const values = breakdown.get(id) || new Map<string, CultureDemand>();
+      const key = JSON.stringify([cycle, culture]);
+      const entry = values.get(key) || { cycle, culture, planned: 0 };
+      entry.planned += standardQuantity(row, "planning", product, dimensions);
+      values.set(key, entry);
+      breakdown.set(id, values);
+    });
     const windowLedger = buildReconciliation({
       bundle: dimensions,
       planningRows: windowPlans,
       stockRows,
       transitRows: datasets.transito,
-      consumptionRows: datasets.consumo,
+      consumptionRows: datasets.consumo.filter(matchesScope),
       pendingRows: pendingOrders,
       farmToNucleus,
     });
@@ -4614,6 +4857,7 @@ export default function Home() {
         // então exibe uma única linha por material, tipo de saldo e localização.
         return {
           ...row,
+          cultureBreakdown: [...(breakdown.get(row.id)?.values() || [])].sort((a,b) => a.cycle.localeCompare(b.cycle) || a.culture.localeCompare(b.culture)),
           balance,
           locations: consolidateLocations([
             ...row.locations,
@@ -4649,6 +4893,8 @@ export default function Home() {
   }, [
     evaluationDate,
     provisionUntil,
+    provisionCycle,
+    provisionCulture,
     plans,
     dimensions,
     stockRows,
@@ -8553,6 +8799,10 @@ export default function Home() {
     const XLSX = await loadXlsx();
     const summary = provision.rows.map((row) => ({
       Núcleo: row.nucleus,
+      Ciclo: [...new Set(row.cultureBreakdown.map((item) => item.cycle))].join(" / "),
+      Cultura: [...new Set(row.cultureBreakdown.map((item) => item.culture))].join(" / "),
+      "Planejado por cultura": row.cultureBreakdown.map((item) => item.cycle + " · " + item.culture + ": " + formatNumber(item.planned)).join("; "),
+      "Qtd. planejada": row.planned,
       "Princípio ativo": row.active,
       Grupo: row.merchandiseGroup,
       Subgrupo: row.subgroup,
@@ -8571,6 +8821,8 @@ export default function Home() {
         .filter((location) => location.type !== "Armazém")
         .map((location) => ({
           Núcleo: row.nucleus,
+          Ciclo: [...new Set(row.cultureBreakdown.map((item) => item.cycle))].join(" / "),
+          Cultura: [...new Set(row.cultureBreakdown.map((item) => item.culture))].join(" / "),
           "Material padrão": row.standardMaterial,
           Material: location.material,
           Tipo: location.type,
@@ -8579,6 +8831,8 @@ export default function Home() {
         })),
       ...row.warehouseLocations.map((location) => ({
         Núcleo: row.nucleus,
+        Ciclo: [...new Set(row.cultureBreakdown.map((item) => item.cycle))].join(" / "),
+        Cultura: [...new Set(row.cultureBreakdown.map((item) => item.culture))].join(" / "),
         "Material padrão": row.standardMaterial,
         Material: location.material,
         Tipo: "Armazém",
@@ -8587,6 +8841,8 @@ export default function Home() {
       })),
       ...row.nucleusSupportLocations.map((location) => ({
         Núcleo: row.nucleus,
+        Ciclo: [...new Set(row.cultureBreakdown.map((item) => item.cycle))].join(" / "),
+        Cultura: [...new Set(row.cultureBreakdown.map((item) => item.culture))].join(" / "),
         "Material padrão": row.standardMaterial,
         Material: location.material,
         Tipo: "Apoio de outro núcleo",
@@ -8605,9 +8861,18 @@ export default function Home() {
       XLSX.utils.json_to_sheet(details),
       "Detalhes",
     );
+    const cultureRows = provision.rows.flatMap((row) => row.cultureBreakdown.map((item) => ({
+      Núcleo: row.nucleus,
+      Ciclo: item.cycle,
+      Cultura: item.culture,
+      "Princípio ativo": row.active,
+      "Material padrão": row.standardMaterial,
+      "Qtd. planejada": item.planned,
+    })));
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(cultureRows), "Planejado por cultura");
     XLSX.writeFile(
       workbook,
-      "provisionamento_" + evaluationDate + "_" + provisionUntil + ".xlsx",
+      "provisionamento_" + provisionCycle.toLowerCase() + "_" + provisionCulture.toLowerCase() + "_" + evaluationDate + "_" + provisionUntil + ".xlsx",
       { bookType: "xlsx" },
     );
   }
@@ -9172,6 +9437,7 @@ export default function Home() {
             tone="amber"
           />
         </div>
+        <PlanningApplicationCalendar rows={plans} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} />
       </section>
     );
   } else if (active === "Acompanhamento") {
@@ -16933,7 +17199,7 @@ export default function Home() {
                 </button>
               </div>
             </div>
-            <div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2">
+            <div className="grid gap-4 border-b border-slate-100 p-6 sm:grid-cols-2 xl:grid-cols-4">
               <label className="grid gap-1.5 text-sm font-medium">
                 Início
                 <input
@@ -16951,6 +17217,18 @@ export default function Home() {
                   type="date"
                   value={provisionUntil}
                 />
+              </label>
+              <label className="grid gap-1.5 text-sm font-medium">
+                Ciclo
+                <select className="rounded-lg border border-slate-200 px-3 py-2" value={provisionCycle} onChange={(event) => setProvisionCycle(event.target.value)}>
+                  {["Todos", "Safra", "Safrinha"].map((value) => <option key={value}>{value}</option>)}
+                </select>
+              </label>
+              <label className="grid gap-1.5 text-sm font-medium">
+                Cultura
+                <select className="rounded-lg border border-slate-200 px-3 py-2" value={provisionCulture} onChange={(event) => setProvisionCulture(event.target.value)}>
+                  {["Todas", "Soja", "Algodão", "Milho", ...filters.cultures.filter((value) => !["Todos", "Soja", "Algodão", "Milho"].includes(value) && !/^(SOJA|ALGODAO|MILHO)/.test(headerKey(value)))].map((value) => <option key={value}>{value}</option>)}
+                </select>
               </label>
             </div>
             <div className="grid gap-3 border-b border-slate-100 p-6 sm:grid-cols-5">
@@ -16974,14 +17252,16 @@ export default function Home() {
             <p className="px-6 py-3 text-xs text-slate-500">
               {provision.dated
                 ? "A demanda foi filtrada por DT_Aplicacao do planejamento."
-                : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas."}
+                : "Não foi encontrada data prevista reconhecida: a janela usa todas as linhas do filtro."}
+              {" "}O saldo físico, trânsito e pedidos são compartilhados por material e núcleo; o planejamento por cultura é exibido separadamente, sem duplicar disponibilidade.
             </p>
             <div className="min-h-0 flex-1 overflow-auto border-t border-slate-100">
-              <table className="w-full min-w-[1180px] text-left text-sm">
+              <table className="w-full min-w-[1380px] text-left text-sm">
                 <thead className="sticky top-0 bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
                   <tr>
                     {[
                       "Núcleo",
+                      "Ciclo / cultura",
                       "Princípio ativo",
                       "Material padrão",
                       "Demanda",
@@ -17001,6 +17281,14 @@ export default function Home() {
                     <Fragment key={row.id}>
                       <tr>
                         <td className="px-4 py-3 font-medium">{row.nucleus}</td>
+                        <td className="px-4 py-3">
+                          {row.cultureBreakdown.map((item) => (
+                            <div key={item.cycle + "|" + item.culture} className={cn("mb-1 rounded border-l-2 px-2 py-1 text-xs", calendarCycleTone(item.cycle))}>
+                              <strong>{item.culture}</strong> · {item.cycle}<br />
+                              Planejado: {formatNumber(item.planned)}
+                            </div>
+                          ))}
+                        </td>
                         <td className="px-4 py-3">{row.active}</td>
                         <td className="px-4 py-3 font-medium">
                           {row.standardMaterial}
@@ -17049,7 +17337,7 @@ export default function Home() {
                           <td className="py-2 pl-8 pr-4 text-slate-500">
                             {location.type}
                           </td>
-                          <td className="px-4 py-2 text-slate-500" colSpan={2}>
+                          <td className="px-4 py-2 text-slate-500" colSpan={3}>
                             {location.location}
                           </td>
                           <td className="px-4 py-2 text-slate-500" colSpan={2}>
@@ -17072,7 +17360,7 @@ export default function Home() {
                     <tr>
                       <td
                         className="px-4 py-10 text-center text-slate-500"
-                        colSpan={8}
+                        colSpan={9}
                       >
                         Não há demanda planejada para esta janela.
                       </td>
