@@ -102,6 +102,12 @@ function authorizeOrigin(user, workspace, originCode) {
 const allowed = (user, row) => user.role === "admin" || row.requester_id === user.id || row.agronomist_id === user.id ||
   (!!user.nucleus && [row.origin_nucleus, row.destination_nucleus].some((n) => norm(n) === norm(user.nucleus)));
 const canRecipe = (user, row) => user.role === "admin" || row.agronomist_id === user.id;
+const canRequestDeletion = (user, row) => !["deletion_pending", "deleted"].includes(row.stage) && (user.role === "admin" || row.requester_id === user.id);
+const directDeletion = (user, row) => user.role === "admin" && row.requester_id === user.id;
+const deletionApprover = (row) => row.payload.deletion?.approvalBy === "admin" ? "admin" : "creator";
+const canConfirmDeletion = (user, row) => row.stage === "deletion_pending" && !!row.payload.deletion &&
+  row.payload.deletion.requestedById !== user.id &&
+  (deletionApprover(row) === "admin" ? user.role === "admin" : row.requester_id === user.id);
 const actor = (user) => user.name || user.username;
 const entry = (user, action) => ({ actor: actor(user), action, at: new Date().toISOString() });
 async function load(db, id, user) {
@@ -115,7 +121,7 @@ async function list(db, user) {
       FROM agronexus_transfer_documents d WHERE d.transfer_id = t.id), '[]'::jsonb) AS documents
     FROM agronexus_transfers t ORDER BY t.created_at DESC`;
   return rows.filter((row) => allowed(user, row)).map((row) => ({
-    id: row.id, ...row.payload, stage: row.stage, status: STAGES[row.stage], agronomistId: row.agronomist_id,
+    id: row.id, ...row.payload, stage: row.stage, agronomistId: row.agronomist_id,
     originNucleus: row.origin_nucleus, destinationNucleus: row.destination_nucleus, documents: row.documents,
     createdAt: row.created_at, updatedAt: row.updated_at, revision: row.revision,
     isMine: row.requester_id === user.id,
@@ -123,8 +129,10 @@ async function list(db, user) {
     isIncoming: !!user.nucleus && norm(row.destination_nucleus) === norm(user.nucleus),
     isAssigned: row.agronomist_id === user.id,
     canEdit: user.role === "admin" && row.stage === "fiscal" && !row.documents.length,
-    canRequestDeletion: user.role === "admin" && !["deletion_pending", "deleted"].includes(row.stage) && row.requester_id !== user.id,
-    canConfirmDeletion: row.stage === "deletion_pending" && row.requester_id === user.id && row.payload.deletion?.requestedById !== user.id,
+    canRequestDeletion: canRequestDeletion(user, row),
+    canDeleteDirectly: canRequestDeletion(user, row) && directDeletion(user, row),
+    canConfirmDeletion: canConfirmDeletion(user, row),
+    status: row.stage === "deletion_pending" ? (deletionApprover(row) === "admin" ? "Exclusão aguardando administrador" : "Exclusão aguardando solicitante") : STAGES[row.stage],
     canFiscal: user.role === "admin" && row.stage === "fiscal",
     canRecipe: canRecipe(user, row) && row.stage === "recipe",
   }));
@@ -200,18 +208,20 @@ export default async function handler(req, res) {
       const requesting = body.action === "requestDeletion";
       const confirming = body.action === "confirmDeletion";
       const deletion = row.payload.deletion;
+      const direct = requesting && directDeletion(user, row);
       if (requesting) {
-        if (user.role !== "admin" || ["deletion_pending", "deleted"].includes(row.stage)) fail("Exclusão não permitida.", 403);
-        if (row.requester_id === user.id) fail("Outro administrador deve iniciar a exclusão de uma solicitação criada por você.", 403);
-      } else if (row.stage !== "deletion_pending" || row.requester_id !== user.id || deletion?.requestedById === user.id) fail("Somente o usuário que criou a solicitação pode confirmar ou recusar esta exclusão.", 403);
+        if (!canRequestDeletion(user, row)) fail("Exclusão não permitida.", 403);
+      } else if (!canConfirmDeletion(user, row)) fail("Somente o responsável pela aprovação pode confirmar ou recusar esta exclusão.", 403);
       const reason = clean(body.reason, 1000);
       if (requesting && !reason) fail("Informe o motivo da exclusão.");
-      const next = requesting ? "deletion_pending" : confirming ? "deleted" : deletion.previousStage;
+      const next = requesting ? (direct ? "deleted" : "deletion_pending") : confirming ? "deleted" : deletion.previousStage;
       if (!["fiscal", "recipe", "done", "deletion_pending", "deleted"].includes(next)) fail("Estado inválido.", 409);
+      const now = new Date().toISOString();
+      const requestedDeletion = { requestedById: user.id, requestedBy: actor(user), requestedAt: now, previousStage: row.stage, reason, approvalBy: direct ? "self" : user.role === "admin" ? "creator" : "admin" };
       const payload = { ...row.payload,
-        deletion: requesting ? { requestedById: user.id, requestedBy: actor(user), requestedAt: new Date().toISOString(), previousStage: row.stage, reason }
-          : { ...deletion, decidedBy: actor(user), decidedAt: new Date().toISOString(), decision: confirming ? "confirmed" : "rejected" },
-        history: [...(row.payload.history || []), entry(user, requesting ? "Exclusão solicitada: " + reason : confirming ? "Exclusão confirmada pelo solicitante (registro arquivado)" : "Exclusão recusada pelo solicitante; fluxo restaurado")]
+        deletion: requesting ? (direct ? { ...requestedDeletion, decidedBy: actor(user), decidedById: user.id, decidedAt: now, decision: "confirmed" } : requestedDeletion)
+          : { ...deletion, decidedBy: actor(user), decidedById: user.id, decidedAt: now, decision: confirming ? "confirmed" : "rejected" },
+        history: [...(row.payload.history || []), entry(user, requesting ? (direct ? "Exclusão direta pelo administrador criador: " : "Exclusão solicitada: ") + reason : confirming ? "Exclusão confirmada pelo responsável (registro arquivado)" : "Exclusão recusada pelo responsável; fluxo restaurado")]
       };
       const changed = await db`UPDATE agronexus_transfers SET stage = ${next}, payload = ${JSON.stringify(payload)}::jsonb, revision = revision + 1, updated_at = NOW()
         WHERE id = ${row.id} AND stage = ${row.stage} AND revision = ${row.revision} RETURNING id`;
