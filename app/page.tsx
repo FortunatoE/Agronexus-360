@@ -1600,7 +1600,101 @@ type ApplicationCalendarEvent = {
   operation: string;
   products: Set<string>;
   fields: Set<string>;
+  sourceRows: Row[];
 };
+
+type CalendarApplicationDetail = {
+  id: string;
+  farm: string;
+  field: string;
+  activity: string;
+  material: string;
+  unit: string;
+  volume: number;
+  knownVolumes: number;
+  missingVolumes: number;
+  dose: number | null;
+  dap: number | null;
+  estimatedDose: boolean;
+  estimatedDap: boolean;
+};
+
+function calendarSourceValue(row: Row, compactKey: string, ...aliases: string[]) {
+  if (row._c === 1) return row[compactKey];
+  for (const alias of aliases) {
+    const key = Object.keys(row).find((name) => headerKey(name) === headerKey(alias));
+    const value = key === undefined ? undefined : row[key];
+    if (value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) return value;
+  }
+  return undefined;
+}
+
+function calendarNumeric(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (!/^[+-]?\d[\d.,\s]*$/.test(String(value ?? "").trim())) return null;
+  return numberFrom(value);
+}
+
+function calendarFarmField(row: Row) {
+  const wbs = readText(row, "WBS element", "WBS", "Elemento PEP");
+  const parts = wbs.split(".");
+  const farm = String(calendarSourceValue(row, "fa", "Fazenda", "Nome Fazenda") ?? "").trim()
+    || readText(row, "Fazenda", "Centro") || parts[1] || "Não informada";
+  const field = readText(row, "Talhão", "Talhao")
+    || parts.slice(3).join(".") || (parts[2] || "").split("-").slice(1).join("-") || "Não informado";
+  return { farm, field };
+}
+
+function calendarApplicationDetails(event: ApplicationCalendarEvent, dimensions: DimensionBundle, byField: boolean) {
+  const values = new Map<string, CalendarApplicationDetail>();
+  event.sourceRows.forEach((row, index) => {
+    const { farm, field } = calendarFarmField(row);
+    const product = productFor(row, "planning", dimensions);
+    const activity = readText(row, "Atividade", "Operação", "Tar.") || event.operation;
+    const unit = String(calendarSourceValue(row, "um", ...sapUnitHeaders) ?? "").trim();
+    let volume = calendarNumeric(calendarSourceValue(row, "q", "Qtde. talhão", "Qtde talhão", "Quantidade"));
+    // Older compacted rows may have stored an already adjusted volume in q.
+    // Never present ambiguous standardized volume as the original material.
+    if (row._c === 1 && row.qr !== 1 && product.canonicalKey !== normalizeMaterial(product.rawName)
+      && volume !== null && volume === calendarNumeric(row.aq)) volume = null;
+    let dose = calendarNumeric(calendarSourceValue(row, "dp", "Dose planejada", "Dose", "Dose por ha", "Dose/ha"));
+    let estimatedDose = false;
+    const area = planningArea(row);
+    if (dose === null && volume !== null && area > 0) {
+      dose = volume / area;
+      estimatedDose = true;
+    }
+    let dap = calendarNumeric(calendarSourceValue(row, "dap", "DAP planejado", "DAP", "Dias após plantio", "Dias apos plantio", "Dias"));
+    let estimatedDap = false;
+    if (dap === null) {
+      const planted = plannedApplicationDate({ DT_Aplicacao: readText(row, "DT_Plantio", "Data de plantio", "Data Plantio", "Dt. Plantio", "Plantio") });
+      const application = plannedApplicationDate(row);
+      if (planted && application) {
+        const day = (date: Date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+        dap = (day(application) - day(planted)) / 86400000;
+        estimatedDap = true;
+      }
+    }
+    // Different doses, DAPs or units must not be averaged or summed together.
+    // Missing farm/field information must not merge unrelated source records.
+    const key = JSON.stringify([farm, byField ? field : "", activity, product.rawName, unit, dose, dap,
+      farm === "Não informada" || (byField && field === "Não informado") ? index : null]);
+    const item = values.get(key) || {
+      id: key, farm, field: byField ? field : "", activity, material: product.rawName, unit,
+      volume: 0, knownVolumes: 0, missingVolumes: 0, dose, dap, estimatedDose: false, estimatedDap: false,
+    };
+    if (volume === null) item.missingVolumes += 1;
+    else { item.volume += volume; item.knownVolumes += 1; }
+    item.estimatedDose ||= estimatedDose;
+    item.estimatedDap ||= estimatedDap;
+    values.set(key, item);
+  });
+  return [...values.values()].sort((a,b) => a.farm.localeCompare(b.farm, "pt-BR", { numeric: true }) || a.field.localeCompare(b.field, "pt-BR", { numeric: true }) || a.activity.localeCompare(b.activity) || a.material.localeCompare(b.material) || (a.dap ?? 0) - (b.dap ?? 0));
+}
+
+function calendarDetailNumber(value: number) {
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 6 }).format(value);
+}
 
 function calendarCycleTone(cycle: string) {
   return cycle === "Safra"
@@ -1633,6 +1727,9 @@ function PlanningApplicationCalendar({
   const [culture, setCulture] = useState("Todas");
   const [nucleus, setNucleus] = useState("Todos");
   const [search, setSearch] = useState("");
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [byField, setByField] = useState(false);
+  const closeDetailRef = useRef<HTMLButtonElement>(null);
   const data = useMemo(() => {
     const entries = new Map<string, ApplicationCalendarEvent>();
     const cultures = new Set<string>();
@@ -1654,14 +1751,12 @@ function PlanningApplicationCalendar({
       const id = JSON.stringify([day, season, crop, unit, operation]);
       const event = entries.get(id) || {
         id, day, cycle: season, culture: crop, nucleus: unit, operation,
-        products: new Set<string>(), fields: new Set<string>(),
+        products: new Set<string>(), fields: new Set<string>(), sourceRows: [],
       };
       event.products.add(product.rawName);
-      const field = readText(row, "Talhão", "Talhao");
-      if (field) {
-        const farm = readText(row, "Fazenda", "Centro") || readText(row, "WBS element", "WBS").split(".")[1] || "";
-        event.fields.add([farm, field].filter(Boolean).join(" / "));
-      }
+      event.sourceRows.push(row);
+      const { farm, field } = calendarFarmField(row);
+      if (field !== "Não informado") event.fields.add([farm, field].join(" / "));
       entries.set(id, event);
     });
     return {
@@ -1698,11 +1793,25 @@ function PlanningApplicationCalendar({
     ? cursor.toLocaleDateString("pt-BR", { month: "long", year: "numeric" })
     : shortDate(first) + " – " + shortDate(calendarAddDays(first, 6)) + " de " + calendarAddDays(first, 6).getFullYear();
   const today = dateKey(new Date());
-  const changeDate = (next: Date) => { setCursor(next); setSelectedDay(dateKey(next)); };
+  const changeDate = (next: Date) => { setCursor(next); setSelectedDay(dateKey(next)); setSelectedEventId(null); };
   const move = (direction: number) => changeDate(view === "Semanal" ? calendarAddDays(cursor, direction * 7) : new Date(year + (view === "Anual" ? direction : 0), view === "Anual" ? month : month + direction, 1));
   const chooseDay = (date: Date) => changeDate(date);
   const monthName = (date: Date) => date.toLocaleDateString("pt-BR", { month: "long" });
   const visibleEvents = filtered.days.get(selectedDay) || [];
+  const selectedEvent = visibleEvents.find((event) => event.id === selectedEventId);
+  const detailRows = useMemo(() => selectedEvent ? calendarApplicationDetails(selectedEvent, dimensions, byField) : [], [selectedEvent, dimensions, byField]);
+  const openEvent = (event: ApplicationCalendarEvent) => {
+    setSelectedDay(event.day);
+    setSelectedEventId(event.id);
+    setByField(false);
+  };
+  useEffect(() => {
+    if (!selectedEventId) return;
+    closeDetailRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setSelectedEventId(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedEventId]);
   return (
     <div className="mt-6 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-5">
@@ -1764,7 +1873,7 @@ function PlanningApplicationCalendar({
                   <button type="button" className={cn("mb-2 flex w-full items-center justify-between gap-1 rounded px-1 py-1 text-left text-xs font-semibold", key === today ? "text-emerald-700" : "text-slate-600")} onClick={() => chooseDay(date)}><span>{String(date.getDate()).padStart(2,"0")}/{String(date.getMonth()+1).padStart(2,"0")}{key === today ? " · Hoje" : ""}</span><span>{events.length || ""}</span></button>
                   <div className="space-y-1">
                     {events.slice(0,limit).map((event) => (
-                      <button key={event.id} type="button" onClick={() => chooseDay(date)} title={event.operation + " · " + [...event.products].join(", ")} className={cn("block w-full overflow-hidden rounded-md border-l-2 px-2 py-1.5 text-left text-xs", calendarCycleTone(event.cycle))}>
+                      <button key={event.id} type="button" onClick={() => openEvent(event)} title={event.operation + " · " + [...event.products].join(", ") + " · Ver planejamento"} className={cn("block w-full overflow-hidden rounded-md border-l-2 px-2 py-1.5 text-left text-xs", calendarCycleTone(event.cycle))}>
                         <span className="block truncate font-semibold">{event.operation}</span>
                         <span className="block truncate">{event.culture} · {event.cycle}</span>
                         <span className="block truncate opacity-80">{event.nucleus}</span>
@@ -1789,14 +1898,54 @@ function PlanningApplicationCalendar({
           <h4 className="font-semibold">Aplicações de {new Date(selectedDay + "T00:00:00").toLocaleDateString("pt-BR")} <span className="text-xs font-normal text-slate-500">· {visibleEvents.length} grupos</span></h4>
           <div className="mt-3 grid gap-2 lg:grid-cols-2">
             {visibleEvents.map((event) => (
-              <details key={event.id} className={cn("rounded-lg border-l-4 p-3 text-sm", calendarCycleTone(event.cycle))}>
-                <summary className="cursor-pointer font-semibold">{event.operation} · {event.culture} · {event.cycle} · {event.nucleus}</summary>
-                <p className="mt-2 text-xs"><strong>Produtos:</strong> {[...event.products].sort().join(", ")}</p>
-                <p className="mt-2 text-xs"><strong>Fazendas / talhões ({event.fields.size}):</strong> {[...event.fields].sort().join("; ") || "Não informado"}</p>
-              </details>
+              <button key={event.id} type="button" onClick={() => openEvent(event)} className={cn("rounded-lg border-l-4 p-3 text-left text-sm hover:ring-1 hover:ring-emerald-600", calendarCycleTone(event.cycle))}>
+                <span className="block font-semibold">{event.operation} · {event.culture} · {event.cycle} · {event.nucleus}</span>
+                <span className="mt-2 block text-xs"><strong>Produtos:</strong> {[...event.products].sort().join(", ")}</span>
+                <span className="mt-2 block text-xs font-semibold">Ver planejamento · {event.fields.size} talhões identificados</span>
+              </button>
             ))}
             {!visibleEvents.length && <p className="text-sm text-slate-500">Sem aplicações para este dia e filtros.</p>}
           </div>
+        </div>
+      )}
+      {selectedEvent && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-3 sm:p-6" onClick={() => setSelectedEventId(null)}>
+          <section role="dialog" aria-modal="true" aria-labelledby="calendar-application-title" className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={(event) => event.stopPropagation()}>
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-200 p-4 sm:p-6">
+              <div>
+                <h3 id="calendar-application-title" className="text-lg font-semibold">{selectedEvent.operation}</h3>
+                <p className="mt-1 text-sm text-slate-600">{new Date(selectedEvent.day + "T00:00:00").toLocaleDateString("pt-BR")} · {selectedEvent.nucleus} · {selectedEvent.culture} · {selectedEvent.cycle}</p>
+                <p className="mt-1 text-xs text-slate-500">{byField ? "Detalhamento por talhão" : "Resumo por fazenda"} · {detailRows.length} linhas</p>
+              </div>
+              <button ref={closeDetailRef} type="button" aria-label="Fechar planejamento" onClick={() => setSelectedEventId(null)} className="rounded-lg border border-slate-200 p-2"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 sm:px-6">
+              <span className="text-xs text-slate-600">Volumes do material originalmente planejado. Doses e DAP diferentes ficam em linhas separadas.</span>
+              <button type="button" onClick={() => setByField(!byField)} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white">{byField ? "Voltar ao resumo por fazenda" : "Ver mais detalhes · Por talhão"}</button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              <table className="w-full min-w-[850px] text-left text-sm">
+                <thead className="sticky top-0 bg-slate-50 text-xs uppercase tracking-wide text-slate-600">
+                  <tr>{["Fazenda", ...(byField ? ["Talhão"] : []), "Atividade", "Material", "Volume", "Dose", "DAP planejado"].map((head) => <th key={head} className="px-4 py-3 font-semibold">{head}</th>)}</tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {detailRows.map((row) => (
+                    <tr key={row.id}>
+                      <td className="px-4 py-3 font-medium">{row.farm}</td>
+                      {byField && <td className="whitespace-nowrap px-4 py-3 font-medium">{row.field}</td>}
+                      <td className="px-4 py-3">{row.activity}</td>
+                      <td className="px-4 py-3">{row.material}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.knownVolumes ? calendarDetailNumber(row.volume) + (row.unit ? " " + row.unit : "") : "—"}{row.missingVolumes > 0 && <span className="block text-xs text-amber-700">{row.missingVolumes} sem volume original</span>}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.dose === null ? "—" : calendarDetailNumber(row.dose) + (row.unit ? " " + row.unit + "/ha" : "")}{row.estimatedDose && <span className="block text-xs text-slate-500">Calculada</span>}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.dap === null ? "—" : calendarDetailNumber(row.dap)}{row.estimatedDap && <span className="block text-xs text-slate-500">Calculado</span>}</td>
+                    </tr>
+                  ))}
+                  {!detailRows.length && <tr><td colSpan={byField ? 7 : 6} className="px-4 py-8 text-center text-slate-500">Nenhum registro de planejamento.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+            <p className="border-t border-slate-200 px-4 py-3 text-xs text-slate-500 sm:px-6">Dose e DAP são lidos do arquivo quando disponíveis. Na ausência desses campos, são calculados a partir de volume/área e data de aplicação menos data de plantio, quando possível. DAP negativo indica aplicação anterior ao plantio. Reimporte o planejamento para recuperar campos não preservados nas cargas antigas.</p>
+          </section>
         </div>
       )}
     </div>

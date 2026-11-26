@@ -132,6 +132,23 @@ export function compactOperationalRow(row: OperationalRow, source: CompactSource
     assign("q", ...quantityFields[quantitySource]);
   }
   assign("aq", "Volume ajustado (produto) padrão", "Volume ajustado (produto) padrao");
+  if (source === "planning") {
+    // Campos de rastreabilidade do calendário; não alteram a conciliação.
+    const exact = (...aliases: string[]) => {
+      for (const alias of aliases) {
+        const value = values.get(headerKey(alias));
+        if (value !== undefined && value !== null && (typeof value === "number" || String(value).trim())) return value;
+      }
+      return undefined;
+    };
+    const dose = exact("Dose planejada", "Dose", "Dose por ha", "Dose/ha");
+    const dap = exact("DAP planejado", "DAP", "Dias após plantio", "Dias apos plantio", "Dias");
+    const farm = exact("Fazenda", "Nome Fazenda");
+    if (dose !== undefined) compact.dp = dose;
+    if (dap !== undefined) compact.dap = dap;
+    if (farm !== undefined) compact.fa = farm;
+    assign("um", ...sapUnitHeaders);
+  }
   assign("c", "Material", "Código material", "Codigo material", "MAT");
   assign("w", "WBS element", "WBS", "Elemento PEP", "Elemento WBS", "Def.proj.", "Def proj", "Projeto");
   assign("ce", "Cen.", "Centro", "CEN", "Fazenda", "Nome Fazenda");
