@@ -2,6 +2,7 @@ import { neon } from "@neondatabase/serverless";
 import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { currentUser, listUsers, sendError } from "./_core.js";
+import { sapLotHeaders, sapUnitHeaders } from "../lib/sap-logistics-fields.mjs";
 
 const STAGES = { fiscal: "Aguardando notas fiscais", recipe: "Aguardando receituário", done: "Concluída" };
 const DOC_TYPES = ["devolucao", "transferencia", "receituario"];
@@ -27,17 +28,76 @@ async function schema(db) {
   return ready;
 }
 
-async function centers(db) {
+async function readCentral(db) {
   const rows = await db`SELECT payload FROM agronexus_platform_workspace WHERE workspace_key = 'operacional' LIMIT 1`;
   let workspace = rows[0]?.payload;
   if (workspace?.encoding === "gzip-base64") workspace = JSON.parse(gunzipSync(Buffer.from(workspace.data, "base64url")).toString("utf8"));
   else if (workspace?.encoding === "json") workspace = workspace.data;
+  return workspace;
+}
+
+function centersFrom(workspace) {
   const result = { FNA1: "NC-NSA", FAV1: "NC-AGV", FBE1: "NC-BES", ...(workspace?.bundle?.centerToNucleus || {}) };
   for (const item of workspace?.dimensionPremises || []) {
     if (["CENTRO", "FAZENDA"].includes(norm(item.domain)) && item.key && item.value) result[norm(item.key)] = item.value;
   }
   return Object.entries(result).filter(([code, nucleus]) => /^[A-Z0-9]{4}$/.test(code) && String(nucleus).startsWith("NC-")).map(([code, nucleus]) => ({ code, nucleus: String(nucleus).replace("NC-VER", "NC-AGV") })).sort((a,b) => a.code.localeCompare(b.code));
 }
+async function centers(db) { return centersFrom(await readCentral(db)); }
+
+function stockValue(row, compact, aliases) {
+  if (row._c === 1) return row[compact];
+  const values = new Map(Object.entries(row).map(([key, value]) => [norm(key), value]));
+  for (const alias of aliases) {
+    const value = values.get(norm(alias));
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return undefined;
+}
+function stockQuantity(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const raw = String(value ?? "").trim().replace(/\s/g, "");
+  if (!/^-?\d+(?:[.,]\d+)*$/.test(raw)) return null;
+  const normalized = raw.includes(",") ? raw.replace(/\./g, "").replace(",", ".") : /^-?\d{1,3}(?:\.\d{3})+$/.test(raw) ? raw.replace(/\./g, "") : raw;
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? amount : null;
+}
+function stockOptions(workspace, origin) {
+  // ZMM_BATCH exclusively: never substitute MB52, aggregate material or converted balances.
+  const rows = Array.isArray(workspace?.datasets?.estoque) ? workspace.datasets.estoque : [];
+  const grouped = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const read = (compact, aliases) => clean(stockValue(row, compact, aliases));
+    const center = norm(read("ce", ["Cen.", "Centro", "CEN", "Fazenda"]));
+    if (center !== origin) continue;
+    const code = read("c", ["Material", "Código material", "Codigo material", "MAT", "CD MAT"]);
+    const material = read("p", ["Texto breve material", "INSUMO", "Descrição material", "Descricao material", "Produto"]);
+    const lot = read("lot", sapLotHeaders);
+    const depot = read("d", ["Dep.", "Depósito", "Deposito", "DEP"]);
+    const unit = read("um", sapUnitHeaders);
+    const expiry = read("ex", ["Dt. Validade", "Dt Validade", "Data de validade", "Data Validade", "Validade"]);
+    const available = stockQuantity(stockValue(row, "q", ["Util.livre", "Utilização livre", "Utilizacao livre", "EST", "Estoque"]));
+    if (!code || !material || !lot || !unit || !depot || available === null) continue;
+    const key = JSON.stringify([center, depot, code, lot, unit]);
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.available += available;
+      if (existing.expiry !== expiry) existing.expiry = "";
+      if (existing.material !== material) existing.ambiguous = true;
+    } else grouped.set(key, { key, center, depot, code, material, lot, unit, expiry, available, ambiguous: false });
+  }
+  return [...grouped.values()].filter((item) => item.available > 0 && !item.ambiguous).map(({ ambiguous, ...item }) => item)
+    .sort((a,b) => a.material.localeCompare(b.material, "pt-BR") || a.lot.localeCompare(b.lot) || a.depot.localeCompare(b.depot));
+}
+
+function authorizeOrigin(user, workspace, originCode) {
+  const origin = centersFrom(workspace).find((unit) => unit.code === norm(originCode));
+  if (!origin) fail("Unidade de origem não cadastrada.");
+  if (user.role !== "admin" && (!user.nucleus || norm(user.nucleus) !== norm(origin.nucleus))) fail("Você só pode solicitar pela unidade do seu núcleo.", 403);
+  return origin;
+}
+
 const allowed = (user, row) => user.role === "admin" || row.requester_id === user.id || row.agronomist_id === user.id ||
   (!!user.nucleus && [row.origin_nucleus, row.destination_nucleus].some((n) => norm(n) === norm(user.nucleus)));
 const canRecipe = (user, row) => user.role === "admin" || row.agronomist_id === user.id;
@@ -79,6 +139,11 @@ export default async function handler(req, res) {
         res.setHeader("Content-Disposition", "attachment; filename*=UTF-8''" + encodeURIComponent(files[0].name));
         return res.status(200).send(Buffer.from(files[0].data, "base64"));
       }
+      if (req.query?.origin) {
+        const workspace = await readCentral(db);
+        const origin = authorizeOrigin(user, workspace, req.query.origin);
+        return res.status(200).json({ options: stockOptions(workspace, origin.code), importedAt: workspace?.imports?.estoque?.importedAt || null });
+      }
       const units = await centers(db);
       const assignees = user.role === "admin" ? (await listUsers()).map((u) => ({ id: u.id, name: u.name, username: u.username })) : [];
       return res.status(200).json({ rows: await list(db, user), units, assignees });
@@ -86,22 +151,26 @@ export default async function handler(req, res) {
     if (req.method !== "POST") { res.setHeader("Allow", "GET, POST"); return sendError(res, 405, "Método não permitido."); }
     const body = req.body || {};
     if (body.action === "create") {
-      const units = await centers(db);
-      const origin = units.find((u) => u.code === norm(body.origin));
-      const destination = units.find((u) => u.code === norm(body.destination));
-      if (!origin || !destination || origin.code === destination.code) fail("Selecione origem e destino diferentes e cadastrados.");
-      if (user.role !== "admin" && (!user.nucleus || norm(user.nucleus) !== norm(origin.nucleus))) fail("Você só pode solicitar pela unidade do seu núcleo.", 403);
+      const workspace = await readCentral(db);
+      const origin = authorizeOrigin(user, workspace, body.origin);
+      const destination = centersFrom(workspace).find((u) => u.code === norm(body.destination));
+      if (!destination || origin.code === destination.code) fail("Selecione origem e destino diferentes e cadastrados.");
       const requester = clean(body.requester);
       if (!requester) fail("Informe o solicitante.");
       if (!Array.isArray(body.items) || !body.items.length || body.items.length > 100) fail("Informe de 1 a 100 materiais.");
+      const available = new Map(stockOptions(workspace, origin.code).map((item) => [item.key, item]));
+      const requested = new Map();
       const items = body.items.map((item) => {
-        const code = clean(item.code, 40), material = clean(item.material, 200), lot = clean(item.lot, 100), unit = clean(item.unit, 15);
+        const stock = available.get(String(item.stockKey || ""));
         const quantity = Number(item.quantity);
-        if (!code || !material || !lot || !unit || !Number.isFinite(quantity) || quantity <= 0) fail("Preencha código, material, lote, unidade e quantidade positiva em todos os itens.");
-        return { id: randomUUID(), code, material, lot, unit, quantity };
+        if (!stock || !Number.isFinite(quantity) || quantity <= 0) fail("Selecione um lote disponível da ZMM_BATCH e informe quantidade positiva.");
+        const total = (requested.get(stock.key) || 0) + quantity;
+        if (total - stock.available > 0.000001) fail("Quantidade solicitada supera o saldo físico do lote " + stock.lot + " (" + stock.material + " / " + stock.depot + ").");
+        requested.set(stock.key, total);
+        return { id: randomUUID(), code: stock.code, material: stock.material, lot: stock.lot, unit: stock.unit, depot: stock.depot, expiry: stock.expiry, availableAtRequest: stock.available, quantity, stockKey: stock.key };
       });
       const id = randomUUID();
-      const payload = { origin: origin.code, destination: destination.code, requester, createdBy: actor(user), observation: clean(body.observation, 4000), items, history: [entry(user, "Solicitação registrada")] };
+      const payload = { origin: origin.code, destination: destination.code, requester, createdBy: actor(user), observation: clean(body.observation, 4000), stockSource: "ZMM_BATCH", stockImportedAt: workspace?.imports?.estoque?.importedAt || null, items, history: [entry(user, "Solicitação registrada")] };
       await db`INSERT INTO agronexus_transfers (id, origin_nucleus, destination_nucleus, requester_id, payload) VALUES (${id}, ${origin.nucleus}, ${destination.nucleus}, ${user.id}, ${JSON.stringify(payload)}::jsonb)`;
       return res.status(201).json({ id });
     }
