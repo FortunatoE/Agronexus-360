@@ -42,6 +42,7 @@ import {
   type CommercialDeliveryTrackingRow,
 } from "@/components/commercial-delivery-tracker";
 import { DimensionUpload } from "@/components/dimension-upload";
+import { FarmTransfers } from "@/components/farm-transfers";
 import {
   emptyDimensionBundle,
   normalizeMaterial,
@@ -1127,6 +1128,7 @@ const nav = [
   ["Execução", PackageSearch],
   ["Importações", FileUp],
   ["Logística", Truck],
+  ["Transferências", Truck],
   ["Fechamentos", BarChart3],
   ["Alertas", Bell],
   ["Tarefas", ClipboardCheck],
@@ -16546,6 +16548,10 @@ export default function Home() {
         </div>
       </section>
     );
+  }
+
+  if (active === "Transferências" && currentUser) {
+    content = <FarmTransfers key={currentUser.id} user={currentUser} />;
   }
 
   if (active === "Importações" && currentUser?.role !== "admin") {
