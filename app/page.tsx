@@ -2030,7 +2030,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
       seen.add(order.key);
       const p = productFor({ Produto: order.product }, "planning", dimensions);
       const center = normalizeMaterial(order.center);
-      const unit = center === "0714" ? "ARMAZÉM" : dimensions.centerToNucleus[center] || farmToNucleus[center];
+      const unit = /^0*714$/.test(center) ? "ARMAZÉM" : dimensions.centerToNucleus[center] || farmToNucleus[center];
       if (!unit || !p.resolvedByDimension || !order.unit || order.unit === "—") { unlinked += 1; continue; }
       const id = p.canonicalKey + "|" + normalizeMaterial(unit);
       const current = purchase.get(id) || { amount: 0, dates: [], missing: 0 };
