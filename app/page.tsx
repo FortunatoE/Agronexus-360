@@ -1961,7 +1961,18 @@ function commercialDestinationNucleus(destination: string, dimensions: Dimension
   if (/^0*714$/.test(key) || key==="ARMAZEM") return "ARMAZÉM";
   return dimensions.centerToNucleus[key] || farmToNucleus[key] || (/^NC-/i.test(destination.trim()) ? destination.trim().toUpperCase().replace("NC-VER","NC-AGV") : "");
 }
-type DapPlanLine = { row: Row; id: string; nucleus: string; cycle: string; culture: string; dap: number | null; date: string; amount: number; applied: number; match: string };
+type DapPlanLine = { row: Row; id: string; nucleus: string; cycle: string; culture: string; dap: number | null; date: string; amount: number; applied: number; match: string; cohort: string; fieldKey: string };
+function dapConsumptionCohort(id:string,cycle:string,culture:string) {
+  return JSON.stringify([id,normalizeMaterial(cycle),normalizeMaterial(culture)]);
+}
+function dapConsumptionField(row:Row,cohort:string) {
+  const wbs=readText(row,"WBS element","WBS","Elemento PEP","Def.proj.");
+  const parts=wbs.split(".");
+  // Prefer the same farm and field segments as SAP; never match a field number alone.
+  const farm=normalizeMaterial(parts[1]||readText(row,"Fazenda","Centro","Cen."));
+  const field=normalizeMaterial(parts[3]||readText(row,"Talhão","Talhao"));
+  return farm&&field?JSON.stringify([cohort,farm,field]):"";
+}
 function plannedDap(row: Row) {
   const explicit = calendarNumeric(calendarSourceValue(row, "dap", "DAP planejado", "DAP", "Dias após plantio", "Dias apos plantio", "Dias"));
   if (explicit !== null) return explicit;
@@ -2004,32 +2015,74 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const base = useMemo(() => {
     const lines: DapPlanLine[] = [];
     const groups = new Map<string, DapPlanLine[]>();
+    const cohorts = new Map<string,DapPlanLine[]>();
+    const fields = new Map<string,DapPlanLine[]>();
     for (const row of plans) {
       const product = productFor(row, "planning", dimensions);
       if (product.rawName === "Sem descrição") continue;
       const amount = standardQuantity(row, "planning", product, dimensions);
       if (!(amount > 0)) continue;
       const unit = planningNucleusFor(row, dimensions, farmToNucleus);
-      const match = dapOperationMatch(row, product.canonicalKey);
+      const id=product.canonicalKey+"|"+normalizeMaterial(unit);
+      const season=cycleFor(row,dimensions), crop=applicationCulture(row);
+      const cohort=dapConsumptionCohort(id,season,cultureFor(row));
+      const operationKey=dapOperationMatch(row,product.canonicalKey);
+      const match=operationKey?JSON.stringify([cohort,operationKey]):"";
+      const fieldKey=dapConsumptionField(row,cohort);
       const date = plannedApplicationDate(row);
-      const line = { row, id: product.canonicalKey + "|" + normalizeMaterial(unit), nucleus: unit, cycle: cycleFor(row, dimensions), culture: applicationCulture(row), dap: plannedDap(row), date: date ? dateKey(date) : "", amount, applied: 0, match };
+      const line = { row,id,nucleus:unit,cycle:season,culture:crop,dap:plannedDap(row),date:date?dateKey(date):"",amount,applied:0,match,cohort,fieldKey };
       lines.push(line);
-      if (match) { const list = groups.get(match) || []; list.push(line); groups.set(match, list); }
+      const add=(map:Map<string,DapPlanLine[]>,key:string)=>{if(!key)return;const list=map.get(key)||[];list.push(line);map.set(key,list);};
+      add(groups,match);add(cohorts,cohort);add(fields,fieldKey);
     }
     const used = new Map<string, number>();
-    let unmatched = 0;
+    const fieldUsed=new Map<string,number>();
+    const cohortNet=new Map<string,number>();
+    const residualByCohort=new Map<string,number>();
+    let unmatched=0;
+    const addNet=(map:Map<string,number>,key:string,amount:number)=>{if(key)map.set(key,(map.get(key)||0)+amount);};
     for (const row of consumption) {
-      const p = productFor(row, "consumption", dimensions);
-      const key = dapOperationMatch(row, p.canonicalKey);
-      const amount = standardQuantity(row, "consumption", p, dimensions);
-      const candidates = groups.get(key);
-      if (!key || !candidates?.length || new Set(candidates.map((line) => JSON.stringify([line.id,line.cycle,line.culture,line.dap,line.date]))).size !== 1) { if (amount !== 0) unmatched += 1; continue; }
-      used.set(key, (used.get(key) || 0) + amount);
+      const p=productFor(row,"consumption",dimensions);
+      if(p.rawName==="Sem descrição")continue;
+      const amount=standardQuantity(row,"consumption",p,dimensions);
+      if(!amount)continue;
+      const id=p.canonicalKey+"|"+normalizeMaterial(consumptionNucleusFor(row,dimensions,farmToNucleus));
+      const cohort=dapConsumptionCohort(id,cycleFor(row,dimensions),cultureFor(row));
+      const operationKey=dapOperationMatch(row,p.canonicalKey);
+      const key=operationKey?JSON.stringify([cohort,operationKey]):"";
+      const fieldKey=dapConsumptionField(row,cohort);
+      addNet(cohortNet,cohort,amount);addNet(fieldUsed,fieldKey,amount);
+      if(!key||!groups.has(key)){unmatched++;continue;}
+      addNet(used,key,amount);
     }
-    for (const [key, amount] of used) {
-      const candidates = groups.get(key)!;
-      const total = candidates.reduce((sum, line) => sum + line.amount, 0);
-      for (const line of candidates) line.applied = Math.max(0, Math.min(line.amount, amount * line.amount / total));
+    const uniqueSchedule=(candidates:DapPlanLine[])=>new Set(candidates.map(line=>JSON.stringify([line.id,line.cycle,line.culture,line.dap,line.date,line.match]))).size===1;
+    const allocate=(candidates:DapPlanLine[],amount:number)=>{
+      const total=candidates.reduce((sum,line)=>sum+Math.max(0,line.amount-line.applied),0);
+      const take=Math.min(total,Math.max(0,amount));
+      if(total>0)for(const line of candidates)line.applied+=take*Math.max(0,line.amount-line.applied)/total;
+    };
+    // Exact operation first; aggregate signed postings before clamping.
+    for(const [key,amount] of used){
+      const candidates=groups.get(key)!;
+      if(uniqueSchedule(candidates))allocate(candidates,amount);
+    }
+    // Net reversals in the cohort cannot leave more attributed than consumed.
+    for(const [cohort,candidates] of cohorts){
+      const net=Math.max(0,cohortNet.get(cohort)||0);
+      const exact=candidates.reduce((sum,line)=>sum+line.applied,0);
+      if(exact>net&&exact>0)for(const line of candidates)line.applied*=net/exact;
+      residualByCohort.set(cohort,Math.max(0,net-Math.min(net,exact)));
+    }
+    // Field fallback only where the schedule is unique. Never assign a DAP
+    // from a nucleus-wide total, and never reuse a previously allocated amount.
+    for(const [key,candidates] of fields){
+      if(!uniqueSchedule(candidates))continue;
+      const cohort=candidates[0].cohort;
+      const before=candidates.reduce((sum,line)=>sum+line.applied,0);
+      const available=Math.min(residualByCohort.get(cohort)||0,Math.max(0,(fieldUsed.get(key)||0)-before));
+      allocate(candidates,available);
+      const added=candidates.reduce((sum,line)=>sum+line.applied,0)-before;
+      residualByCohort.set(cohort,Math.max(0,(residualByCohort.get(cohort)||0)-added));
     }
     const purchase = new Map<string, { amount: number; dates: string[]; missing: number }>();
     const seen = new Set<string>();
@@ -2053,7 +2106,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
       if (due) current.dates.push(dateKey(due)); else current.missing += 1;
       purchase.set(id, current);
     }
-    return { lines, purchase, purchaseDetails, unmatched, unlinked, nuclei: [...new Set(lines.map((line) => line.nucleus))].sort() };
+    return { lines, cohorts, residualByCohort, purchase, purchaseDetails, unmatched, unlinked, nuclei: [...new Set(lines.map((line) => line.nucleus))].sort() };
   }, [plans, consumption, orders, dimensions, farmToNucleus]);
   const report = useMemo(() => {
     const eligible = (line: DapPlanLine) => line.cycle === cycle && (culture === "Todas" || line.culture === culture);
@@ -2066,12 +2119,25 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
     const competition = new Map<string, number>();
     const ledgers = new Map(ledger.map((row) => [row.id, row]));
     for (const line of selected) { const list = selectedById.get(line.id) || []; list.push(line); selectedById.set(line.id, list); }
-    let undated = 0;
-    for (const line of base.lines) {
-      if (selectedSet.has(line)) continue;
-      if (!line.date && line.amount > line.applied) undated += 1;
-      // Demand without dates is conservatively reserved, not offered for transfers.
-      if (!line.date || !horizon || line.date <= horizon) competition.set(line.id, (competition.get(line.id) || 0) + Math.max(0, line.amount - line.applied));
+    let undated=0;
+    const competitionGross=new Map<string,number>(), competitionCredit=new Map<string,number>();
+    const competing=(line:DapPlanLine)=>!selectedSet.has(line)&&(!line.date||!horizon||line.date<=horizon);
+    for(const [cohort,lines] of base.cohorts){
+      let prior=0,other=0;
+      for(const line of lines){
+        const remaining=Math.max(0,line.amount-line.applied);
+        if(competing(line)){prior+=remaining;if(!line.date&&remaining>0)undated++;}
+        else other+=remaining;
+      }
+      if(prior<=0)continue;
+      // Unattributed consumption may first belong to the selected window or
+      // later operations. Only the portion exceeding that capacity is certain
+      // to reduce competing demand; no individual DAP is marked as applied.
+      const credit=Math.min(prior,Math.max(0,(base.residualByCohort.get(cohort)||0)-other));
+      const id=lines[0].id;
+      competitionGross.set(id,(competitionGross.get(id)||0)+prior);
+      competitionCredit.set(id,(competitionCredit.get(id)||0)+credit);
+      competition.set(id,(competition.get(id)||0)+prior-credit);
     }
     type CentralPool = { stock: number; transit: number; bought: number; overlap: number; stockLeft: number; transitLeft: number; boughtLeft: number; prior: number; allocatedStock: number; allocatedTransit: number; allocatedBought: number };
     const central = new Map<string, CentralPool>();
@@ -2112,11 +2178,12 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
       const applied = lines.reduce((sum, line) => sum + line.applied, 0);
       const demand = Math.max(0, planned - applied);
       const prior = competition.get(id) || 0;
+      const priorGross=competitionGross.get(id)||0, priorCredit=competitionCredit.get(id)||0;
       const stock = Math.max(0, row.farmBalance);
       const transit = Math.max(0, row.transit - (centralTransitByLedger.get(id)||0));
       const order = base.purchase.get(id);
       const bought = normalizeMaterial(row.nucleus) === normalizeMaterial("ARMAZÉM") ? 0 : order?.amount || 0;
-      return { row, lines, planned, applied, demand, prior, stock, transit, bought, warehouse: 0, warehouseTransit: 0, warehouseBought: 0, stockAfter: 0, transitAfter: 0, boughtAfter: 0, overlap: 0, shortage: 0, priorUncovered: 0, net: 0, surplus: 0, physicalSurplus: 0, transferIn: 0, transferOut: 0, projectedIn: 0, projectedOut: 0, buyNeed: 0, first: lines.filter((line) => line.amount > line.applied && line.date).map((line) => line.date).sort()[0] || "", due: order?.dates.slice().sort()[0] || "", missingDue: order?.missing || 0, status: "" };
+      return { row, lines, planned, applied, demand, prior, priorGross, priorCredit, priorTransferIn:0, priorTransferOut:0, stock, transit, bought, warehouse: 0, warehouseTransit: 0, warehouseBought: 0, stockAfter: 0, transitAfter: 0, boughtAfter: 0, overlap: 0, shortage: 0, priorUncovered: 0, net: 0, surplus: 0, physicalSurplus: 0, transferIn: 0, transferOut: 0, projectedIn: 0, projectedOut: 0, buyNeed: 0, first: lines.filter((line) => line.amount > line.applied && line.date).map((line) => line.date).sort()[0] || "", due: order?.dates.slice().sort()[0] || "", missingDue: order?.missing || 0, status: "" };
     }).filter((item): item is NonNullable<typeof item> => item !== null);
     // Deduct all potentially overlapping transit from supplier balances once per material.
     // No exact PO/MB5T link is assumed: this is deliberately a lower bound.
@@ -2162,10 +2229,31 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
       const bought = Math.min(prior, netBought); prior -= bought; p.boughtAfter = netBought - bought;
       p.priorUncovered = prior;
     }
+    const transfers: { material: string; canonical: string; origin: string; destination: string; amount: number; type: "Estoque físico" | "Dependente de entrega"; purpose:"Concorrente"|"Janela DAP" }[] = [];
     // Shared warehouse is reserved for competing needs before assigning the target.
     for (const p of [...pools].sort((a,b) => a.row.id.localeCompare(b.row.id))) {
       const used=takeCentral(p.row.canonicalKey,p.priorUncovered,true);
       p.priorUncovered=Math.max(0,p.priorUncovered-used.stock-used.transit-used.bought);
+    }
+    // Reserve cross-nucleus supply for outstanding competing needs BEFORE
+    // assigning the target window. Deduct each donor balance once.
+    const priorGroups=new Map<string,typeof pools>();
+    for(const p of pools){
+      if(!inScope(p.row.nucleus)||!targetMaterials.has(p.row.canonicalKey)||!/^NC-/i.test(p.row.nucleus))continue;
+      const group=priorGroups.get(p.row.canonicalKey)||[];group.push(p);priorGroups.set(p.row.canonicalKey,group);
+    }
+    for(const group of priorGroups.values()){
+      const ordered=[...group].sort((a,b)=>a.row.id.localeCompare(b.row.id));
+      for(const field of ["stockAfter","transitAfter","boughtAfter"] as const){
+        for(const receiver of ordered)for(const donor of ordered){
+          if(receiver===donor||receiver.priorUncovered<=0.000001||donor.priorUncovered>0.000001)continue;
+          const amount=Math.min(receiver.priorUncovered,Math.max(0,donor[field]));
+          if(amount<=0.000001)continue;
+          donor[field]-=amount;receiver.priorUncovered=Math.max(0,receiver.priorUncovered-amount);
+          donor.priorTransferOut+=amount;receiver.priorTransferIn+=amount;
+          transfers.push({material:receiver.row.standardMaterial,canonical:receiver.row.canonicalKey,origin:donor.row.nucleus,destination:receiver.row.nucleus,amount,type:field==="stockAfter"?"Estoque físico":"Dependente de entrega",purpose:"Concorrente"});
+        }
+      }
     }
     for (const p of [...pools].sort((a,b) => (a.first || "9999").localeCompare(b.first || "9999") || a.row.id.localeCompare(b.row.id))) {
       const used=takeCentral(p.row.canonicalKey,Math.max(0,p.demand-p.stockAfter-p.transitAfter-p.boughtAfter),false);
@@ -2175,8 +2263,8 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
     }
     // Remanejamento is a scenario, not a stock reservation or SAP transfer.
     // Only pools inside the visible scope may exchange quantities.
-    const transfers: { material: string; canonical: string; origin: string; destination: string; amount: number; type: "Estoque físico" | "Dependente de entrega" }[] = [];
-    const visiblePools = pools.filter(p => inScope(p.row.nucleus) && targetMaterials.has(p.row.canonicalKey) && (p.lines.length > 0 || (/^NC-/i.test(p.row.nucleus) && (p.stock > 0 || p.transit > 0 || p.bought > 0))));
+
+    const visiblePools = pools.filter(p => inScope(p.row.nucleus) && targetMaterials.has(p.row.canonicalKey) && (p.lines.length > 0 || (/^NC-/i.test(p.row.nucleus) && (p.prior > 0 || p.stock > 0 || p.transit > 0 || p.bought > 0))));
     const byMaterial = new Map<string, typeof visiblePools>();
     for (const p of visiblePools) {
       p.net = p.stockAfter + p.warehouse + p.transitAfter + p.boughtAfter + p.warehouseTransit + p.warehouseBought - p.demand;
@@ -2201,7 +2289,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
           if (kind === "Estoque físico") { donor.transferOut += amount; receiver.transferIn += amount; }
           else { donor.projectedOut += amount; receiver.projectedIn += amount; }
           receiver.buyNeed = Math.max(0,receiver.buyNeed-amount);
-          transfers.push({ material:receiver.row.standardMaterial, canonical:receiver.row.canonicalKey, origin:donor.row.nucleus, destination:receiver.row.nucleus, amount, type:kind });
+          transfers.push({ material:receiver.row.standardMaterial, canonical:receiver.row.canonicalKey, origin:donor.row.nucleus, destination:receiver.row.nucleus, amount, type:kind, purpose:"Janela DAP" });
         }
       }
     }
@@ -2230,7 +2318,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
     }
     return [...map].map(([key, pools]) => {
       const first = pools[0];
-      const sum = (field: "planned" | "applied" | "demand" | "prior" | "stock" | "stockAfter" | "warehouse" | "warehouseTransit" | "warehouseBought" | "transit" | "transitAfter" | "bought" | "boughtAfter" | "shortage" | "net" | "surplus" | "physicalSurplus" | "transferIn" | "transferOut" | "projectedIn" | "projectedOut" | "buyNeed") => pools.reduce((total,p) => total + p[field], 0);
+      const sum = (field: "planned" | "applied" | "demand" | "prior" | "priorGross" | "priorCredit" | "priorUncovered" | "priorTransferIn" | "priorTransferOut" | "stock" | "stockAfter" | "warehouse" | "warehouseTransit" | "warehouseBought" | "transit" | "transitAfter" | "bought" | "boughtAfter" | "shortage" | "net" | "surplus" | "physicalSurplus" | "transferIn" | "transferOut" | "projectedIn" | "projectedOut" | "buyNeed") => pools.reduce((total,p) => total + p[field], 0);
       const materials = new Set(pools.map((p) => p.row.canonicalKey));
       const uncovered = new Set(pools.filter((p) => p.buyNeed > 0.000001).map((p) => p.row.canonicalKey));
       const delivery = new Set(pools.filter((p) => p.status.startsWith("Dependente") || p.projectedIn > 0.000001 || p.transferIn > 0.000001).map((p) => p.row.canonicalKey));
@@ -2242,7 +2330,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
         cultures: [...new Set(pools.flatMap((p) => p.lines.map((line) => line.culture)))].sort().join(", "),
         materialCount: materials.size, nucleusCount: new Set(pools.map((p) => p.row.nucleus)).size,
         uncoveredCount: uncovered.size, deliveryCount: [...delivery].filter((key) => !uncovered.has(key)).length, coveredCount: covered,
-        shortage: lack, net:sum("net"), surplus:sum("surplus"), physicalSurplus:sum("physicalSurplus"), transferIn:sum("transferIn"), transferOut:sum("transferOut"), projectedIn:sum("projectedIn"), projectedOut:sum("projectedOut"), buyNeed:purchaseNeed, planned: sum("planned"), applied: sum("applied"), demand: sum("demand"), prior: sum("prior"), stock: sum("stock"), stockAfter: sum("stockAfter"), warehouse: sum("warehouse"), warehouseTransit:sum("warehouseTransit"), warehouseBought:sum("warehouseBought"), transit: sum("transit"), transitAfter: sum("transitAfter"), bought: sum("bought"), boughtAfter: sum("boughtAfter"),
+        shortage: lack, net:sum("net"), surplus:sum("surplus"), physicalSurplus:sum("physicalSurplus"), transferIn:sum("transferIn"), transferOut:sum("transferOut"), projectedIn:sum("projectedIn"), projectedOut:sum("projectedOut"), buyNeed:purchaseNeed, planned: sum("planned"), applied: sum("applied"), demand: sum("demand"), prior: sum("prior"), priorGross:sum("priorGross"),priorCredit:sum("priorCredit"),priorUncovered:sum("priorUncovered"),priorTransferIn:sum("priorTransferIn"),priorTransferOut:sum("priorTransferOut"), stock: sum("stock"), stockAfter: sum("stockAfter"), warehouse: sum("warehouse"), warehouseTransit:sum("warehouseTransit"), warehouseBought:sum("warehouseBought"), transit: sum("transit"), transitAfter: sum("transitAfter"), bought: sum("bought"), boughtAfter: sum("boughtAfter"),
         status: lack > 0.000001 ? (!purchasesLoaded ? "Compras não importadas" : purchaseNeed > 0.000001 ? "Compra potencial necessária" : transfer > 0.000001 ? "Remanejamento potencial" : "Falta cobertura identificada") : pools.some((p) => p.status === "Dependente de fornecedor") ? "Dependente de fornecedor" : pools.some((p) => p.status === "Dependente de trânsito") ? "Dependente de trânsito" : pools.every((p) => p.status === "Sem demanda na janela") ? "Sem demanda na janela" : pools.every((p) => p.status === "Aplicado" || p.status === "Sem demanda na janela") ? "Aplicado" : "Atendido com estoque",
       };
     }).sort((a,b) => (bucketLevel === "Grupo" || bucketLevel === "Subgrupo" ? b.uncoveredCount - a.uncoveredCount : Number(b.shortage > 0.000001) - Number(a.shortage > 0.000001)) || a.label.localeCompare(b.label,"pt-BR"));
@@ -2296,15 +2384,15 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
       const XLSX = await loadXlsx();
       const workbook = XLSX.utils.book_new();
       const exportMacro = (entries: typeof buckets) => entries.map((p) => ({ Classificação:p.label, Grupo:p.group, Materiais:p.materialCount, Núcleos:p.nucleusCount, "Atendidos":p.coveredCount, "Dependentes de entregas":p.deliveryCount, "Sem cobertura":p.uncoveredCount }));
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(materialBuckets.map((p) => ({ "Material padrão":p.label, Grupo:p.group, Subgrupo:p.subgroup, "Princípio ativo":p.active, Núcleos:p.nucleusCount, Planejado:p.planned, Aplicado:p.applied, Demanda:p.demand, Concorrente:p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Armazém físico alocado":p.warehouse, "Armazém trânsito alocado":p.warehouseTransit, "Armazém compra alocada":p.warehouseBought, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado a entregar":purchasesLoaded?p.bought:null, "Compra residual":purchasesLoaded?p.boughtAfter:null, "Falta cobertura por núcleo somada":p.shortage, "Saldo consolidado":p.net, "Excedente físico":p.physicalSurplus, "Excedente projetado":p.surplus, "Transferência física potencial":p.transferIn, "Transferência dependente de entrega":p.projectedIn, "Compra potencial após remanejamento":purchasesLoaded?p.buyNeed:null, Situação:p.status }))), "Materiais");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(materialBuckets.map((p) => ({ "Material padrão":p.label, Grupo:p.group, Subgrupo:p.subgroup, "Princípio ativo":p.active, Núcleos:p.nucleusCount, Planejado:p.planned, Aplicado:p.applied, Demanda:p.demand, "Concorrente antes do abatimento consolidado":p.priorGross,"Consumo concorrente conciliado":p.priorCredit,Concorrente:p.prior,"Concorrente sem cobertura":p.priorUncovered,"Concorrente a receber":p.priorTransferIn,"Concorrente a ceder":p.priorTransferOut, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Armazém físico alocado":p.warehouse, "Armazém trânsito alocado":p.warehouseTransit, "Armazém compra alocada":p.warehouseBought, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado a entregar":purchasesLoaded?p.bought:null, "Compra residual":purchasesLoaded?p.boughtAfter:null, "Falta cobertura por núcleo somada":p.shortage, "Saldo consolidado":p.net, "Excedente físico":p.physicalSurplus, "Excedente projetado":p.surplus, "Transferência física potencial":p.transferIn, "Transferência dependente de entrega":p.projectedIn, "Compra potencial após remanejamento":purchasesLoaded?p.buyNeed:null, Situação:p.status }))), "Materiais");
       if (showCentralTotals) XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(materialBuckets.map(p=>{const item=centralTotals(p.key);return {"Material padrão":p.label,"Estoque central":item?.stock||0,"Trânsito para 0714":item?.transit||0,"Compra central bruta":purchasesLoaded?(item?.bought||0):null,"Dedução de trânsito":item?.overlap||0,"Reserva concorrente":item?.prior||0,"Físico alocado":item?.allocatedStock||0,"Trânsito alocado":item?.allocatedTransit||0,"Compra alocada":item?.allocatedBought||0,"Estoque residual":item?.stockLeft||0,"Trânsito residual":item?.transitLeft||0,"Compra residual":item?.boughtLeft||0,"Residual total":centralResidual(p.key)};})), "Armazem 0714");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportMacro(groupBuckets)), "Grupos");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportMacro(subgroupBuckets)), "Subgrupos");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, Grupo:p.row.merchandiseGroup, Subgrupo:p.row.subgroup, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Demanda concorrente":p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Armazém físico alocado":p.warehouse, "Armazém trânsito alocado":p.warehouseTransit, "Armazém compra alocada":p.warehouseBought, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Saldo líquido":p.net, "Excedente físico":p.physicalSurplus, "Excedente projetado":p.surplus, "Receber estoque físico":p.transferIn, "Ceder estoque físico":p.transferOut, "Receber após entrega":p.projectedIn, "Ceder após entrega":p.projectedOut, "Compra potencial após remanejamento":purchasesLoaded?p.buyNeed:null, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Núcleos");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, Grupo:p.row.merchandiseGroup, Subgrupo:p.row.subgroup, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Concorrente antes do abatimento consolidado":p.priorGross,"Consumo concorrente conciliado":p.priorCredit,"Demanda concorrente":p.prior,"Concorrente sem cobertura":p.priorUncovered,"Concorrente a receber":p.priorTransferIn,"Concorrente a ceder":p.priorTransferOut, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Armazém físico alocado":p.warehouse, "Armazém trânsito alocado":p.warehouseTransit, "Armazém compra alocada":p.warehouseBought, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Saldo líquido":p.net, "Excedente físico":p.physicalSurplus, "Excedente projetado":p.surplus, "Receber estoque físico":p.transferIn, "Ceder estoque físico":p.transferOut, "Receber após entrega":p.projectedIn, "Ceder após entrega":p.projectedOut, "Compra potencial após remanejamento":purchasesLoaded?p.buyNeed:null, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Núcleos");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.flatMap(detail)), "Talhões");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(commercialRows.filter(row=>shownMaterials.has(row.canonical)).map(row=>({"Material padrão":row.material,"Material físico":row.physical,"Destino":row.nucleus,"Pedido":row.document,"Fonte":row.source,"Saldo físico":row.balance,"Unidade física":row.unit,"Saldo equivalente":row.equivalent,"Vencimento":row.dueDate}))),"Saldo comercial");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(transferRows.map(t=>({Material:t.material,Origem:t.origin,Destino:t.destination,"Volume equivalente":t.amount,Tipo:t.type}))), "Remanejamentos");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Exportação de todos os registros dos filtros, independente da página ou expansão. Grupo e subgrupo exibem contagem de materiais, sem somar unidades diferentes. Falta operacional soma faltas por núcleo. Remanejamento potencial usa excedente físico primeiro e excedente projetado depois, somente dentro do escopo selecionado; compra potencial é a falta restante. Não confirma viabilidade logística, validade ou chegada. Demandas sem data são reservadas conservadoramente. Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Saldo comercial compartilhado com Acompanhamento: fechamento vinculado substitui o pedido original, com conversão para material padrão no DAP. Não garante chegada; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados." }]), "Premissas");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(transferRows.map(t=>({Material:t.material,Origem:t.origin,Destino:t.destination,"Volume equivalente":t.amount,Tipo:t.type,Finalidade:t.purpose}))), "Remanejamentos");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Exportação de todos os registros dos filtros, independente da página ou expansão. Grupo e subgrupo exibem contagem de materiais, sem somar unidades diferentes. Falta operacional soma faltas por núcleo. Remanejamento potencial usa excedente físico primeiro e excedente projetado depois, somente dentro do escopo selecionado; compra potencial é a falta restante. Não confirma viabilidade logística, validade ou chegada. Demandas sem data são reservadas conservadoramente. Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado por operação ou talhão inequívoco; saldo líquido por material/núcleo/ciclo/cultura abate somente concorrente quando não puder pertencer à janela ou operações posteriores; concorrentes têm prioridade inclusive em remanejamentos; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Saldo comercial compartilhado com Acompanhamento: fechamento vinculado substitui o pedido original, com conversão para material padrão no DAP. Não garante chegada; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados." }]), "Premissas");
       XLSX.writeFile(workbook, "provisionamento_DAP_" + cycle + "_" + lo + "_" + hi + ".xlsx");
     } catch (error) { setExportError(error instanceof Error ? error.message : "Falha ao exportar."); }
   }
@@ -2327,12 +2415,12 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const statusColumn:DapColumn={key:"status",label:"Situação",render:p=><>{p.status}{level==="Material"&&<span className="block text-slate-500">{p.nucleusCount} núcleos · {p.pools.filter(pool=>pool.shortage>0.000001).length} com falta</span>}</>};
   const riskColumn:DapColumn={key:"risk",label:"Prazo",render:p=><>{level==="Núcleo"?risk(p.pools[0]):p.pools.some(pool=>risk(pool)==="Primeira compra após início")?"Risco em algum núcleo":p.pools.some(pool=>risk(pool)!=="—")?"Prazo a validar":"—"}{level==="Núcleo"&&<span className="block text-slate-500">{p.pools[0].first||"Sem data"} / {p.pools[0].due||"Sem previsão"}</span>}</>};
   const columnGroups:DapColumnGroup[]=[
-    {key:"planning",label:"Planejamento",summary:[demandColumn],detail:[numericColumn("planned","Planejado",p=>p.planned),numericColumn("applied","Aplicado",p=>p.applied),demandColumn,numericColumn("prior","Concorrente",p=>p.prior)]},
+    {key:"planning",label:"Planejamento",summary:[demandColumn],detail:[numericColumn("planned","Planejado",p=>p.planned),numericColumn("applied","Aplicado",p=>p.applied),demandColumn,numericColumn("priorGross","Concorrente antes do abatimento consolidado",p=>p.priorGross),numericColumn("priorCredit","Consumo concorrente conciliado",p=>p.priorCredit),numericColumn("prior","Concorrente residual",p=>p.prior),numericColumn("priorUncovered","Concorrente sem cobertura",p=>p.priorUncovered,deficitTone(p=>p.priorUncovered))]},
     {key:"stock",label:"Estoque",summary:[stockColumn],detail:[numericColumn("stock","Estoque atual",p=>p.stock),stockColumn]},
     {key:"central",label:"Armazém 0714",summary:[centralColumn],detail:[centralColumn,numericColumn("centralStock","Armazém físico alocado",p=>p.warehouse),numericColumn("centralTransit","Armazém trânsito alocado",p=>p.warehouseTransit),numericColumn("centralPurchase","Armazém compra alocada",p=>p.warehouseBought),...(level==="Material"&&showCentralTotals?[numericColumn("centralStockTotal","Armazém estoque total",p=>centralTotals(p.key)?.stock||0),numericColumn("centralTransitTotal","Armazém trânsito total",p=>centralTotals(p.key)?.transit||0),purchaseColumn("centralPurchaseTotal","Armazém comprado bruto",p=>centralTotals(p.key)?.bought||0),numericColumn("centralResidual","Armazém residual",p=>centralResidual(p.key))]:[])]},
     {key:"transit",label:"Trânsito",summary:[transitColumn],detail:[numericColumn("transit","Trânsito atual",p=>p.transit),transitColumn]},
     {key:"purchases",label:"Compras",summary:[boughtColumn],detail:[purchaseColumn("bought","Comprado a entregar (bruto)",p=>p.bought),boughtColumn]},
-    {key:"transfer",label:"Remanejamentos",summary:[transferColumn],detail:[numericColumn("physicalSurplus","Excedente físico",p=>p.physicalSurplus),numericColumn("surplus","Excedente projetado",p=>p.surplus),transferColumn,numericColumn("transferIn","Transferência física (receber)",p=>p.transferIn),numericColumn("projectedIn","Transferência futura (receber)",p=>p.projectedIn),{key:"transferOut",label:"Ceder (físico / futuro)",render:p=>value(p.transferOut)+" / "+value(p.projectedOut)}]},
+    {key:"transfer",label:"Remanejamentos",summary:[transferColumn],detail:[numericColumn("physicalSurplus","Excedente físico",p=>p.physicalSurplus),numericColumn("surplus","Excedente projetado",p=>p.surplus),transferColumn,numericColumn("transferIn","Transferência física (receber)",p=>p.transferIn),numericColumn("projectedIn","Transferência futura (receber)",p=>p.projectedIn),numericColumn("priorTransferIn","Concorrente a receber",p=>p.priorTransferIn),numericColumn("priorTransferOut","Concorrente a ceder",p=>p.priorTransferOut),{key:"transferOut",label:"Ceder (físico / futuro)",render:p=>value(p.transferOut)+" / "+value(p.projectedOut)}]},
     {key:"result",label:"Resultado",summary:[shortageColumn,buyColumn,statusColumn],detail:[shortageColumn,numericColumn("net","Saldo líquido",p=>p.net,p=>cn("font-semibold",p.net<0?"text-rose-700":"text-emerald-700")),buyColumn,riskColumn,statusColumn]},
   ];
   const visibleColumnGroups=columnGroups.map(group=>({...group,expanded:expandedColumnGroups.includes(group.key),columns:expandedColumnGroups.includes(group.key)?group.detail:group.summary}));
@@ -2352,7 +2440,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
     <div className="grid gap-2 sm:grid-cols-4">{[["Materiais",materialBuckets.length],["Atendidos com estoque",materialBuckets.filter((p) => p.status === "Atendido com estoque" || p.status === "Aplicado").length],["Dependentes de entregas",materialBuckets.filter((p) => p.status.startsWith("Dependente")).length],["Com compra potencial",materialBuckets.filter((p) => p.buyNeed > 0.000001).length]].map(([label,count]) => <div key={label} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-2xl font-semibold">{count}</p></div>)}</div>
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
       <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo comercial utiliza o destino dos fechamentos vinculados, com pedido SAP não vinculado como alternativa. A faturar é volume físico; no DAP o saldo é convertido para material padrão e desconta trânsito potencialmente sobreposto. Pedidos internos não são compras. O armazém compartilha estoque físico, trânsito receptor 0714 e compras com destino 0714; primeiro atende concorrentes, depois faltas após a cobertura local.</p>
-      <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data reservados conservadoramente. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : (base.unlinked + commercialAmbiguous) + " registros comerciais sem vínculo/material/destino/unidade conciliados; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados."}</p>
+      <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data reservados conservadoramente. "}{consumptionLoaded ? "Consumo abatido por operação ou talhão inequívoco; saldo não atribuído reduz demanda concorrente por material/núcleo/ciclo/cultura, sem marcar DAP como aplicado." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : (base.unlinked + commercialAmbiguous) + " registros comerciais sem vínculo/material/destino/unidade conciliados; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados."}</p>
       <p>Falta operacional não é necessariamente compra. Remanejamentos são sugestões dentro do escopo selecionado: estoque físico primeiro, depois excedente dependente de entrega. Compra potencial restante pressupõe inclusive os remanejamentos futuros indicados; sem eles, some a transferência futura à compra potencial. O filtro de núcleo restringe o remanejamento ao escopo selecionado. A compra depende de validação dos dados, logística e prazos; não cria transferência nem reserva no SAP.</p>
     </div>
     {exportError && <p className="text-sm text-rose-700">{exportError}</p>}
@@ -2391,12 +2479,12 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
         <tbody className="divide-y divide-slate-100">{visible.map(p=><tr key={p.key} className="hover:bg-slate-50">
         <td className="p-3"><button type="button" className="text-left font-semibold text-emerald-800" onClick={() => openBucket(p)}>{p.label}<span className="block text-xs font-normal text-slate-500">{level === "Material" ? p.group+" · "+p.subgroup+" · "+p.active : level === "Subgrupo" ? p.group : level === "Núcleo" ? p.pools[0].row.standardMaterial : ""}</span></button></td>
         {macro ? <><td className="p-3">{p.materialCount}</td><td className="p-3">{p.nucleusCount}</td><td className="p-3 text-emerald-700">{p.coveredCount}</td><td className="p-3 text-amber-700">{p.deliveryCount}</td><td className="p-3 font-semibold text-rose-700">{p.uncoveredCount}</td></> : <><td className="p-3">{p.cultures}</td>{visibleColumns.map(column=><td key={column.key} className={cn("border-l border-slate-100 p-3 tabular-nums",column.tone?.(p))}>{column.render(p)}</td>)}</>}
-        <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button>{!macro && (p.transferIn+p.transferOut+p.projectedIn+p.projectedOut)>0.000001 && <button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setTransferMaterial(p.pools[0].row.canonicalKey)}>Remanejamentos</button>}{!macro&&level==="Material"&&commercialRows.some(row=>row.canonical===p.key)&&<button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setCommercialMaterial(p.key)}>Saldo comercial</button>}</td>
+        <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button>{!macro && (p.transferIn+p.transferOut+p.projectedIn+p.projectedOut+p.priorTransferIn+p.priorTransferOut)>0.000001 && <button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setTransferMaterial(p.pools[0].row.canonicalKey)}>Remanejamentos</button>}{!macro&&level==="Material"&&commercialRows.some(row=>row.canonical===p.key)&&<button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setCommercialMaterial(p.key)}>Saldo comercial</button>}</td>
       </tr>)}{!visible.length&&<tr><td colSpan={macro?7:visibleColumns.length+3} className="p-8 text-center text-slate-500">Nenhuma demanda neste filtro.</td></tr>}</tbody></table>
     </div>
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{buckets.length ? (currentPage-1)*size+1 : 0}–{Math.min(currentPage*size,buckets.length)} de {buckets.length} registros · Página {currentPage} de {pageCount}</span><div className="flex gap-2"><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage<=1} onClick={()=>setPage(currentPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage>=pageCount} onClick={()=>setPage(currentPage+1)}>Próxima</button></div></div>
     {commercialMaterial && <div role="dialog" aria-modal="true" aria-label="Origem do saldo comercial" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Saldo comercial · {visibleCommercial[0]?.material||commercialMaterial}</h3><button type="button" className={inputClass} onClick={()=>setCommercialMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Saldo bruto antes de reservar demandas concorrentes e descontar possível sobreposição com trânsito. Destino do fechamento tem prioridade sobre o centro do pedido.</p><div className="overflow-auto"><table className="w-full min-w-[850px] text-left text-xs"><thead className="bg-slate-50"><tr>{["Pedido","Material físico","Destino","Fonte","Saldo físico","Saldo equivalente","Vencimento"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleCommercial.map((row,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{row.document||"—"}</td><td className="p-3">{row.physical}</td><td className="p-3">{row.nucleus}</td><td className="p-3">{row.source}</td><td className="p-3">{value(row.balance)} {row.unit}</td><td className="p-3 font-semibold">{value(row.equivalent)}</td><td className="p-3">{row.dueDate||"Sem data"}</td></tr>)}</tbody></table></div></div></div>}
-    {transferMaterial && <div role="dialog" aria-modal="true" aria-label="Remanejamentos potenciais" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Remanejamentos potenciais · {visibleTransfers[0]?.material||transferMaterial}</h3><button type="button" className={inputClass} onClick={()=>setTransferMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Volumes equivalentes, não ordens de transferência. Conferir lote, disponibilidade física, validade e prazo antes da execução.</p><table className="w-full text-left text-sm"><thead className="bg-slate-50"><tr>{["Origem","Destino","Volume equivalente","Tipo"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleTransfers.map((t,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{t.origin}</td><td className="p-3">{t.destination}</td><td className="p-3 font-semibold">{value(t.amount)}</td><td className="p-3">{t.type}</td></tr>)}</tbody></table></div></div>}
+    {transferMaterial && <div role="dialog" aria-modal="true" aria-label="Remanejamentos potenciais" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Remanejamentos potenciais · {visibleTransfers[0]?.material||transferMaterial}</h3><button type="button" className={inputClass} onClick={()=>setTransferMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Volumes equivalentes, não ordens de transferência. Conferir lote, disponibilidade física, validade e prazo antes da execução.</p><table className="w-full text-left text-sm"><thead className="bg-slate-50"><tr>{["Origem","Destino","Volume equivalente","Tipo","Finalidade"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleTransfers.map((t,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{t.origin}</td><td className="p-3">{t.destination}</td><td className="p-3 font-semibold">{value(t.amount)}</td><td className="p-3">{t.type}</td><td className="p-3">{t.purpose}</td></tr>)}</tbody></table></div></div>}
     {selected && <div role="dialog" aria-modal="true" aria-label="Detalhamento do provisionamento" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex flex-wrap justify-between gap-2"><h3 className="font-semibold">{selected.row.standardMaterial} · {selected.row.nucleus}</h3><div className="flex gap-2"><button type="button" className={inputClass} onClick={() => setByField(!byField)}>{byField ? "Resumo por fazenda" : "Ver por talhão"}</button><button type="button" className={inputClass} onClick={() => setDetailId("")}>Fechar</button></div></div><div className="mt-3 overflow-auto"><table className="w-full min-w-[850px] text-xs"><thead className="bg-slate-50"><tr>{["Fazenda",...(byField?["Talhão"]:[]),"Cultura","Atividade","Material","DAP","Data","Planejado equiv.","Aplicado","Demanda"].map((h) => <th key={h} className="p-2 text-left">{h}</th>)}</tr></thead><tbody>{visibleDetails.map(([key,line]) => <tr key={key} className="border-b border-slate-100"><td className="p-2">{line.Fazenda}</td>{byField && <td className="p-2">{line.Talhão}</td>}<td className="p-2">{line.Cultura}</td><td className="p-2">{line.Atividade}</td><td className="p-2">{line.Material}</td><td className="p-2">{line.DAP}</td><td className="p-2">{line["Data prevista"] || "—"}</td><td className="p-2">{value(line["Planejado equivalente"])}</td><td className="p-2">{value(line["Aplicado conciliado"])}</td><td className="p-2">{value(line["Demanda remanescente"])}</td></tr>)}</tbody></table></div><div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{detailEntries.length} registros · Página {currentDetailPage} de {detailPageCount}</span><div className="flex items-center gap-2"><select aria-label="Linhas por página no detalhe" className={inputClass} value={pageSize} onChange={e=>setPageSize(e.target.value)}>{["20","50","100","Todos"].map(v=><option key={v}>{v}</option>)}</select><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage<=1} onClick={()=>setDetailPage(currentDetailPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage>=detailPageCount} onClick={()=>setDetailPage(currentDetailPage+1)}>Próxima</button></div></div></div></div>}
   </div>;
 }
