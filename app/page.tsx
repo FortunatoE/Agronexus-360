@@ -2009,6 +2009,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const [detailPage, setDetailPage] = useState(1);
   // Visual preference only: never changes the reconciliation or export.
   const [expandedColumnGroups, setExpandedColumnGroups] = useState<string[]>([]);
+  const [stockView,setStockView]=useState<"Atual"|"Residual"|"Ambos">("Residual");
   const toggleColumnGroup = (key: string) => setExpandedColumnGroups(current => current.includes(key) ? current.filter(item=>item!==key) : [...current,key]);
   const lo = Number(initial), hi = Number(final);
   const valid = initial.trim() !== "" && final.trim() !== "" && Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi;
@@ -2406,6 +2407,8 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const deficitTone = (read:(p:Bucket)=>number) => (p:Bucket)=>cn("font-semibold",read(p)>0.000001?"text-rose-700":"text-emerald-700");
   const demandColumn=numericColumn("demand","Demanda",p=>p.demand);
   const stockColumn=numericColumn("stockAfter","Estoque residual",p=>p.stockAfter);
+  const currentStockColumn=numericColumn("stock","Estoque atual",p=>p.stock);
+  const compactStockColumns=stockView==="Atual"?[currentStockColumn]:stockView==="Ambos"?[currentStockColumn,stockColumn]:[stockColumn];
   const centralColumn=numericColumn("centralAllocated","Armazém alocado",p=>p.warehouse+p.warehouseTransit+p.warehouseBought);
   const transitColumn=numericColumn("transitAfter","Trânsito residual",p=>p.transitAfter);
   const boughtColumn=purchaseColumn("boughtAfter","Compra residual",p=>p.boughtAfter);
@@ -2416,7 +2419,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const riskColumn:DapColumn={key:"risk",label:"Prazo",render:p=><>{level==="Núcleo"?risk(p.pools[0]):p.pools.some(pool=>risk(pool)==="Primeira compra após início")?"Risco em algum núcleo":p.pools.some(pool=>risk(pool)!=="—")?"Prazo a validar":"—"}{level==="Núcleo"&&<span className="block text-slate-500">{p.pools[0].first||"Sem data"} / {p.pools[0].due||"Sem previsão"}</span>}</>};
   const columnGroups:DapColumnGroup[]=[
     {key:"planning",label:"Planejamento",summary:[demandColumn],detail:[numericColumn("planned","Planejado",p=>p.planned),numericColumn("applied","Aplicado",p=>p.applied),demandColumn,numericColumn("priorGross","Concorrente antes do abatimento consolidado",p=>p.priorGross),numericColumn("priorCredit","Consumo concorrente conciliado",p=>p.priorCredit),numericColumn("prior","Concorrente residual",p=>p.prior),numericColumn("priorUncovered","Concorrente sem cobertura",p=>p.priorUncovered,deficitTone(p=>p.priorUncovered))]},
-    {key:"stock",label:"Estoque",summary:[stockColumn],detail:[numericColumn("stock","Estoque atual",p=>p.stock),stockColumn]},
+    {key:"stock",label:"Estoque",summary:compactStockColumns,detail:[currentStockColumn,stockColumn]},
     {key:"central",label:"Armazém 0714",summary:[centralColumn],detail:[centralColumn,numericColumn("centralStock","Armazém físico alocado",p=>p.warehouse),numericColumn("centralTransit","Armazém trânsito alocado",p=>p.warehouseTransit),numericColumn("centralPurchase","Armazém compra alocada",p=>p.warehouseBought),...(level==="Material"&&showCentralTotals?[numericColumn("centralStockTotal","Armazém estoque total",p=>centralTotals(p.key)?.stock||0),numericColumn("centralTransitTotal","Armazém trânsito total",p=>centralTotals(p.key)?.transit||0),purchaseColumn("centralPurchaseTotal","Armazém comprado bruto",p=>centralTotals(p.key)?.bought||0),numericColumn("centralResidual","Armazém residual",p=>centralResidual(p.key))]:[])]},
     {key:"transit",label:"Trânsito",summary:[transitColumn],detail:[numericColumn("transit","Trânsito atual",p=>p.transit),transitColumn]},
     {key:"purchases",label:"Compras",summary:[boughtColumn],detail:[purchaseColumn("bought","Comprado a entregar (bruto)",p=>p.bought),boughtColumn]},
@@ -2463,6 +2466,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
         <div><p className="text-sm font-semibold">Contextos das colunas</p><p className="text-xs text-slate-500">Use + para expandir um contexto e − para recolher. O resumo e os resultados permanecem visíveis.</p></div>
         <div className="flex gap-2"><button type="button" disabled={allColumnGroupsExpanded} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-40" onClick={()=>setExpandedColumnGroups(columnGroups.map(group=>group.key))}>+ Expandir tudo</button><button type="button" disabled={!expandedColumnGroups.length} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-40" onClick={()=>setExpandedColumnGroups([])}>− Recolher tudo</button></div>
       </div>
+      <div className="mt-3 flex flex-wrap items-center gap-2"><span className="text-xs font-semibold text-slate-600">Visualização do estoque:</span><div role="group" aria-label="Visualização do estoque" className="flex flex-wrap gap-1">{(["Atual","Residual","Ambos"] as const).map(mode=><button key={mode} type="button" aria-pressed={stockView===mode} className={cn("rounded-md border px-3 py-1.5 text-xs font-semibold",stockView===mode?"border-emerald-600 bg-emerald-50 text-emerald-800":"border-slate-200 bg-white text-slate-700")} onClick={()=>{setStockView(mode);setExpandedColumnGroups(previous=>previous.filter(key=>key!=="stock"));}}>{mode}</button>)}</div><span className="text-xs text-slate-500">{stockView==="Atual"?"Saldo físico da última importação.":stockView==="Residual"?"Saldo após reservas para demandas concorrentes e remanejamentos prioritários.":"Compare o saldo físico e o saldo após reservas."} A cobertura e a compra potencial continuam calculadas com o estoque residual.</span></div>
       <div className="mt-3 flex flex-wrap gap-2">{visibleColumnGroups.map(group=><button type="button" key={group.key} aria-expanded={group.expanded} aria-label={(group.expanded?"Recolher ":"Expandir ")+group.label} className={cn("flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold",group.expanded?"border-emerald-600 bg-emerald-50 text-emerald-800":"border-slate-200 bg-white text-slate-700")} onClick={()=>toggleColumnGroup(group.key)}><span aria-hidden="true" className="inline-flex h-4 w-4 items-center justify-center rounded border border-current text-sm leading-none">{group.expanded?"−":"+"}</span>{group.label}</button>)}</div>
     </div>}
     <div className="overflow-x-auto rounded-xl border border-slate-200">
