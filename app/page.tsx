@@ -2046,7 +2046,7 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
     const selected = valid ? base.lines.filter((line) => eligible(line) && line.dap !== null && line.dap >= lo && line.dap <= hi) : [];
     const selectedSet = new Set(selected);
     const inScope = (unit: string) => (!operatorNucleus || unit === operatorNucleus) && (nucleus === "Todos" || unit === nucleus);
-    const targetMaterials = new Set(selected.filter(line => inScope(line.nucleus)).map(line => line.id.split("|")[0]));
+    const targetMaterials = new Set(selected.filter(line => inScope(line.nucleus)).map(line => productFor(line.row,"planning",dimensions).canonicalKey));
     const horizon = selected.reduce((max, line) => line.date > max ? line.date : max, "");
     const selectedById = new Map<string, DapPlanLine[]>();
     const competition = new Map<string, number>();
@@ -2117,7 +2117,7 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
       p.warehouse = Math.min(available, Math.max(0, p.demand - p.stockAfter));
       central.set(p.row.canonicalKey, available - p.warehouse);
       p.shortage = Math.max(0, p.demand - p.stockAfter - p.warehouse - p.transitAfter - p.boughtAfter);
-      p.status = p.demand <= 0.000001 ? "Aplicado" : p.demand <= p.stockAfter + p.warehouse + 0.000001 ? "Atendido com estoque" : p.demand <= p.stockAfter + p.warehouse + p.transitAfter + 0.000001 ? "Dependente de trânsito" : p.shortage <= 0.000001 ? "Dependente de fornecedor" : purchasesLoaded ? "Falta cobertura identificada" : "Compras não importadas";
+      p.status = !p.lines.length ? "Sem demanda na janela" : p.demand <= 0.000001 ? "Aplicado" : p.demand <= p.stockAfter + p.warehouse + 0.000001 ? "Atendido com estoque" : p.demand <= p.stockAfter + p.warehouse + p.transitAfter + 0.000001 ? "Dependente de trânsito" : p.shortage <= 0.000001 ? "Dependente de fornecedor" : purchasesLoaded ? "Falta cobertura identificada" : "Compras não importadas";
     }
     // Remanejamento is a scenario, not a stock reservation or SAP transfer.
     // Only pools inside the visible scope may exchange quantities.
@@ -2156,7 +2156,7 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
     return { transfers, rows: visiblePools.sort((a,b) => b.shortage - a.shortage || a.row.standardMaterial.localeCompare(b.row.standardMaterial)), first: visibleDates[0] || "", horizon: visibleDates[visibleDates.length - 1] || "", undated,
       missingDap: base.lines.filter((line) => eligible(line) && scoped(line) && line.dap === null).length,
       missingDate: selected.filter((line) => scoped(line) && !line.date).length };
-  }, [base, cycle, culture, valid, lo, hi, ledger, operatorNucleus, nucleus, purchasesLoaded]);
+  }, [base, cycle, culture, valid, lo, hi, ledger, operatorNucleus, nucleus, purchasesLoaded, dimensions]);
   type Pool = typeof report.rows[number];
   type Level = "Grupo" | "Subgrupo" | "Material" | "Núcleo";
   const groupKey = (p: Pool) => p.row.merchandiseGroup || "Sem grupo";
@@ -2189,7 +2189,7 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
         materialCount: materials.size, nucleusCount: new Set(pools.map((p) => p.row.nucleus)).size,
         uncoveredCount: uncovered.size, deliveryCount: [...delivery].filter((key) => !uncovered.has(key)).length, coveredCount: covered,
         shortage: lack, net:sum("net"), surplus:sum("surplus"), physicalSurplus:sum("physicalSurplus"), transferIn:sum("transferIn"), transferOut:sum("transferOut"), projectedIn:sum("projectedIn"), projectedOut:sum("projectedOut"), buyNeed:purchaseNeed, planned: sum("planned"), applied: sum("applied"), demand: sum("demand"), prior: sum("prior"), stock: sum("stock"), stockAfter: sum("stockAfter"), warehouse: sum("warehouse"), transit: sum("transit"), transitAfter: sum("transitAfter"), bought: sum("bought"), boughtAfter: sum("boughtAfter"),
-        status: lack > 0.000001 ? (!purchasesLoaded ? "Compras não importadas" : purchaseNeed > 0.000001 ? "Compra potencial necessária" : transfer > 0.000001 ? "Remanejamento potencial" : "Falta cobertura identificada") : pools.some((p) => p.status === "Dependente de fornecedor") ? "Dependente de fornecedor" : pools.some((p) => p.status === "Dependente de trânsito") ? "Dependente de trânsito" : pools.every((p) => p.status === "Aplicado") ? "Aplicado" : "Atendido com estoque",
+        status: lack > 0.000001 ? (!purchasesLoaded ? "Compras não importadas" : purchaseNeed > 0.000001 ? "Compra potencial necessária" : transfer > 0.000001 ? "Remanejamento potencial" : "Falta cobertura identificada") : pools.some((p) => p.status === "Dependente de fornecedor") ? "Dependente de fornecedor" : pools.some((p) => p.status === "Dependente de trânsito") ? "Dependente de trânsito" : pools.every((p) => p.status === "Sem demanda na janela") ? "Sem demanda na janela" : pools.every((p) => p.status === "Aplicado" || p.status === "Sem demanda na janela") ? "Aplicado" : "Atendido com estoque",
       };
     }).sort((a,b) => (bucketLevel === "Grupo" || bucketLevel === "Subgrupo" ? b.uncoveredCount - a.uncoveredCount : Number(b.shortage > 0.000001) - Number(a.shortage > 0.000001)) || a.label.localeCompare(b.label,"pt-BR"));
   }
@@ -2215,7 +2215,8 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
     return { Núcleo: line.nucleus, Fazenda: field.farm, Talhão: field.field, Ciclo: line.cycle, Cultura: line.culture, Atividade: readText(line.row,"Atividade","Operação","Tar."), Material: productFor(line.row,"planning",dimensions).rawName, DAP: line.dap, "Data prevista": line.date, "Planejado equivalente": line.amount, "Aplicado conciliado": line.applied, "Demanda remanescente": Math.max(0,line.amount-line.applied) };
   });
   const details = selected ? detail(selected) : [];
-  const transferRows = report.transfers.filter(t=>shown.some(p=>p.row.canonicalKey===t.canonical));
+  const shownMaterials = new Set(shown.map(p=>p.row.canonicalKey));
+  const transferRows = report.transfers.filter(t=>shownMaterials.has(t.canonical));
   const visibleTransfers = transferRows.filter(t=>t.canonical===transferMaterial);
   const summaryDetails = new Map<string, typeof details[number]>();
   for (const line of details) {
@@ -2263,7 +2264,7 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
       <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo de fornecedor líquido estimado desconta trânsito potencialmente sobreposto; pedidos internos não são compras.</p>
       <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data reservados conservadoramente. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : base.unlinked + " pedidos sem material/destino/unidade conciliados; compras centralizadas sem destino operacional não rateadas."}</p>
-      <p>Falta operacional não é necessariamente compra. Remanejamentos são sugestões dentro do escopo selecionado: estoque físico primeiro, depois excedente dependente de entrega. Compra potencial restante depende de validação dos dados, logística e prazos; não cria transferência nem reserva no SAP.</p>
+      <p>Falta operacional não é necessariamente compra. Remanejamentos são sugestões dentro do escopo selecionado: estoque físico primeiro, depois excedente dependente de entrega. Compra potencial restante pressupõe inclusive os remanejamentos futuros indicados; sem eles, some a transferência futura à compra potencial. O filtro de núcleo restringe o remanejamento ao escopo selecionado. A compra depende de validação dos dados, logística e prazos; não cria transferência nem reserva no SAP.</p>
     </div>
     {exportError && <p className="text-sm text-rose-700">{exportError}</p>}
     <div className="flex flex-wrap items-end justify-between gap-3">
