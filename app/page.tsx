@@ -2260,7 +2260,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, commerc
   const pageCount = Math.max(1, Math.ceil(buckets.length / size));
   const currentPage = Math.min(page,pageCount);
   const visible = buckets.slice((currentPage-1)*size,currentPage*size);
-  useEffect(() => { setPage(1); setDrill([]); setDetailId(""); setTransferMaterial(""); }, [cycle,culture,initial,final,nucleus,search,grain]);
+  useEffect(() => { setPage(1); setDrill([]); setDetailId(""); setTransferMaterial(""); setCommercialMaterial(""); }, [cycle,culture,initial,final,nucleus,search,grain]);
   useEffect(() => { setPage(1); setDetailPage(1); }, [pageSize]);
   useEffect(() => { setDetailPage(1); }, [detailId,byField]);
   function openBucket(bucket: typeof buckets[number]) {
@@ -4376,6 +4376,7 @@ export default function Home() {
     const linkedVolumeByOrder = new Map<string, number>();
     const linkedKeys = new Set<string>();
     const ordersByDocument = new Set(commercialOrders.map(order=>String(order.orderNumber||"").replace(/[^0-9]/g,"")).filter(Boolean));
+    const knownOrderKeys=new Set(commercialOrders.map(order=>order.key));
     const seenClosings = new Set<string>();
     const entries = resolvedCommercialClosings.filter(entry=>{
       if (seenClosings.has(entry.closing.id)) return false;
@@ -4397,7 +4398,7 @@ export default function Home() {
       if (!volume) continue;
       // If a SAP document exists but the material/item cannot be linked, do not
       // add a manual balance on top of the same document's SAP balance.
-      if (!order && (entry.closing.orderKey && commercialOrders.some(o=>o.key===entry.closing.orderKey) || ordersByDocument.has(String(entry.closing.orderNumber||"").replace(/[^0-9]/g,"")))) { ambiguous++; continue; }
+      if (!order && (entry.closing.orderKey && knownOrderKeys.has(entry.closing.orderKey) || ordersByDocument.has(String(entry.closing.orderNumber||"").replace(/[^0-9]/g,"")))) { ambiguous++; continue; }
       const remaining=order ? Math.max(0,order.balance) : typeof entry.closing.invoicedVolume==="number" && Number.isFinite(entry.closing.invoicedVolume) ? Math.max(0,volume-entry.closing.invoicedVolume) : 0;
       if (!(remaining>0)) continue;
       const linked=order ? linkedVolumeByOrder.get(order.key)||0 : 0;
@@ -4405,7 +4406,7 @@ export default function Home() {
       if (!(balance>0)) continue;
       const center=entry.closing.destination || order?.center || "";
       const monitoringNucleus=commercialDestinationNucleus(center,dimensions,farmToNucleus)||center;
-      rows.push({key:"closing:"+entry.closing.id, product:order?.product||entry.physicalProduct, canonicalProduct:entry.standardProduct, balance, center, dueDate:order?.dueDate||"", unit:order?.unit||entry.closing.unit, source:order?"Fechamento vinculado ao SAP":"Fechamento com faturamento informado",document:order?.orderNumber||entry.closing.orderNumber,plannedKey:entry.plannedKey,monitoringNucleus});
+      rows.push({key:"closing:"+entry.closing.id, product:order?.product||entry.physicalProduct, canonicalProduct:entry.standardProduct, balance, center, dueDate:order?.dueDate||"", unit:order?.unit && order.unit!=="—" ? order.unit : entry.closing.unit, source:order?"Fechamento vinculado ao SAP":"Fechamento com faturamento informado",document:order?.orderNumber||entry.closing.orderNumber,plannedKey:entry.plannedKey,monitoringNucleus});
     }
     return {rows,linkedKeys,ambiguous};
   },[commercialOrderForClosing,commercialOrders,resolvedCommercialClosings,dimensions,farmToNucleus]);
