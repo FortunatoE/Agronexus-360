@@ -358,6 +358,38 @@ type LogisticsState = {
   webMaterialLinks?: Record<string, string>;
 };
 type ClosingDistribution = Record<string, number>;
+
+function commercialPackageSize(packaging: string, unit: string): number | null {
+  const raw=packaging.trim();
+  const matches=raw.match(/\d+(?:[.,]\d+)?/g);
+  if(!matches || matches.length!==1) return null;
+  const size=Number(matches[0].replace(",","."));
+  const units=raw.toUpperCase().match(/\b(KG|ML|MG|G|L|LT|UN|T)\b/g)||[];
+  const normalizedUnit=unit.trim().toUpperCase().replace(/^LT$/,"L");
+  if(units.some(value=>value.replace(/^LT$/,"L")!==normalizedUnit))return null;
+  return Number.isFinite(size)&&size>0?size:null;
+}
+function commercialWholePackages(volume:number,size:number) {
+  const count=volume/size;
+  return Number.isSafeInteger(Math.round(count)) && Math.abs(count-Math.round(count))<1e-7;
+}
+function commercialRoundedDistribution(months:ClosingDistribution,volume:number,size:number):ClosingDistribution {
+  const ordered=Object.entries(months).filter(([,amount])=>Number.isFinite(amount)&&amount>0).sort(([a],[b])=>a.localeCompare(b));
+  const total=ordered.reduce((sum,[,amount])=>sum+amount,0);
+  const packages=Math.round(volume/size);
+  let cumulative=0,allocated=0;
+  const result:ClosingDistribution={};
+  ordered.forEach(([month,amount],index)=>{
+    cumulative+=amount;
+    // Round the cumulative requirement upward, bringing forward any fraction
+    // of a package, never increasing the total negotiated volume.
+    const target=index===ordered.length-1?packages:Math.min(packages,Math.ceil(packages*cumulative/total-1e-9));
+    const quantity=Number(((target-allocated)*size).toFixed(8));
+    if(quantity>0)result[month]=quantity;
+    allocated=target;
+  });
+  return result;
+}
 type CommercialCurrency = "" | "BRL" | "USD";
 type CommercialClosing = {
   id: string;
@@ -4232,6 +4264,7 @@ export default function Home() {
       culture: string;
       merchandiseGroup: string;
       months: Record<string, number>;
+      deliveryMonths: Record<string, number>;
       planned: number;
       product: string;
       subgroup: string;
@@ -4248,25 +4281,20 @@ export default function Home() {
         culture,
         merchandiseGroup: product.merchandiseGroup || "Sem grupo",
         months: {},
+        deliveryMonths: {},
         planned: 0,
         product: product.canonicalName,
         subgroup: product.subgroup || "Sem subgrupo",
       };
       const amount = standardQuantity(row, "planning", product, dimensions);
       current.planned += amount;
-      const scheduledAt = dateFromPlan(
-        readText(
-          row,
-          "DT_Aplicacao",
-          "Data prevista",
-          "Data planejada",
-          "Data aplicação",
-          "Data",
-        ),
-      );
-      if (scheduledAt)
-        current.months[monthKey(scheduledAt)] =
-          (current.months[monthKey(scheduledAt)] || 0) + amount;
+      const scheduledAt = plannedApplicationDate(row);
+      if (scheduledAt) {
+        const applicationMonth=monthKey(scheduledAt);
+        const deliveryMonth=monthKey(calendarAddDays(scheduledAt,-30));
+        current.months[applicationMonth]=(current.months[applicationMonth]||0)+amount;
+        current.deliveryMonths[deliveryMonth]=(current.deliveryMonths[deliveryMonth]||0)+amount;
+      }
       values.set(key, current);
     });
     return values;
@@ -4361,14 +4389,16 @@ export default function Home() {
   }, [commercialClosings.closings]);
   const closingMonths = useMemo(() => {
     const values = new Set<string>();
-    planningDistribution.forEach((schedule) =>
-      Object.keys(schedule.months).forEach((month) => values.add(month)),
-    );
+    planningDistribution.forEach((schedule) => {
+      Object.keys(schedule.months).forEach((month) => values.add(month));
+      Object.keys(schedule.deliveryMonths).forEach((month) => values.add(month));
+    });
+    Object.keys(closingDistributionDraft).forEach(month=>values.add(month));
     Object.values(commercialClosings.closings).forEach((closing) =>
       Object.keys(closing.distribution).forEach((month) => values.add(month)),
     );
     return [...values].sort();
-  }, [commercialClosings.closings, planningDistribution]);
+  }, [commercialClosings.closings, planningDistribution, closingDistributionDraft]);
 
   const resolvedCommercialClosings = useMemo(
     () =>
@@ -8964,25 +8994,26 @@ export default function Home() {
     }));
   }
   function applyPlanningDistribution() {
-    const volume = numberFrom(closingDraft.totalVolume);
-    if (!selectedClosingSchedule?.planned || !volume) {
-      setClosingMessage(
-        "Informe o produto e o volume para usar a sugestão baseada no planejamento.",
-      );
-      return;
+    const volume=numberFrom(closingDraft.totalVolume);
+    const size=commercialPackageSize(closingDraft.packaging,closingDraft.unit);
+    if(!selectedClosingSchedule?.planned||!(volume>0)){
+      setClosingMessage("Informe o produto e o volume para usar a sugestão baseada no planejamento.");return;
     }
-    const distribution = Object.fromEntries(
-      Object.entries(selectedClosingSchedule.months).map(([month, amount]) => [
-        month,
-        Number(
-          ((volume * amount) / selectedClosingSchedule.planned).toFixed(4),
-        ),
-      ]),
-    );
+    if(size===null){
+      setClosingMessage("Informe o volume de uma embalagem na mesma unidade do fechamento (ex.: 15 ou saco 15 KG).");return;
+    }
+    if(!commercialWholePackages(volume,size)){
+      setClosingMessage("O volume negociado não é múltiplo da embalagem. Ajuste o volume ou a embalagem antes de sugerir; o sistema não altera o volume comprado.");return;
+    }
+    const months=selectedClosingSchedule.deliveryMonths;
+    const dated=Object.values(months).reduce((sum,amount)=>sum+amount,0);
+    if(!(dated>0)||Object.values(months).some(amount=>amount<0)||Math.abs(dated-selectedClosingSchedule.planned)>0.000001){
+      setClosingMessage("Há demanda sem data de aplicação reconhecida ou volumes inconsistentes. Corrija o planejamento antes de sugerir a distribuição D-30.");return;
+    }
+    const distribution=commercialRoundedDistribution(months,volume,size);
     setClosingDistributionDraft(distribution);
-    setClosingMessage(
-      "Distribuição sugerida pelo volume planejado em cada mês de aplicação.",
-    );
+    const past=Object.keys(distribution).some(month=>month<monthKey(new Date()));
+    setClosingMessage("Distribuição sugerida 30 dias corridos antes de cada aplicação, em embalagens fechadas, preservando o volume negociado."+(past?" Atenção: há mês de entrega já vencido; alinhe a antecipação com o fornecedor.":""));
   }
   function saveCommercialClosing() {
     if (currentUser?.role !== "admin") return;
@@ -9006,6 +9037,13 @@ export default function Home() {
         `A distribuição mensal soma ${formatNumber(totalDistributed)} e precisa totalizar ${formatNumber(totalVolume)}.`,
       );
       return;
+    }
+    const packageSize=commercialPackageSize(closingDraft.packaging,closingDraft.unit);
+    if(packageSize===null){
+      setClosingMessage("Informe uma embalagem válida na unidade do fechamento (ex.: 15 ou saco 15 KG).");return;
+    }
+    if(!commercialWholePackages(totalVolume,packageSize)||Object.values(closingDistributionDraft).some(amount=>!Number.isFinite(amount)||amount<0||!commercialWholePackages(amount,packageSize))){
+      setClosingMessage("O volume total e cada distribuição mensal devem ser múltiplos da embalagem, sem volumes negativos. Ajuste a distribuição antes de salvar.");return;
     }
     const selectedOrder = commercialOrders.find(
       (order) => order.key === closingDraft.orderKey,
@@ -11737,7 +11775,7 @@ export default function Home() {
                           packaging: event.target.value,
                         }))
                       }
-                      placeholder="Ex.: galão 20 L"
+                      placeholder="Ex.: 15 ou saco 15 KG"
                       value={closingDraft.packaging}
                     />
                   </label>
@@ -11808,7 +11846,7 @@ export default function Home() {
                     <div>
                       <h4 className="font-semibold">Distribuição mensal</h4>
                       <p className="mt-1 text-xs text-slate-500">
-                        Preencha os volumes por mês. Total distribuído:{" "}
+                        Entrega prevista 30 dias antes da aplicação na sugestão; volumes em embalagens fechadas. Total distribuído:{" "}
                         <strong>{formatNumber(draftDistributed)}</strong> de{" "}
                         {formatNumber(numberFrom(closingDraft.totalVolume))}.
                       </p>
@@ -11818,7 +11856,7 @@ export default function Home() {
                       onClick={applyPlanningDistribution}
                       type="button"
                     >
-                      Sugerir pelo planejamento
+                      Sugerir pelo planejamento (D-30)
                     </button>
                   </div>
                   <div className="mt-4 grid gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
