@@ -2,9 +2,10 @@
 
 import { clsx as cn } from "clsx";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
+import { commercialFarmDeliveries } from "@/lib/commercial-closings";
 
-type Closing = {
+type Closing = Parameters<typeof commercialFarmDeliveries>[0] & {
   id: string;
   product: string;
   active: string;
@@ -58,6 +59,22 @@ function monthsInPeriod({ start, end }: ClosingCalendarPeriod) {
   return months;
 }
 
+function calendarFarmRows(closing: Closing, months: string[]) {
+  const byFarm = new Map<string, Record<string, number>>();
+  const visibleMonths = new Set(months);
+  for (const { farm, month, volume } of commercialFarmDeliveries(closing)) {
+    if (!visibleMonths.has(month) || !volume) continue;
+    const monthly = byFarm.get(farm) || {};
+    monthly[month] = (monthly[month] ?? 0) + volume;
+    byFarm.set(farm, monthly);
+  }
+  return [...byFarm].sort(([left], [right]) => left.localeCompare(right, "pt-BR"))
+    .map(([farm, monthly]) => {
+      const volumes = months.map((month) => monthly[month] ?? 0);
+      return { farm, volumes: [...volumes, volumes.reduce((sum, amount) => sum + amount, 0)] };
+    });
+}
+
 function summarizeCalendar(groups: SupplierGroup[], months: string[]) {
   const totalByColumn = Array.from({ length: months.length + 1 }, () => new Map<string, number>());
   const activeGroups = groups.flatMap((group) => {
@@ -74,7 +91,7 @@ function summarizeCalendar(groups: SupplierGroup[], months: string[]) {
         subtotal.set(unit, (subtotal.get(unit) ?? 0) + amount);
         total.set(unit, (total.get(unit) ?? 0) + amount);
       });
-      return [{ closing, unit, volumes }];
+      return [{ closing, unit, volumes, farms: calendarFarmRows(closing, months) }];
     });
     return rows.length ? [{ key: group.key, name: group.name, rows, subtotalByColumn }] : [];
   });
@@ -87,6 +104,14 @@ function TotalsCells({ totals }: { totals: VolumeByUnit[] }) {
       {volumes.size ? [...volumes].sort(([left], [right]) => left.localeCompare(right, "pt-BR")).map(([unit, volume]) => (
         <div className="leading-4" key={unit}>{volumeFormat.format(volume)} <span className="text-[10px] font-medium">{unit || "s/un."}</span></div>
       )) : <span className="font-normal text-slate-400">—</span>}
+    </td>
+  ));
+}
+
+function DeliveryCells({ volumes, unit, highlight }: { volumes: number[]; unit: string; highlight?: boolean }) {
+  return volumes.map((amount, index) => (
+    <td className={cn(volumeColumn, amount && highlight && "bg-emerald-50 font-semibold text-emerald-900", index === volumes.length - 1 && "border-l-slate-200")} key={index}>
+      {amount ? <>{volumeFormat.format(amount)} <span className="text-[10px] font-medium">{unit || "s/un."}</span></> : <span className="text-slate-400">—</span>}
     </td>
   ));
 }
@@ -105,6 +130,7 @@ export function CommercialClosingCalendar({
   supplier?: string;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [expandedProducts, setExpandedProducts] = useState<Record<string, boolean>>({});
   const suggested = defaultPeriod(registeredMonths);
   const { start, end } = period ?? suggested;
   const endpoints = [registeredMonths[0] ?? suggested.start, suggested.start, start, end, suggested.end, registeredMonths.at(-1) ?? suggested.end].sort();
@@ -143,7 +169,7 @@ export function CommercialClosingCalendar({
         <table className="w-max min-w-full border-separate border-spacing-0 text-xs">
           <thead className="sticky top-0 z-20 bg-slate-50 text-slate-700">
             <tr className="bg-slate-50">
-              <th className={identityColumn} scope="col">Fornecedor / produto</th>
+              <th className={identityColumn} scope="col">Fornecedor / produto / fazenda</th>
               {months.map((month) => (
                 <th className={volumeColumn} key={month} scope="col">{formatCalendarMonth(month)}</th>
               ))}
@@ -174,23 +200,40 @@ export function CommercialClosingCalendar({
                   </th>
                   <TotalsCells totals={group.subtotalByColumn} />
                 </tr>
-                {open ? group.rows.map(({ closing, unit, volumes }) => (
-                  <tr className="bg-white text-slate-700 [&>td]:border-t [&>th]:border-t" key={closing.id}>
-                    <th className={cn(identityColumn, "pl-7 font-medium")} scope="row">
-                      <span className="block wrap-anywhere text-slate-900">
-                        {closing.product}{closing.active ? ` (${closing.active})` : ""}
-                      </span>
-                      <span className="block wrap-anywhere text-[10px] font-normal leading-4 text-slate-500">
-                        {[closing.destination, closing.deliveryLocation, closing.culture || closing.cycle].filter(Boolean).join(" · ")}
-                      </span>
-                    </th>
-                    {volumes.map((amount, index) => (
-                      <td className={cn(volumeColumn, amount && "bg-emerald-50 font-semibold text-emerald-900", index === volumes.length - 1 && "border-l-slate-200")} key={index}>
-                        {amount ? <>{volumeFormat.format(amount)} <span className="text-[10px] font-medium">{unit || "s/un."}</span></> : <span className="text-slate-400">—</span>}
-                      </td>
-                    ))}
-                  </tr>
-                )) : null}
+                {open && group.rows.map(({ closing, unit, volumes, farms }) => {
+                  const showFarms = expandedProducts[closing.id] ?? true;
+                  const product = closing.active ? `${closing.product} (${closing.active})` : closing.product;
+                  return (
+                    <Fragment key={closing.id}>
+                      <tr className="bg-white text-slate-700 [&>td]:border-t [&>th]:border-t">
+                        <th className={cn(identityColumn, "pl-7 font-medium")} scope="row">
+                          {farms.length ? (
+                            <button
+                              aria-expanded={showFarms}
+                              aria-label={`Entregas por fazenda de ${product}`}
+                              className="flex w-full items-start gap-1 text-left text-slate-900 hover:underline"
+                              onClick={() => setExpandedProducts((current) => ({ ...current, [closing.id]: !showFarms }))}
+                              type="button"
+                            >
+                              {showFarms ? <ChevronDown aria-hidden="true" className="size-4 shrink-0" /> : <ChevronRight aria-hidden="true" className="size-4 shrink-0" />}
+                              <span className="min-w-0 wrap-anywhere">{product}</span>
+                            </button>
+                          ) : <span className="block wrap-anywhere text-slate-900">{product}</span>}
+                          <span className="block wrap-anywhere text-[10px] font-normal leading-4 text-slate-500">
+                            {[closing.destination, closing.deliveryLocation, closing.culture || closing.cycle].filter(Boolean).join(" · ")}
+                          </span>
+                        </th>
+                        <DeliveryCells volumes={volumes} unit={unit} highlight />
+                      </tr>
+                      {showFarms && farms.map(({ farm, volumes: farmVolumes }) => (
+                        <tr className="bg-slate-50 text-slate-700 [&>td]:border-t [&>th]:border-t" key={farm}>
+                          <th className={cn(identityColumn, "pl-12 font-normal wrap-anywhere")} scope="row">{farm}</th>
+                          <DeliveryCells volumes={farmVolumes} unit={unit} />
+                        </tr>
+                      ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             );
           })}
