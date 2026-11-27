@@ -397,7 +397,6 @@ type ClosingLotDraft = {
   id: string;
   totalVolume: string;
   unitPrice: string;
-  validity: string;
   orderKey: string;
   allocations: ClosingAllocationDraft[];
 };
@@ -417,7 +416,6 @@ function emptyClosingLot(): ClosingLotDraft {
     id: taskId("fechamento"),
     totalVolume: "",
     unitPrice: "",
-    validity: "",
     orderKey: "",
     allocations: [],
   };
@@ -428,7 +426,6 @@ type CommercialClosing = {
   groupId?: string;
   groupName?: string;
   groupFarms?: ClosingFarm[];
-  validity?: string;
   farmAllocations?: { farmId: string; month: string; volume: number }[];
   supplier: string;
   paymentDue: string;
@@ -9185,7 +9182,6 @@ export default function Home() {
         groupId,
         groupName,
         groupFarms: farms,
-        validity: lot.validity.trim(),
         farmAllocations,
         supplier,
         paymentDue: closingDraft.paymentDue,
@@ -9323,7 +9319,6 @@ export default function Home() {
           id: item.id,
           totalVolume: closingDraftText(item.totalVolume),
           unitPrice: closingDraftText(item.unitPrice),
-          validity: item.validity || "",
           orderKey: item.orderKey,
           allocations: (item.farmAllocations || []).map((allocation) => ({
             ...allocation,
@@ -12179,7 +12174,7 @@ export default function Home() {
                         return (
                           <fieldset className="min-w-0 rounded-xl border border-slate-200 p-4" key={lot.id}>
                             <legend className="px-2 text-sm font-semibold">Lote {index + 1}</legend>
-                            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                               <label className="grid gap-1 text-xs font-semibold text-slate-600">
                                 Volume contratado
                                 <input className={inputClass} inputMode="decimal" value={lot.totalVolume}
@@ -12189,11 +12184,6 @@ export default function Home() {
                                 Valor unitário
                                 <input className={inputClass} inputMode="decimal" value={lot.unitPrice}
                                   onChange={(event) => updateClosingLot(lot.id, { unitPrice: event.target.value })} />
-                              </label>
-                              <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                Validade
-                                <input className={inputClass} placeholder="Ex.: 08/2027 ou Normal" value={lot.validity}
-                                  onChange={(event) => updateClosingLot(lot.id, { validity: event.target.value })} />
                               </label>
                               <label className="grid gap-1 text-xs font-semibold text-slate-600">
                                 Pedido de compra vinculado
@@ -12451,7 +12441,6 @@ export default function Home() {
                                     <span className="text-xs text-slate-500">
                                       {closing.packaging || closing.unit}
                                     </span>
-                                    {closing.validity && <div className="text-xs text-slate-500">Validade {closing.validity}</div>}
                                   </td>
                                   <td className="px-3 py-3">
                                     <strong>
