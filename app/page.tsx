@@ -1954,6 +1954,217 @@ function PlanningApplicationCalendar({
   );
 }
 
+
+type DapPurchase = { key: string; product: string; balance: number; center: string; dueDate: string; unit: string };
+type DapPlanLine = { row: Row; id: string; nucleus: string; cycle: string; culture: string; dap: number | null; date: string; amount: number; applied: number; match: string };
+function plannedDap(row: Row) {
+  const explicit = calendarNumeric(calendarSourceValue(row, "dap", "DAP planejado", "DAP", "Dias após plantio", "Dias apos plantio", "Dias"));
+  if (explicit !== null) return explicit;
+  const planted = plannedApplicationDate({ DT_Aplicacao: readText(row, "DT_Plantio", "Data de plantio", "Data Plantio", "Dt. Plantio", "Plantio") });
+  const application = plannedApplicationDate(row);
+  const utc = (date: Date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+  return planted && application ? (utc(application) - utc(planted)) / 86400000 : null;
+}
+function dapOperationMatch(row: Row, canonical: string) {
+  const wbs = headerKey(readText(row, "WBS element", "WBS", "Elemento PEP", "Def.proj."));
+  const diagram = headerKey(readText(row, "DiagRede", "Diagrama"));
+  const operation = headerKey(readText(row, "Tar.", "Operação", "Operacao"));
+  return wbs && diagram && operation ? JSON.stringify([wbs, diagram, operation, canonical]) : "";
+}
+function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNucleus, operatorNucleus, purchasesLoaded, stockLoaded, transitLoaded, consumptionLoaded }: {
+  plans: Row[]; consumption: Row[]; ledger: ReconciliationRow[]; orders: DapPurchase[]; dimensions: DimensionBundle;
+  farmToNucleus: Record<string, string>; operatorNucleus: string; purchasesLoaded: boolean; stockLoaded: boolean; transitLoaded: boolean; consumptionLoaded: boolean;
+}) {
+  const [cycle, setCycle] = useState("Safrinha");
+  const [culture, setCulture] = useState("Todas");
+  const [initial, setInitial] = useState("-30");
+  const [final, setFinal] = useState("30");
+  const [nucleus, setNucleus] = useState("Todos");
+  const [search, setSearch] = useState("");
+  const [detailId, setDetailId] = useState("");
+  const [byField, setByField] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const lo = Number(initial), hi = Number(final);
+  const valid = initial.trim() !== "" && final.trim() !== "" && Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi;
+  const base = useMemo(() => {
+    const lines: DapPlanLine[] = [];
+    const groups = new Map<string, DapPlanLine[]>();
+    for (const row of plans) {
+      const product = productFor(row, "planning", dimensions);
+      if (product.rawName === "Sem descrição") continue;
+      const amount = standardQuantity(row, "planning", product, dimensions);
+      if (!(amount > 0)) continue;
+      const unit = planningNucleusFor(row, dimensions, farmToNucleus);
+      const match = dapOperationMatch(row, product.canonicalKey);
+      const date = plannedApplicationDate(row);
+      const line = { row, id: product.canonicalKey + "|" + normalizeMaterial(unit), nucleus: unit, cycle: cycleFor(row, dimensions), culture: applicationCulture(row), dap: plannedDap(row), date: date ? dateKey(date) : "", amount, applied: 0, match };
+      lines.push(line);
+      if (match) { const list = groups.get(match) || []; list.push(line); groups.set(match, list); }
+    }
+    const used = new Map<string, number>();
+    let unmatched = 0;
+    for (const row of consumption) {
+      const p = productFor(row, "consumption", dimensions);
+      const key = dapOperationMatch(row, p.canonicalKey);
+      const amount = standardQuantity(row, "consumption", p, dimensions);
+      const candidates = groups.get(key);
+      if (!key || !candidates?.length || new Set(candidates.map((line) => JSON.stringify([line.id,line.cycle,line.culture,line.dap,line.date]))).size !== 1) { if (amount !== 0) unmatched += 1; continue; }
+      used.set(key, (used.get(key) || 0) + amount);
+    }
+    for (const [key, amount] of used) {
+      const candidates = groups.get(key)!;
+      const total = candidates.reduce((sum, line) => sum + line.amount, 0);
+      for (const line of candidates) line.applied = Math.max(0, Math.min(line.amount, amount * line.amount / total));
+    }
+    const purchase = new Map<string, { amount: number; dates: string[]; missing: number }>();
+    const seen = new Set<string>();
+    let unlinked = 0;
+    for (const order of orders) {
+      if (seen.has(order.key) || !(order.balance > 0)) continue;
+      seen.add(order.key);
+      const p = productFor({ Produto: order.product }, "planning", dimensions);
+      const center = normalizeMaterial(order.center);
+      const unit = center === "0714" ? "ARMAZÉM" : dimensions.centerToNucleus[center] || farmToNucleus[center];
+      if (!unit || !p.resolvedByDimension || !order.unit || order.unit === "—") { unlinked += 1; continue; }
+      const id = p.canonicalKey + "|" + normalizeMaterial(unit);
+      const current = purchase.get(id) || { amount: 0, dates: [], missing: 0 };
+      current.amount += standardAmount(order.balance, p, dimensions);
+      const due = plannedApplicationDate({ DT_Aplicacao: order.dueDate });
+      if (due) current.dates.push(dateKey(due)); else current.missing += 1;
+      purchase.set(id, current);
+    }
+    return { lines, purchase, unmatched, unlinked, nuclei: [...new Set(lines.map((line) => line.nucleus))].sort() };
+  }, [plans, consumption, orders, dimensions, farmToNucleus]);
+  const report = useMemo(() => {
+    const eligible = (line: DapPlanLine) => line.cycle === cycle && (culture === "Todas" || line.culture === culture);
+    const selected = valid ? base.lines.filter((line) => eligible(line) && line.dap !== null && line.dap >= lo && line.dap <= hi) : [];
+    const selectedSet = new Set(selected);
+    const horizon = selected.reduce((max, line) => line.date > max ? line.date : max, "");
+    const selectedById = new Map<string, DapPlanLine[]>();
+    const competition = new Map<string, number>();
+    const ledgers = new Map(ledger.map((row) => [row.id, row]));
+    for (const line of selected) { const list = selectedById.get(line.id) || []; list.push(line); selectedById.set(line.id, list); }
+    let undated = 0;
+    for (const line of base.lines) {
+      if (selectedSet.has(line) || !horizon) continue;
+      if (!line.date) { if (line.amount > line.applied) undated += 1; continue; }
+      if (line.date <= horizon) competition.set(line.id, (competition.get(line.id) || 0) + Math.max(0, line.amount - line.applied));
+    }
+    const central = new Map<string, number>();
+    const allTransit = new Map<string, number>();
+    for (const row of ledger) {
+      central.set(row.canonicalKey, (central.get(row.canonicalKey) || 0) + Math.max(0, row.warehouseBalance));
+      allTransit.set(row.canonicalKey, (allTransit.get(row.canonicalKey) || 0) + Math.max(0, row.transit));
+    }
+    const keys = new Set([...selectedById.keys(), ...competition.keys()]);
+    const pools = [...keys].map((id) => {
+      const row = ledgers.get(id);
+      if (!row) return null;
+      const lines = selectedById.get(id) || [];
+      const planned = lines.reduce((sum, line) => sum + line.amount, 0);
+      const applied = lines.reduce((sum, line) => sum + line.applied, 0);
+      const demand = Math.max(0, planned - applied);
+      const prior = competition.get(id) || 0;
+      const stock = Math.max(0, row.farmBalance);
+      const transit = Math.max(0, row.transit);
+      const order = base.purchase.get(id);
+      const bought = order?.amount || 0;
+      return { row, lines, planned, applied, demand, prior, stock, transit, bought, warehouse: 0, stockAfter: 0, transitAfter: 0, boughtAfter: 0, overlap: 0, shortage: 0, priorUncovered: 0, first: lines.filter((line) => line.amount > line.applied && line.date).map((line) => line.date).sort()[0] || "", due: order?.dates.slice().sort()[0] || "", missingDue: order?.missing || 0, status: "" };
+    }).filter((item): item is NonNullable<typeof item> => item !== null);
+    // Deduct all potentially overlapping transit from supplier balances once per material.
+    // No exact PO/MB5T link is assumed: this is deliberately a lower bound.
+    const overlapPool = new Map(allTransit);
+    // Prefer same nucleus; only then reserve possible overlap across destinations.
+    for (const p of pools) {
+      const available = overlapPool.get(p.row.canonicalKey) || 0;
+      p.overlap = Math.min(p.bought, p.transit, available);
+      overlapPool.set(p.row.canonicalKey, available - p.overlap);
+    }
+    for (const p of [...pools].sort((a,b) => a.row.id.localeCompare(b.row.id))) {
+      const available = overlapPool.get(p.row.canonicalKey) || 0;
+      const extra = Math.min(p.bought - p.overlap, available);
+      p.overlap += extra;
+      overlapPool.set(p.row.canonicalKey, available - extra);
+    }
+    // Reserve stock for every competing demand before allocating the target window.
+    for (const p of pools) {
+      let prior = p.prior;
+      const used = Math.min(prior, p.stock); prior -= used; p.stockAfter = p.stock - used;
+      const transit = Math.min(prior, p.transit); prior -= transit; p.transitAfter = p.transit - transit;
+      const netBought = Math.max(0, p.bought - p.overlap);
+      const bought = Math.min(prior, netBought); prior -= bought; p.boughtAfter = netBought - bought;
+      p.priorUncovered = prior;
+    }
+    // Shared warehouse is reserved for competing needs before assigning the target.
+    for (const p of [...pools].sort((a,b) => a.row.id.localeCompare(b.row.id))) {
+      const available = central.get(p.row.canonicalKey) || 0;
+      const used = Math.min(available, p.priorUncovered);
+      p.priorUncovered -= used; central.set(p.row.canonicalKey, available - used);
+    }
+    for (const p of [...pools].sort((a,b) => (a.first || "9999").localeCompare(b.first || "9999") || a.row.id.localeCompare(b.row.id))) {
+      const available = central.get(p.row.canonicalKey) || 0;
+      p.warehouse = Math.min(available, Math.max(0, p.demand - p.stockAfter));
+      central.set(p.row.canonicalKey, available - p.warehouse);
+      p.shortage = Math.max(0, p.demand - p.stockAfter - p.warehouse - p.transitAfter - p.boughtAfter);
+      p.status = p.demand <= 0.000001 ? "Aplicado" : p.demand <= p.stockAfter + p.warehouse + 0.000001 ? "Atendido com estoque" : p.demand <= p.stockAfter + p.warehouse + p.transitAfter + 0.000001 ? "Dependente de trânsito" : p.shortage <= 0.000001 ? "Dependente de fornecedor" : purchasesLoaded ? "Falta cobertura identificada" : "Compras não importadas";
+    }
+    const scoped = (line: DapPlanLine) => (!operatorNucleus || line.nucleus === operatorNucleus) && (nucleus === "Todos" || line.nucleus === nucleus);
+    const visibleDates = selected.filter(scoped).map((line) => line.date).filter(Boolean).sort();
+    return { rows: pools.filter((p) => p.lines.length && scoped(p.lines[0])).sort((a,b) => b.shortage - a.shortage || a.row.standardMaterial.localeCompare(b.row.standardMaterial)), first: visibleDates[0] || "", horizon: visibleDates[visibleDates.length - 1] || "", undated,
+      missingDap: base.lines.filter((line) => eligible(line) && scoped(line) && line.dap === null).length,
+      missingDate: selected.filter((line) => scoped(line) && !line.date).length };
+  }, [base, cycle, culture, valid, lo, hi, ledger, operatorNucleus, nucleus, purchasesLoaded]);
+  const shown = report.rows.filter((p) => !search.trim() || headerKey([p.row.standardMaterial,p.row.active,p.row.nucleus,...p.lines.map((line) => line.culture)].join(" ")).includes(headerKey(search)));
+  const selected = shown.find((p) => p.row.id === detailId);
+  const detail = (p: typeof report.rows[number]) => p.lines.map((line) => {
+    const field = calendarFarmField(line.row);
+    return { Núcleo: line.nucleus, Fazenda: field.farm, Talhão: field.field, Ciclo: line.cycle, Cultura: line.culture, Atividade: readText(line.row,"Atividade","Operação","Tar."), Material: productFor(line.row,"planning",dimensions).rawName, DAP: line.dap, "Data prevista": line.date, "Planejado equivalente": line.amount, "Aplicado conciliado": line.applied, "Demanda remanescente": Math.max(0,line.amount-line.applied) };
+  });
+  const details = selected ? detail(selected) : [];
+  const summaryDetails = new Map<string, typeof details[number]>();
+  for (const line of details) {
+    const key = JSON.stringify([line.Fazenda, line.Ciclo, line.Cultura, line.Atividade, line.Material, line.DAP, line["Data prevista"], byField ? line.Talhão : ""]);
+    const current = summaryDetails.get(key);
+    if (current) { current["Planejado equivalente"] += line["Planejado equivalente"]; current["Aplicado conciliado"] += line["Aplicado conciliado"]; current["Demanda remanescente"] += line["Demanda remanescente"]; }
+    else summaryDetails.set(key, { ...line });
+  }
+  const risk = (p: typeof report.rows[number]) => p.demand <= p.stockAfter + p.warehouse + 0.000001 ? "—" : p.first && p.due && !p.missingDue && p.due > p.first && p.demand > p.stockAfter + p.warehouse + p.transitAfter ? "Primeira compra após início" : "Prazo a validar";
+  async function exportDap() {
+    setExportError("");
+    try {
+      const XLSX = await loadXlsx();
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Demanda concorrente":p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Apoio armazém":p.warehouse, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Resumo");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.flatMap(detail)), "Talhões");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Não garante chegada; compras centralizadas sem destino operacional não rateadas." }]), "Premissas");
+      XLSX.writeFile(workbook, "provisionamento_DAP_" + cycle + "_" + lo + "_" + hi + ".xlsx");
+    } catch (error) { setExportError(error instanceof Error ? error.message : "Falha ao exportar."); }
+  }
+  const inputClass = "rounded-lg border border-slate-200 px-3 py-2 text-sm";
+  const value = (v: number) => calendarDetailNumber(v);
+  return <div className="mt-6 space-y-4">
+    <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-semibold">Provisionamento por DAP</h3><p className="text-xs text-slate-500">Janela relativa ao plantio de cada talhão. Volumes equivalentes ao material padrão.</p></div><button type="button" disabled={!shown.length || !valid} onClick={() => void exportDap()} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Exportar Excel</button></div>
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+      <label className="grid gap-1 text-xs font-semibold">Ciclo<select className={inputClass} value={cycle} onChange={(e) => setCycle(e.target.value)}>{["Safra","Safrinha"].map((v) => <option key={v}>{v}</option>)}</select></label>
+      <label className="grid gap-1 text-xs font-semibold">Cultura<select className={inputClass} value={culture} onChange={(e) => setCulture(e.target.value)}>{["Todas","Soja","Algodão","Milho"].map((v) => <option key={v}>{v}</option>)}</select></label>
+      <label className="grid gap-1 text-xs font-semibold">DAP inicial<input type="number" step="1" className={inputClass} value={initial} onChange={(e) => setInitial(e.target.value)} /></label>
+      <label className="grid gap-1 text-xs font-semibold">DAP final<input type="number" step="1" className={inputClass} value={final} onChange={(e) => setFinal(e.target.value)} /></label>
+      <label className="grid gap-1 text-xs font-semibold">Núcleo<select className={inputClass} disabled={!!operatorNucleus} value={operatorNucleus || nucleus} onChange={(e) => setNucleus(e.target.value)}>{(operatorNucleus ? [operatorNucleus] : ["Todos", ...base.nuclei]).map((v) => <option key={v}>{v}</option>)}</select></label>
+      <label className="grid gap-1 text-xs font-semibold">Buscar material<input className={inputClass} value={search} onChange={(e) => setSearch(e.target.value)} /></label>
+    </div>
+    {!valid && <p className="text-sm text-rose-700">Informe DAPs inteiros, com início menor ou igual ao fim.</p>}
+    <div className="grid gap-2 sm:grid-cols-4">{[["Materiais / núcleos",shown.length],["Atendidos com estoque",shown.filter((p) => p.status === "Atendido com estoque" || p.status === "Aplicado").length],["Dependentes de entregas",shown.filter((p) => p.status.startsWith("Dependente")).length],["Sem cobertura identificada",shown.filter((p) => p.shortage > 0.000001).length]].map(([label,count]) => <div key={label} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-2xl font-semibold">{count}</p></div>)}</div>
+    <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
+      <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo de fornecedor líquido estimado desconta trânsito potencialmente sobreposto; pedidos internos não são compras.</p>
+      <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data não reservados. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : base.unlinked + " pedidos sem material/destino/unidade conciliados; compras centralizadas sem destino operacional não rateadas."}</p>
+      <p>Falta cobertura é indicativa, não autorização de compra. Datas de vencimento não garantem chegada; transferência interna e chegada física não confirmadas.</p>
+    </div>
+    {exportError && <p className="text-sm text-rose-700">{exportError}</p>}
+    <div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[1650px] text-left text-xs"><thead className="bg-slate-50"><tr>{["Núcleo","Material padrão","Cultura","Planejado","Aplicado","Demanda","Concorrente","Estoque atual","Estoque residual","Armazém","Trânsito atual","Trânsito residual","Comprado a entregar (bruto)","Compra residual","Falta cobertura","Prazo","Situação",""].map((h) => <th key={h} className="p-3">{h}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{shown.map((p) => <tr key={p.row.id}><td className="p-3">{p.row.nucleus}</td><td className="p-3 font-semibold">{p.row.standardMaterial}<span className="block text-slate-500">{p.row.active}</span></td><td className="p-3">{[...new Set(p.lines.map((line) => line.culture))].join(", ")}</td>{[p.planned,p.applied,p.demand,p.prior,p.stock,p.stockAfter,p.warehouse,p.transit,p.transitAfter].map((v,i) => <td key={i} className="p-3 tabular-nums">{value(v)}</td>)}<td className="p-3">{purchasesLoaded ? value(p.bought) : "—"}</td><td className="p-3">{purchasesLoaded ? value(p.boughtAfter) : "—"}</td><td className={"p-3 font-semibold " + (p.shortage > 0.000001 ? "text-rose-700" : "text-emerald-700")}>{value(p.shortage)}</td><td className="p-3">{risk(p)}<span className="block text-slate-500">{p.first || "Sem data"} / {p.due || "Sem previsão"}</span></td><td className="p-3">{p.status}</td><td className="p-3"><button type="button" className="font-semibold text-emerald-700" onClick={() => { setDetailId(p.row.id); setByField(false); }}>Detalhes</button></td></tr>)}{!shown.length && <tr><td colSpan={18} className="p-8 text-center text-slate-500">Nenhuma demanda na janela de DAP selecionada.</td></tr>}</tbody></table></div>
+    {selected && <div role="dialog" aria-modal="true" aria-label="Detalhamento do provisionamento" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex flex-wrap justify-between gap-2"><h3 className="font-semibold">{selected.row.standardMaterial} · {selected.row.nucleus}</h3><div className="flex gap-2"><button type="button" className={inputClass} onClick={() => setByField(!byField)}>{byField ? "Resumo por fazenda" : "Ver por talhão"}</button><button type="button" className={inputClass} onClick={() => setDetailId("")}>Fechar</button></div></div><div className="mt-3 overflow-auto"><table className="w-full min-w-[850px] text-xs"><thead className="bg-slate-50"><tr>{["Fazenda",...(byField?["Talhão"]:[]),"Cultura","Atividade","Material","DAP","Data","Planejado equiv.","Aplicado","Demanda"].map((h) => <th key={h} className="p-2 text-left">{h}</th>)}</tr></thead><tbody>{[...summaryDetails.entries()].map(([key,line]) => <tr key={key} className="border-b border-slate-100"><td className="p-2">{line.Fazenda}</td>{byField && <td className="p-2">{line.Talhão}</td>}<td className="p-2">{line.Cultura}</td><td className="p-2">{line.Atividade}</td><td className="p-2">{line.Material}</td><td className="p-2">{line.DAP}</td><td className="p-2">{line["Data prevista"] || "—"}</td><td className="p-2">{value(line["Planejado equivalente"])}</td><td className="p-2">{value(line["Aplicado conciliado"])}</td><td className="p-2">{value(line["Demanda remanescente"])}</td></tr>)}</tbody></table></div></div></div>}
+  </div>;
+}
+
 function mergePremises(
   bundle: DimensionBundle,
   items: DimensionPremise[],
@@ -2886,6 +3097,7 @@ export default function Home() {
   const [premiseSection, setPremiseSection] =
     useState<PremiseSection["id"]>("operacionais");
   const [showProvision, setShowProvision] = useState(false);
+  const [calendarMode, setCalendarMode] = useState<"calendar" | "dap">("calendar");
   const [dark, setDark] = useState(
     () =>
       typeof window !== "undefined" &&
@@ -9565,7 +9777,7 @@ export default function Home() {
             type="button"
           >
             <CalendarDays className="h-4 w-4" />
-            Rodar provisionamento
+            Provisionamento por data
           </button>
         </div>
         <div className="mt-6 grid gap-3 sm:grid-cols-3">
@@ -9588,7 +9800,12 @@ export default function Home() {
             tone="amber"
           />
         </div>
-        <PlanningApplicationCalendar rows={plans} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} />
+        <div className="mt-5 flex flex-wrap gap-2 border-b border-slate-200 pb-3">
+          <button type="button" onClick={() => setCalendarMode("calendar")} className={cn("rounded-lg px-4 py-2 text-sm font-semibold", calendarMode === "calendar" ? "bg-emerald-700 text-white" : "border border-slate-200")}>Calendário de aplicações</button>
+          <button type="button" onClick={() => setShowProvision(true)} disabled={!plans.length} className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold disabled:opacity-50">Provisionamento por data</button>
+          <button type="button" onClick={() => setCalendarMode("dap")} className={cn("rounded-lg px-4 py-2 text-sm font-semibold", calendarMode === "dap" ? "bg-emerald-700 text-white" : "border border-slate-200")}>Provisionamento por DAP</button>
+        </div>
+        {calendarMode === "calendar" ? <PlanningApplicationCalendar rows={plans} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} /> : <DapProvision plans={plans} consumption={datasets.consumo} ledger={ledger} orders={commercialOrders} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} purchasesLoaded={!!imports.pedidosCompra} stockLoaded={!!imports.estoque || !!imports.estoqueMb52} transitLoaded={!!imports.transito} consumptionLoaded={!!imports.consumo} />}
       </section>
     );
   } else if (active === "Acompanhamento") {
