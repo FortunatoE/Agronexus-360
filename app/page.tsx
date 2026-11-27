@@ -12,6 +12,8 @@ import {
 } from "react";
 import {
   buildCommercialClosingOverview,
+  commercialFarmDeliveries,
+  type FarmDelivery,
   commercialPlanningKey,
   matchesCommercialClosing,
   resolveCommercialClosings,
@@ -391,15 +393,7 @@ function commercialRoundedDistribution(months:ClosingDistribution,volume:number,
   return result;
 }
 type CommercialCurrency = "" | "BRL" | "USD";
-type ClosingFarm = { id: string; name: string };
-type ClosingAllocationDraft = { id: string; farmId: string; month: string; volume: string };
-type ClosingLotDraft = {
-  id: string;
-  totalVolume: string;
-  unitPrice: string;
-  orderKey: string;
-  allocations: ClosingAllocationDraft[];
-};
+type ClosingDeliveryDraft = { id: string; farm: string; month: string; volume: string };
 
 function closingDraftNumber(value: string) {
   const number = value.trim();
@@ -411,21 +405,10 @@ function closingDraftText(value: number) {
   return value.toLocaleString("pt-BR", { useGrouping: false, maximumFractionDigits: 15 });
 }
 
-function emptyClosingLot(): ClosingLotDraft {
-  return {
-    id: taskId("fechamento"),
-    totalVolume: "",
-    unitPrice: "",
-    orderKey: "",
-    allocations: [],
-  };
-}
-
 type CommercialClosing = {
   id: string;
-  groupId?: string;
-  groupName?: string;
-  groupFarms?: ClosingFarm[];
+  farmDeliveries?: FarmDelivery[];
+  groupFarms?: { id: string; name: string }[];
   farmAllocations?: { farmId: string; month: string; volume: number }[];
   supplier: string;
   paymentDue: string;
@@ -3540,11 +3523,8 @@ export default function Home() {
   });
   const [closingDistributionDraft, setClosingDistributionDraft] =
     useState<ClosingDistribution>({});
-  const [groupMode, setGroupMode] = useState(false);
-  const [closingGroupId, setClosingGroupId] = useState("");
-  const [closingGroupName, setClosingGroupName] = useState("");
-  const [closingFarms, setClosingFarms] = useState<ClosingFarm[]>([]);
-  const [closingLots, setClosingLots] = useState<ClosingLotDraft[]>([]);
+  const [distributeByFarm, setDistributeByFarm] = useState(false);
+  const [closingDeliveries, setClosingDeliveries] = useState<ClosingDeliveryDraft[]>([]);
   const [editingClosingId, setEditingClosingId] = useState("");
   const [closingAnnotationDraft, setClosingAnnotationDraft] = useState({
     closingId: "",
@@ -8999,11 +8979,8 @@ export default function Home() {
     );
   }
   function resetClosingDraft() {
-    setGroupMode(false);
-    setClosingGroupId("");
-    setClosingGroupName("");
-    setClosingFarms([]);
-    setClosingLots([]);
+    setDistributeByFarm(false);
+    setClosingDeliveries([]);
     setEditingClosingId("");
     setClosingDraft({
       supplier: "",
@@ -9067,194 +9044,122 @@ export default function Home() {
     const past=Object.keys(distribution).some(month=>month<monthKey(new Date()));
     setClosingMessage("Distribuição sugerida 30 dias corridos antes de cada aplicação, em embalagens fechadas, preservando o volume negociado."+(past?" Atenção: há mês de entrega já vencido; alinhe a antecipação com o fornecedor.":""));
   }
-  function updateClosingLot(id: string, update: Partial<ClosingLotDraft>) {
-    setClosingLots((current) => current.map((lot) => lot.id === id ? { ...lot, ...update } : lot));
-  }
-
-  function suggestGroupClosingLot(lot: ClosingLotDraft) {
-    const volume = closingDraftNumber(lot.totalVolume);
+  function suggestFarmDeliveries() {
+    const volume = closingDraftNumber(closingDraft.totalVolume);
     const size = commercialPackageSize(closingDraft.packaging, closingDraft.unit);
-    if (!selectedClosingSchedule || !closingFarms.length || size === null ||
+    const farms = [...new Map(closingDeliveries
+      .filter(({ farm }) => normalizeMaterial(farm))
+      .map(({ farm }) => [normalizeMaterial(farm), farm.trim()])).values()];
+    if (!selectedClosingSchedule || !farms.length || size === null ||
       volume === null || volume <= 0 || !commercialWholePackages(volume, size)) {
-      setClosingMessage("Informe produto, fazendas, embalagem e volume em embalagens fechadas para sugerir a distribuição.");
+      setClosingMessage("Importe o Planejamento e informe produto, fazendas, embalagem e volume em embalagens fechadas para usar a sugestão.");
       return;
     }
-    const names = closingFarms.map((farm) => normalizeMaterial(farm.name));
-    if (names.some((name) => !name) || new Set(names).size !== names.length) {
-      setClosingMessage("Preencha os nomes das fazendas sem repetições antes de solicitar a sugestão.");
+
+    const assignedByFarm = new Map<string, number>();
+    for (const line of closingDeliveries) {
+      if (!line.volume.trim()) continue;
+      const farmKey = normalizeMaterial(line.farm);
+      const amount = closingDraftNumber(line.volume);
+      if (!farmKey || amount === null || amount <= 0 || !commercialWholePackages(amount, size)) {
+        setClosingMessage("Confira a fazenda e o volume em embalagens fechadas antes de calendarizar.");
+        return;
+      }
+      assignedByFarm.set(farmKey, (assignedByFarm.get(farmKey) || 0) + amount);
+    }
+    const assigned = [...assignedByFarm.values()].reduce((sum, amount) => sum + amount, 0);
+    if (assignedByFarm.size &&
+      (assignedByFarm.size !== farms.length || Math.round(assigned / size) !== Math.round(volume / size))) {
+      setClosingMessage("Para calendarizar os volumes informados, preencha o volume de todas as fazendas até zerar o saldo.");
       return;
     }
+
     const weights: ClosingDistribution = {};
-    for (const farm of closingFarms) {
-      const schedule = selectedClosingSchedule.farmSchedules.get(normalizeMaterial(farm.name));
+    const scheduled: ClosingDistribution = {};
+    for (const [index, farm] of farms.entries()) {
+      const schedule = selectedClosingSchedule.farmSchedules.get(normalizeMaterial(farm));
       const months = Object.entries(schedule?.deliveryMonths || {});
       const dated = months.reduce((sum, [, amount]) => sum + amount, 0);
       if (!schedule || dated <= 0 || months.some(([, amount]) => amount < 0) ||
         Math.abs(dated - schedule.planned) > 0.000001) {
-        setClosingMessage(`Não há demanda com datas completas para ${farm.name.trim() || "uma das fazendas"}. Revise o Planejamento ou preencha a distribuição manualmente.`);
+        setClosingMessage(`Não há demanda com datas completas para ${farm}. Revise o Planejamento ou preencha as entregas manualmente.`);
         return;
       }
-      for (const [month, amount] of months) weights[`${month}|${farm.id}`] = amount;
+      const quota = assignedByFarm.get(normalizeMaterial(farm));
+      if (quota !== undefined) {
+        for (const [month, amount] of Object.entries(commercialRoundedDistribution(schedule.deliveryMonths, quota, size))) {
+          scheduled[`${month}|${index}`] = amount;
+        }
+      } else {
+        for (const [month, amount] of months) weights[`${month}|${index}`] = amount;
+      }
     }
-    const allocations = Object.entries(commercialRoundedDistribution(weights, volume, size))
-      .map(([key, amount]) => {
-        const [month, farmId] = key.split("|");
-        return { id: taskId("entrega"), farmId, month, volume: closingDraftText(amount) };
-      });
-    updateClosingLot(lot.id, { allocations });
-    const past = allocations.some(({ month }) => month < monthKey(new Date()));
+
+    const distribution = assignedByFarm.size ? scheduled : commercialRoundedDistribution(weights, volume, size);
+    const deliveries = Object.entries(distribution).sort(([left], [right]) => left.localeCompare(right)).map(([key, amount]) => {
+      const [month, index] = key.split("|");
+      return { id: taskId("entrega"), farm: farms[Number(index)], month, volume: closingDraftText(amount) };
+    });
+    if (closingDeliveries.some((line) => line.month) &&
+      !window.confirm("Substituir os meses de entrega pela sugestão do Planejamento?")) return;
+    setClosingDeliveries(deliveries);
+    const past = deliveries.some(({ month }) => month < monthKey(new Date()));
     setClosingMessage("Distribuição sugerida pelo Planejamento das fazendas." +
       (past ? " Há mês de entrega já vencido." : ""));
   }
 
-  function saveClosingGroup() {
-    const groupName = closingGroupName.trim();
-    const supplier = closingDraft.supplier.trim();
-    const paymentMethod = closingDraft.paymentMethod.trim();
-    const product = closingDraft.product.trim();
-    const farms = closingFarms.map((farm) => ({ ...farm, name: farm.name.trim() }));
-    const farmNames = farms.map((farm) => normalizeMaterial(farm.name));
-    if (!groupName || !supplier || !paymentMethod || !product || !farms.length ||
-      farmNames.some((name) => !name) || new Set(farmNames).size !== farms.length) {
-      setClosingMessage("Informe o grupo, fornecedor, origem do recurso, produto e os nomes das fazendas, sem repetir fazendas.");
-      return;
-    }
-    const packageSize = commercialPackageSize(closingDraft.packaging, closingDraft.unit);
-    if (!closingDraft.unit.trim() || packageSize === null) {
-      setClosingMessage("Informe a unidade e uma embalagem válida nessa unidade.");
-      return;
-    }
-    const previousLots = closingGroupId
-      ? commercialClosings.closings.filter((closing) => closing.groupId === closingGroupId)
-      : [];
-    const lotIds = new Set(closingLots.map((lot) => lot.id));
-    if (previousLots.some((closing) => !lotIds.has(closing.id) &&
-      commercialClosings.annotations.some((note) => note.closingId === closing.id))) {
-      setClosingMessage("Resolva a remoção das anotações vinculadas antes de retirar esse lote do grupo.");
-      return;
-    }
-    if (!closingLots.length) {
-      setClosingMessage("Adicione pelo menos um lote ao grupo.");
-      return;
-    }
-
-    const farmIds = new Set(farms.map((farm) => farm.id));
-    const groupId = closingGroupId || taskId("grupo-fechamento");
-    const now = new Date().toISOString();
-    const items: CommercialClosing[] = [];
-    for (const [index, lot] of closingLots.entries()) {
-      const totalVolume = closingDraftNumber(lot.totalVolume);
-      const unitPrice = closingDraftNumber(lot.unitPrice);
-      const label = `Lote ${index + 1}`;
-      if (totalVolume === null || totalVolume <= 0 ||
-        !commercialWholePackages(totalVolume, packageSize) || unitPrice === null || unitPrice < 0) {
-        setClosingMessage(`${label}: informe o preço e um volume positivo em embalagens fechadas.`);
-        return;
-      }
-
-      const distribution: ClosingDistribution = {};
-      const farmAllocations: NonNullable<CommercialClosing["farmAllocations"]> = [];
-      const allocatedMonths = new Set<string>();
-      for (const allocation of lot.allocations) {
-        const { farmId, month } = allocation;
-        const volume = closingDraftNumber(allocation.volume);
-        const key = `${farmId}|${month}`;
-        if (!farmIds.has(farmId) || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month) ||
-          volume === null || volume <= 0 || !commercialWholePackages(volume, packageSize) ||
-          allocatedMonths.has(key)) {
-          setClosingMessage(`${label}: cada entrega precisa de fazenda, mês e volume em embalagens fechadas. Use uma linha por fazenda e mês.`);
-          return;
-        }
-        allocatedMonths.add(key);
-        farmAllocations.push({ farmId, month, volume });
-        distribution[month] = (distribution[month] || 0) + volume;
-      }
-      const distributed = farmAllocations.reduce((sum, allocation) => sum + allocation.volume, 0);
-      if (Math.round(distributed / packageSize) !== Math.round(totalVolume / packageSize)) {
-        setClosingMessage(`${label}: foram distribuídos ${formatNumber(distributed)} de ${formatNumber(totalVolume)} ${closingDraft.unit}. Ajuste as entregas para fechar o lote.`);
-        return;
-      }
-      const previous = previousLots.find((closing) => closing.id === lot.id);
-      const order = commercialOrders.find((entry) => entry.key === lot.orderKey);
-      items.push({
-        ...previous,
-        id: lot.id,
-        groupId,
-        groupName,
-        groupFarms: farms,
-        farmAllocations,
-        supplier,
-        paymentDue: closingDraft.paymentDue,
-        paymentMethod,
-        destination: closingDraft.destination.trim(),
-        deliveryLocation: closingDraft.deliveryLocation.trim(),
-        cycle: closingDraft.cycle,
-        culture: closingDraft.culture.trim(),
-        active: closingDraft.active.trim() ||
-          dimensions.materials[normalizeMaterial(product)]?.principleActive || "Não informado",
-        product,
-        unit: closingDraft.unit.trim(),
-        currency: closingDraft.currency,
-        unitPrice,
-        packaging: closingDraft.packaging.trim(),
-        totalVolume,
-        distribution,
-        orderKey: lot.orderKey,
-        orderNumber: order?.orderNumber || (previous?.orderKey === lot.orderKey ? previous?.orderNumber || "" : ""),
-        orderItem: order?.item || (previous?.orderKey === lot.orderKey ? previous?.orderItem : undefined),
-        createdAt: previous?.createdAt || now,
-        updatedAt: now,
-      });
-    }
-
-    setCommercialClosings((current) => ({
-      ...current,
-      closings: [...items, ...current.closings.filter((closing) => closing.groupId !== groupId)],
-    }));
-    recordAudit("workspace", `Fechamento em grupo ${closingGroupId ? "atualizado" : "criado"}: ${groupName} · ${product}.`);
-    setClosingMessage(`Fechamento do grupo ${groupName} salvo com ${items.length} lote(s).`);
-    resetClosingDraft();
-  }
-
   function saveCommercialClosing() {
     if (currentUser?.role !== "admin") return;
-    if (groupMode) {
-      saveClosingGroup();
-      return;
-    }
     const supplier = closingDraft.supplier.trim();
     const product = closingDraft.product.trim();
     const paymentMethod = closingDraft.paymentMethod.trim();
     const totalVolume = numberFrom(closingDraft.totalVolume);
     const unitPrice = numberFrom(closingDraft.unitPrice);
-    const totalDistributed = Object.values(closingDistributionDraft).reduce(
-      (sum, amount) => sum + numberFrom(amount),
-      0,
-    );
     if (!supplier || !product || !paymentMethod || totalVolume <= 0 || unitPrice < 0) {
-      setClosingMessage(
-        "Informe fornecedor, produto, forma de pagamento, volume e valor unitário para salvar o fechamento.",
-      );
+      setClosingMessage("Informe fornecedor, produto, origem do recurso, volume e valor unitário para salvar o fechamento.");
       return;
     }
-    if (Math.abs(totalDistributed - totalVolume) > 0.01) {
-      setClosingMessage(
-        `A distribuição mensal soma ${formatNumber(totalDistributed)} e precisa totalizar ${formatNumber(totalVolume)}.`,
-      );
+    const packageSize = commercialPackageSize(closingDraft.packaging, closingDraft.unit);
+    if (packageSize === null) {
+      setClosingMessage("Informe uma embalagem válida na unidade do fechamento (ex.: 15 ou saco 15 KG).");
       return;
     }
-    const packageSize=commercialPackageSize(closingDraft.packaging,closingDraft.unit);
-    if(packageSize===null){
-      setClosingMessage("Informe uma embalagem válida na unidade do fechamento (ex.: 15 ou saco 15 KG).");return;
+
+    const farmDeliveries: FarmDelivery[] = [];
+    const distribution: ClosingDistribution = distributeByFarm ? {} : { ...closingDistributionDraft };
+    if (distributeByFarm) {
+      const farmMonths = new Set<string>();
+      for (const [index, line] of closingDeliveries.entries()) {
+        const farm = line.farm.trim();
+        const volume = closingDraftNumber(line.volume);
+        const key = `${normalizeMaterial(farm)}|${line.month}`;
+        if (!normalizeMaterial(farm) || !/^\d{4}-(0[1-9]|1[0-2])$/.test(line.month) ||
+          volume === null || volume <= 0 || !commercialWholePackages(volume, packageSize) || farmMonths.has(key)) {
+          setClosingMessage(`Entrega ${index + 1}: informe fazenda, mês e volume em embalagens fechadas. Use uma linha por fazenda e mês.`);
+          return;
+        }
+        farmMonths.add(key);
+        farmDeliveries.push({ farm, month: line.month, volume });
+        distribution[line.month] = (distribution[line.month] || 0) + volume;
+      }
     }
-    if(!commercialWholePackages(totalVolume,packageSize)||Object.values(closingDistributionDraft).some(amount=>!Number.isFinite(amount)||amount<0||!commercialWholePackages(amount,packageSize))){
-      setClosingMessage("O volume total e cada distribuição mensal devem ser múltiplos da embalagem, sem volumes negativos. Ajuste a distribuição antes de salvar.");return;
+    if (!commercialWholePackages(totalVolume, packageSize) ||
+      Object.values(distribution).some((amount) => amount < 0 || !commercialWholePackages(amount, packageSize))) {
+      setClosingMessage("O volume total e cada distribuição mensal devem ser múltiplos da embalagem, sem volumes negativos.");
+      return;
+    }
+    const totalDistributed = Object.values(distribution).reduce((sum, amount) => sum + amount, 0);
+    if (Math.round(totalDistributed / packageSize) !== Math.round(totalVolume / packageSize)) {
+      setClosingMessage(`A distribuição mensal soma ${formatNumber(totalDistributed)} e precisa totalizar ${formatNumber(totalVolume)}.`);
+      return;
     }
     const selectedOrder = commercialOrders.find(
       (order) => order.key === closingDraft.orderKey,
     );
     const now = new Date().toISOString();
+    const previous = commercialClosings.closings.find((closing) => closing.id === editingClosingId);
     const item: CommercialClosing = {
+      ...previous,
       id: editingClosingId || taskId("fechamento"),
       supplier,
       paymentDue: closingDraft.paymentDue,
@@ -9273,17 +9178,12 @@ export default function Home() {
       unitPrice,
       packaging: closingDraft.packaging.trim(),
       totalVolume,
-      distribution: Object.fromEntries(
-        Object.entries(closingDistributionDraft)
-          .filter(([, amount]) => numberFrom(amount) !== 0)
-          .map(([month, amount]) => [month, numberFrom(amount)]),
-      ),
-      orderKey: selectedOrder?.key || "",
-      orderNumber: selectedOrder?.orderNumber || "",
-      createdAt:
-        commercialClosings.closings.find(
-          (closing) => closing.id === editingClosingId,
-        )?.createdAt || now,
+      farmDeliveries,
+      distribution: Object.fromEntries(Object.entries(distribution).filter(([, amount]) => amount !== 0)),
+      orderKey: closingDraft.orderKey,
+      orderNumber: selectedOrder?.orderNumber || (previous?.orderKey === closingDraft.orderKey ? previous?.orderNumber || "" : ""),
+      orderItem: selectedOrder?.item || (previous?.orderKey === closingDraft.orderKey ? previous?.orderItem : undefined),
+      createdAt: previous?.createdAt || now,
       updatedAt: now,
     };
     setCommercialClosings((current) => ({
@@ -9308,25 +9208,13 @@ export default function Home() {
   }
   function editCommercialClosing(closing: CommercialClosing) {
     resetClosingDraft();
-    if (closing.groupId) {
-      setGroupMode(true);
-      setClosingGroupId(closing.groupId);
-      setClosingGroupName(closing.groupName || "");
-      setClosingFarms(closing.groupFarms || []);
-      setClosingLots(commercialClosings.closings
-        .filter((item) => item.groupId === closing.groupId)
-        .map((item) => ({
-          id: item.id,
-          totalVolume: closingDraftText(item.totalVolume),
-          unitPrice: closingDraftText(item.unitPrice),
-          orderKey: item.orderKey,
-          allocations: (item.farmAllocations || []).map((allocation) => ({
-            ...allocation,
-            id: taskId("entrega"),
-            volume: closingDraftText(allocation.volume),
-          })),
-        })));
-    }
+    const deliveries = commercialFarmDeliveries(closing);
+    setDistributeByFarm(deliveries.length > 0);
+    setClosingDeliveries(deliveries.map((line) => ({
+      ...line,
+      id: taskId("entrega"),
+      volume: closingDraftText(line.volume),
+    })));
     setEditingClosingId(closing.id);
     setClosingDraft({
       supplier: closing.supplier,
@@ -9340,9 +9228,9 @@ export default function Home() {
       product: closing.product,
       unit: closing.unit,
       currency: closing.currency,
-      unitPrice: String(closing.unitPrice),
+      unitPrice: closingDraftText(closing.unitPrice),
       packaging: closing.packaging,
-      totalVolume: String(closing.totalVolume),
+      totalVolume: closingDraftText(closing.totalVolume),
       orderKey: closing.orderKey,
     });
     setClosingDistributionDraft(closing.distribution);
@@ -9351,19 +9239,13 @@ export default function Home() {
   }
   function removeCommercialClosing(closing: CommercialClosing) {
     if (currentUser?.role !== "admin") return;
-    const ids = new Set(commercialClosings.closings
-      .filter((item) => closing.groupId ? item.groupId === closing.groupId : item.id === closing.id)
-      .map((item) => item.id));
-    const subject = closing.groupId
-      ? `o fechamento do grupo ${closing.groupName} e todos os seus lotes`
-      : `o fechamento de ${closing.product} com ${closing.supplier}`;
-    if (!window.confirm(`Excluir ${subject}?`)) return;
+    if (!window.confirm(`Excluir o fechamento de ${closing.product} com ${closing.supplier}?`)) return;
     setCommercialClosings((current) => ({
       ...current,
-      closings: current.closings.filter((item) => !ids.has(item.id)),
-      annotations: current.annotations.filter((note) => !ids.has(note.closingId)),
+      closings: current.closings.filter((item) => item.id !== closing.id),
+      annotations: current.annotations.filter((note) => note.closingId !== closing.id),
     }));
-    if (ids.has(editingClosingId)) resetClosingDraft();
+    if (editingClosingId === closing.id) resetClosingDraft();
     recordAudit(
       "workspace",
       `Fechamento comercial excluído: ${closing.product}.`,
@@ -11583,14 +11465,11 @@ export default function Home() {
         orderProduct.canonicalKey === draftProduct.canonicalKey
       );
     });
-    const groupContracted = closingLots.reduce((sum, lot) => sum + (closingDraftNumber(lot.totalVolume) ?? 0), 0);
-    const groupDistributed = closingLots.reduce((sum, lot) => sum + lot.allocations.reduce(
-      (allocated, line) => allocated + (closingDraftNumber(line.volume) ?? 0), 0,
-    ), 0);
-    const draftDistributed = Object.values(closingDistributionDraft).reduce(
-      (sum, amount) => sum + numberFrom(amount),
-      0,
-    );
+    const draftDistributed = distributeByFarm
+      ? closingDeliveries.reduce((sum, line) => sum + (closingDraftNumber(line.volume) ?? 0), 0)
+      : Object.values(closingDistributionDraft).reduce((sum, amount) => sum + amount, 0);
+    const draftBalance = numberFrom(closingDraft.totalVolume) - draftDistributed;
+    const farmDeliveryInputClass = "w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-normal";
     content =
       currentUser?.role === "admin" ? (
         <section className="space-y-6">
@@ -11790,7 +11669,7 @@ export default function Home() {
                     <h3 className="font-semibold">
                       {editingClosingId
                         ? "Editar distribuição"
-                        : groupMode ? "Novo fechamento em grupo" : "Nova distribuição comercial"}
+                        : "Nova distribuição comercial"}
                     </h3>
                     <p className="mt-1 text-xs leading-relaxed text-slate-500">
                       O calendário pode ser sugerido pelo planejamento, usando
@@ -11807,37 +11686,6 @@ export default function Home() {
                     </button>
                   ) : null}
                 </div>
-                {!editingClosingId && (
-                  <label className="mt-4 flex items-center gap-2 text-sm font-medium">
-                    <input
-                      checked={groupMode}
-                      onChange={(event) => {
-                        setGroupMode(event.target.checked);
-                        if (event.target.checked && !closingLots.length) {
-                          setClosingLots([{
-                            ...emptyClosingLot(),
-                            totalVolume: closingDraft.totalVolume,
-                            unitPrice: closingDraft.unitPrice,
-                            orderKey: closingDraft.orderKey,
-                          }]);
-                        }
-                      }}
-                      type="checkbox"
-                    />
-                    Distribuir para um grupo de fazendas
-                  </label>
-                )}
-                {groupMode && (
-                  <label className="mt-4 grid max-w-md gap-1 text-xs font-semibold text-slate-600">
-                    Nome do grupo
-                    <input
-                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
-                      onChange={(event) => setClosingGroupName(event.target.value)}
-                      placeholder="Ex.: Fazendas BE"
-                      value={closingGroupName}
-                    />
-                  </label>
-                )}
                 <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
                     Fornecedor
@@ -12010,22 +11858,20 @@ export default function Home() {
                       <option value="USD">USD</option>
                     </select>
                   </label>
-                  {!groupMode && (
-                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                      Valor unitário
-                      <input
-                        className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
-                        inputMode="decimal"
-                        onChange={(event) =>
-                          setClosingDraft((current) => ({
-                            ...current,
-                            unitPrice: event.target.value,
-                          }))
-                        }
-                        value={closingDraft.unitPrice}
-                      />
-                    </label>
-                  )}
+                  <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                    Valor unitário
+                    <input
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                      inputMode="decimal"
+                      onChange={(event) =>
+                        setClosingDraft((current) => ({
+                          ...current,
+                          unitPrice: event.target.value,
+                        }))
+                      }
+                      value={closingDraft.unitPrice}
+                    />
+                  </label>
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
                     Embalagem
                     <input
@@ -12040,22 +11886,20 @@ export default function Home() {
                       value={closingDraft.packaging}
                     />
                   </label>
-                  {!groupMode && (
-                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                      Volume total
-                      <input
-                        className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
-                        inputMode="decimal"
-                        onChange={(event) =>
-                          setClosingDraft((current) => ({
-                            ...current,
-                            totalVolume: event.target.value,
-                          }))
-                        }
-                        value={closingDraft.totalVolume}
-                      />
-                    </label>
-                  )}
+                  <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                    Volume total
+                    <input
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                      inputMode="decimal"
+                      onChange={(event) =>
+                        setClosingDraft((current) => ({
+                          ...current,
+                          totalVolume: event.target.value,
+                        }))
+                      }
+                      value={closingDraft.totalVolume}
+                    />
+                  </label>
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
                     Unidade
                     <input
@@ -12070,35 +11914,33 @@ export default function Home() {
                       value={closingDraft.unit}
                     />
                   </label>
-                  {!groupMode && (
-                    <label className="grid gap-1 text-xs font-semibold text-slate-600 xl:col-span-2">
-                      Pedido de compra vinculado
-                      <select
-                        className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
-                        disabled={!matchingCommercialOrdersForDraft.length}
-                        onChange={(event) =>
-                          applyClosingOrder(event.target.value)
-                        }
-                        value={closingDraft.orderKey}
-                      >
-                        <option value="">Vincular depois</option>
-                        {matchingCommercialOrdersForDraft.map((order) => (
-                          <option key={order.key} value={order.key}>
-                            {order.orderNumber} · item {order.item} ·{" "}
-                            {order.product} · fornecido{" "}
-                            {formatNumber(order.supplied)} {order.unit}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="text-[11px] font-normal text-slate-500">
-                        {closingDraft.product.trim()
-                          ? `${matchingCommercialOrdersForDraft.length} pedido(s) conciliado(s) com este produto.`
-                          : "Informe o produto para listar somente pedidos compatíveis."}
-                      </span>
-                    </label>
-                  )}
+                  <label className="grid gap-1 text-xs font-semibold text-slate-600 xl:col-span-2">
+                    Pedido de compra vinculado
+                    <select
+                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                      disabled={!matchingCommercialOrdersForDraft.length}
+                      onChange={(event) =>
+                        applyClosingOrder(event.target.value)
+                      }
+                      value={closingDraft.orderKey}
+                    >
+                      <option value="">Vincular depois</option>
+                      {matchingCommercialOrdersForDraft.map((order) => (
+                        <option key={order.key} value={order.key}>
+                          {order.orderNumber} · item {order.item} ·{" "}
+                          {order.product} · fornecido{" "}
+                          {formatNumber(order.supplied)} {order.unit}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-[11px] font-normal text-slate-500">
+                      {closingDraft.product.trim()
+                        ? `${matchingCommercialOrdersForDraft.length} pedido(s) conciliado(s) com este produto.`
+                        : "Informe o produto para listar somente pedidos compatíveis."}
+                    </span>
+                  </label>
                 </div>
-                {!groupMode && selectedOrderForDraft ? (
+                {selectedOrderForDraft ? (
                   <p className="mt-3 rounded-xl bg-sky-50 px-3 py-2 text-xs text-sky-900">
                     Pedido {selectedOrderForDraft.orderNumber}:{" "}
                     {formatNumber(selectedOrderForDraft.ordered)} pedido,{" "}
@@ -12106,200 +11948,94 @@ export default function Home() {
                     {formatNumber(selectedOrderForDraft.balance)} a fornecer.
                   </p>
                 ) : null}
-                {groupMode ? (
-                  <div className="mt-5 space-y-5 border-t border-slate-100 pt-5">
+                <div className="mt-5 border-t border-slate-100 pt-5">
+                  <div className="flex flex-wrap items-end justify-between gap-3">
                     <div>
-                      <h4 className="font-semibold">Fazendas do grupo</h4>
-                      <datalist id="commercial-group-farms">
+                      <h4 className="font-semibold">Distribuição mensal</h4>
+                      <p aria-live="polite" className={`mt-1 text-xs ${draftBalance < -0.000001 ? "text-rose-700" : "text-slate-600"}`}>
+                        Distribuído <strong>{formatNumber(draftDistributed)} {closingDraft.unit}</strong> ·
+                        {" "}Saldo a distribuir <strong>{formatNumber(Number(draftBalance.toFixed(8)))} {closingDraft.unit}</strong>
+                      </p>
+                    </div>
+                    <button
+                      className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700"
+                      onClick={distributeByFarm ? suggestFarmDeliveries : applyPlanningDistribution}
+                      type="button"
+                    >
+                      Sugerir pelo planejamento (D-30)
+                    </button>
+                  </div>
+                  <label className="mt-4 flex items-center gap-2 text-sm font-medium">
+                    <input
+                      checked={distributeByFarm}
+                      onChange={(event) => setDistributeByFarm(event.target.checked)}
+                      type="checkbox"
+                    />
+                    Distribuir por fazenda
+                  </label>
+                  {distributeByFarm ? (
+                    <div className="mt-3 space-y-3">
+                      <p className="text-xs text-slate-600">
+                        Adicione uma linha por fazenda e mês de entrega. Você pode preencher o calendário manualmente e importar o Planejamento depois.
+                      </p>
+                      <datalist id="commercial-delivery-farms">
                         {[...new Set([
+                          ...Array.from(selectedClosingSchedule?.farmSchedules.values() || [], ({ name }) => name),
                           ...commercialDestinationOptions,
-                          ...Array.from(selectedClosingSchedule?.farmSchedules.values() || [], (farm) => farm.name),
+                          ...closingDeliveries.map(({ farm }) => farm.trim()).filter(Boolean),
                         ])].map((name) => <option key={name} value={name} />)}
                       </datalist>
-                      <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                        {closingFarms.map((farm, index) => (
-                          <div className="flex items-center gap-2" key={farm.id}>
-                            <input
-                              aria-label={`Fazenda ${index + 1}`}
-                              className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm"
-                              list="commercial-group-farms"
-                              onChange={(event) => {
-                                const name = event.target.value;
-                                setClosingFarms((current) => current.map((entry) =>
-                                  entry.id === farm.id ? { ...entry, name } : entry));
-                              }}
-                              placeholder={`Fazenda ${index + 1}`}
-                              value={farm.name}
-                            />
-                            <button
-                              aria-label={`Remover fazenda ${index + 1}`}
-                              className="text-xs font-bold text-rose-700"
-                              onClick={() => {
-                                if (closingLots.some((lot) => lot.allocations.some((line) => line.farmId === farm.id))) {
-                                  setClosingMessage("Remova as entregas desta fazenda nos lotes antes de retirá-la do grupo.");
-                                  return;
-                                }
-                                setClosingFarms((current) => current.filter((entry) => entry.id !== farm.id));
-                              }}
-                              type="button"
-                            >
+                      {closingDeliveries.map((line, index) => {
+                        const changeDelivery = (update: Partial<ClosingDeliveryDraft>) =>
+                          setClosingDeliveries((current) => current.map((entry) =>
+                            entry.id === line.id ? { ...entry, ...update } : entry));
+                        return (
+                          <div className="grid items-end gap-2 sm:grid-cols-[2fr_1fr_1fr_auto]" key={line.id}>
+                            <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                              Fazenda
+                              <input
+                                className={farmDeliveryInputClass}
+                                list="commercial-delivery-farms"
+                                onChange={(event) => changeDelivery({ farm: event.target.value })}
+                                value={line.farm}
+                              />
+                            </label>
+                            <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                              Mês de entrega
+                              <input className={farmDeliveryInputClass} type="month" value={line.month}
+                                onChange={(event) => changeDelivery({ month: event.target.value })} />
+                            </label>
+                            <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                              Volume {closingDraft.unit && `(${closingDraft.unit})`}
+                              <input className={farmDeliveryInputClass} inputMode="decimal" value={line.volume}
+                                onChange={(event) => changeDelivery({ volume: event.target.value })} />
+                            </label>
+                            <button aria-label={`Remover entrega ${index + 1}`}
+                              className="px-2 py-2.5 text-xs font-bold text-rose-700"
+                              onClick={() => setClosingDeliveries((current) => current.filter((entry) => entry.id !== line.id))}
+                              type="button">
                               Remover
                             </button>
                           </div>
-                        ))}
-                      </div>
-                      <button
-                        className="mt-3 rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700"
-                        onClick={() => {
-                          const farm = { id: taskId("fazenda"), name: "" };
-                          setClosingFarms((current) => [...current, farm]);
-                        }}
-                        type="button"
-                      >
-                        Adicionar fazenda
-                      </button>
-                    </div>
-
-                    <div className="space-y-3">
-                      <h4 className="font-semibold">Lotes negociados</h4>
-                      <p className="text-xs text-slate-600">
-                        Total contratado <strong>{formatNumber(groupContracted)} {closingDraft.unit}</strong>
-                        {" · "}Saldo do grupo <strong>{formatNumber(groupContracted - groupDistributed)} {closingDraft.unit}</strong>
-                      </p>
-                      {closingLots.map((lot, index) => {
-                        const contracted = closingDraftNumber(lot.totalVolume) ?? 0;
-                        const allocated = lot.allocations.reduce((sum, line) => sum + (closingDraftNumber(line.volume) ?? 0), 0);
-                        const remaining = Number((contracted - allocated).toFixed(8));
-                        const inputClass = "w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-normal";
-                        return (
-                          <fieldset className="min-w-0 rounded-xl border border-slate-200 p-4" key={lot.id}>
-                            <legend className="px-2 text-sm font-semibold">Lote {index + 1}</legend>
-                            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                              <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                Volume contratado
-                                <input className={inputClass} inputMode="decimal" value={lot.totalVolume}
-                                  onChange={(event) => updateClosingLot(lot.id, { totalVolume: event.target.value })} />
-                              </label>
-                              <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                Valor unitário
-                                <input className={inputClass} inputMode="decimal" value={lot.unitPrice}
-                                  onChange={(event) => updateClosingLot(lot.id, { unitPrice: event.target.value })} />
-                              </label>
-                              <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                Pedido de compra vinculado
-                                <select className={inputClass} value={lot.orderKey}
-                                  onChange={(event) => updateClosingLot(lot.id, { orderKey: event.target.value })}>
-                                  <option value="">Vincular depois</option>
-                                  {lot.orderKey && !matchingCommercialOrdersForDraft.some((order) => order.key === lot.orderKey) && (
-                                    <option value={lot.orderKey}>Pedido vinculado</option>
-                                  )}
-                                  {matchingCommercialOrdersForDraft.map((order) => (
-                                    <option key={order.key} value={order.key}>{order.orderNumber} · item {order.item}</option>
-                                  ))}
-                                </select>
-                              </label>
-                            </div>
-                            <p aria-live="polite" className={`mt-3 text-sm ${remaining < 0 ? "text-rose-700" : "text-slate-700"}`}>
-                              Distribuído <strong>{formatNumber(allocated)} {closingDraft.unit}</strong> ·
-                              {" "}Saldo a distribuir <strong>{formatNumber(remaining)} {closingDraft.unit}</strong>
-                            </p>
-                            <div className="mt-3 space-y-2">
-                              {lot.allocations.map((line) => {
-                                const changeLine = (update: Partial<ClosingAllocationDraft>) =>
-                                  updateClosingLot(lot.id, { allocations: lot.allocations.map((entry) =>
-                                    entry.id === line.id ? { ...entry, ...update } : entry) });
-                                return (
-                                  <div className="grid items-end gap-2 sm:grid-cols-[2fr_1fr_1fr_auto]" key={line.id}>
-                                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                      Fazenda
-                                      <select className={inputClass} value={line.farmId}
-                                        onChange={(event) => changeLine({ farmId: event.target.value })}>
-                                        <option value="">Selecione</option>
-                                        {closingFarms.filter((farm) => farm.name.trim()).map((farm) => (
-                                          <option key={farm.id} value={farm.id}>{farm.name}</option>
-                                        ))}
-                                      </select>
-                                    </label>
-                                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                      Mês de entrega
-                                      <input className={inputClass} type="month" value={line.month}
-                                        onChange={(event) => changeLine({ month: event.target.value })} />
-                                    </label>
-                                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                                      Volume
-                                      <input className={inputClass} inputMode="decimal" value={line.volume}
-                                        onChange={(event) => changeLine({ volume: event.target.value })} />
-                                    </label>
-                                    <button className="px-2 py-2.5 text-xs font-bold text-rose-700"
-                                      onClick={() => updateClosingLot(lot.id, {
-                                        allocations: lot.allocations.filter((entry) => entry.id !== line.id),
-                                      })}
-                                      type="button">
-                                      Remover entrega
-                                    </button>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              <button className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold"
-                                onClick={() => updateClosingLot(lot.id, { allocations: [
-                                  ...lot.allocations, { id: taskId("entrega"), farmId: "", month: "", volume: "" },
-                                ] })}
-                                type="button">
-                                Adicionar entrega
-                              </button>
-                              <button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700"
-                                onClick={() => {
-                                  if (lot.allocations.length && !window.confirm("Substituir as entregas deste lote pela sugestão do Planejamento?")) return;
-                                  suggestGroupClosingLot(lot);
-                                }}
-                                type="button">
-                                Sugerir pelo planejamento (D-30)
-                              </button>
-                              {closingLots.length > 1 && (
-                                <button className="px-3 py-2 text-xs font-bold text-rose-700"
-                                  onClick={() => {
-                                    if (lot.allocations.length && !window.confirm("Remover este lote e suas entregas do formulário?")) return;
-                                    setClosingLots((current) => current.filter((entry) => entry.id !== lot.id));
-                                  }}
-                                  type="button">
-                                  Remover lote
-                                </button>
-                              )}
-                            </div>
-                          </fieldset>
                         );
                       })}
-                      <button className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700"
-                        onClick={() => {
-                          const lot = emptyClosingLot();
-                          setClosingLots((current) => [...current, lot]);
-                        }}
-                        type="button">
-                        Adicionar lote
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="mt-5 border-t border-slate-100 pt-5">
-                    <div className="flex flex-wrap items-end justify-between gap-3">
-                      <div>
-                        <h4 className="font-semibold">Distribuição mensal</h4>
-                        <p className="mt-1 text-xs text-slate-500">
-                          Entrega prevista 30 dias antes da aplicação na sugestão; volumes em embalagens fechadas. Total distribuído:{" "}
-                          <strong>{formatNumber(draftDistributed)}</strong> de{" "}
-                          {formatNumber(numberFrom(closingDraft.totalVolume))}.
-                        </p>
+                      <div className="flex flex-wrap gap-2">
+                        <button className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold"
+                          onClick={() => {
+                            const delivery = { id: taskId("entrega"), farm: "", month: "", volume: "" };
+                            setClosingDeliveries((current) => [...current, delivery]);
+                          }}
+                          type="button">
+                          Adicionar entrega
+                        </button>
+                        <button className="rounded-lg px-3 py-2 text-xs font-bold text-emerald-700"
+                          onClick={() => setActive("Importações")}
+                          type="button">
+                          Central de importações
+                        </button>
                       </div>
-                      <button
-                        className="rounded-lg border border-emerald-700 px-3 py-2 text-xs font-bold text-emerald-700"
-                        onClick={applyPlanningDistribution}
-                        type="button"
-                      >
-                        Sugerir pelo planejamento (D-30)
-                      </button>
                     </div>
+                  ) : (
                     <div className="mt-4 grid gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
                       {closingMonths.map((month) => (
                         <label
@@ -12327,8 +12063,8 @@ export default function Home() {
                         </p>
                       ) : null}
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
                 <div className="mt-5 flex justify-end">
                   <button
                     className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white"
@@ -12416,6 +12152,8 @@ export default function Home() {
                               const order = commercialOrders.find(
                                 (item) => item.key === closing.orderKey,
                               );
+                              const farmDeliveries = [...commercialFarmDeliveries(closing)]
+                                .sort((left, right) => left.farm.localeCompare(right.farm, "pt-BR") || left.month.localeCompare(right.month));
                               return (
                                 <tr key={closing.id}>
                                   <td className="px-3 py-3">
@@ -12461,26 +12199,15 @@ export default function Home() {
                                     <span className="text-xs text-slate-500">
                                       {closing.deliveryLocation || "—"}
                                     </span>
-                                    {closing.groupName && (
+                                    {farmDeliveries.length > 0 && (
                                       <details className="mt-1 text-xs text-slate-600">
-                                        <summary className="cursor-pointer font-semibold">{closing.groupName}</summary>
+                                        <summary className="cursor-pointer font-semibold">Entregas por fazenda</summary>
                                         <ul className="mt-1 space-y-1">
-                                          {closing.groupFarms?.map((farm) => {
-                                            const deliveries = (closing.farmAllocations || [])
-                                              .filter((line) => line.farmId === farm.id)
-                                              .sort((left, right) => left.month.localeCompare(right.month));
-                                            const volume = deliveries.reduce((sum, line) => sum + line.volume, 0);
-                                            return (
-                                              <li key={farm.id}>
-                                                {farm.name} · {formatNumber(volume)} {closing.unit}
-                                                <ul className="ml-3">
-                                                  {deliveries.map((line) => (
-                                                    <li key={line.month}>{formatMonth(line.month)} · {formatNumber(line.volume)} {closing.unit}</li>
-                                                  ))}
-                                                </ul>
-                                              </li>
-                                            );
-                                          })}
+                                          {farmDeliveries.map(({ farm, month, volume }) => (
+                                            <li key={`${farm}|${month}`}>
+                                              {farm} · {formatMonth(month)} · {formatNumber(volume)} {closing.unit}
+                                            </li>
+                                          ))}
                                         </ul>
                                       </details>
                                     )}
@@ -12511,7 +12238,7 @@ export default function Home() {
                                         }
                                         type="button"
                                       >
-                                        {closing.groupId ? "Editar grupo" : "Editar"}
+                                        Editar
                                       </button>
                                       <button
                                         className="text-xs font-bold text-rose-700"
@@ -12520,7 +12247,7 @@ export default function Home() {
                                         }
                                         type="button"
                                       >
-                                        {closing.groupId ? "Excluir grupo" : "Excluir"}
+                                        Excluir
                                       </button>
                                     </div>
                                   </td>

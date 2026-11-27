@@ -1,13 +1,29 @@
 import { normalizeMaterial, type DimensionBundle } from "@/lib/material-dimension";
 import { productFor, registeredConversionFactor } from "@/lib/reconciliation";
 
-type ClosingRecord = {
+export type FarmDelivery = { farm: string; month: string; volume: number };
+
+type ClosingFarmData = {
+  farmDeliveries?: FarmDelivery[];
+  groupFarms?: { id: string; name: string }[];
+  farmAllocations?: { farmId: string; month: string; volume: number }[];
+};
+
+export function commercialFarmDeliveries(closing: ClosingFarmData): FarmDelivery[] {
+  if (closing.farmDeliveries) return closing.farmDeliveries;
+  const names = new Map(closing.groupFarms?.map(({ id, name }) => [id, name]));
+  return (closing.farmAllocations || []).map(({ farmId, month, volume }) => ({
+    farm: names.get(farmId) || "Fazenda não informada",
+    month,
+    volume,
+  }));
+}
+
+type ClosingRecord = ClosingFarmData & {
   active: string;
   cycle: string;
   culture: string;
   destination: string;
-  groupName?: string;
-  groupFarms?: { name: string }[];
   orderKey: string;
   orderNumber: string;
   product: string;
@@ -214,7 +230,7 @@ export function matchesCommercialClosing(entry: ResolvedClosing<ClosingRecord>, 
   const { closing, active, physicalProduct, standardProduct } = entry;
   return !normalizedQuery || [
     active, closing.active, closing.product, physicalProduct, standardProduct, closing.supplier, closing.destination, closing.orderNumber,
-    closing.groupName || "", ...(closing.groupFarms || []).map((farm) => farm.name),
+    ...commercialFarmDeliveries(closing).map((delivery) => delivery.farm),
   ].some((value) => normalizeMaterial(value).includes(normalizedQuery));
 }
 
