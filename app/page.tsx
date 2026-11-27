@@ -1990,6 +1990,9 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
   const [pageSize, setPageSize] = useState("20");
   const [page, setPage] = useState(1);
   const [detailPage, setDetailPage] = useState(1);
+  // Visual preference only: never changes the reconciliation or export.
+  const [expandedColumnGroups, setExpandedColumnGroups] = useState<string[]>([]);
+  const toggleColumnGroup = (key: string) => setExpandedColumnGroups(current => current.includes(key) ? current.filter(item=>item!==key) : [...current,key]);
   const lo = Number(initial), hi = Number(final);
   const valid = initial.trim() !== "" && final.trim() !== "" && Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi;
   const base = useMemo(() => {
@@ -2293,6 +2296,34 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
   }
   const inputClass = "rounded-lg border border-slate-200 px-3 py-2 text-sm";
   const value = (v: number) => calendarDetailNumber(v);
+  type Bucket = typeof buckets[number];
+  type DapColumn = { key: string; label: string; render: (p: Bucket) => ReactNode; tone?: (p: Bucket)=>string };
+  type DapColumnGroup = { key: string; label: string; summary: DapColumn[]; detail: DapColumn[] };
+  const numericColumn = (key:string,label:string,read:(p:Bucket)=>number,tone?:(p:Bucket)=>string):DapColumn => ({key,label,render:p=>value(read(p)),tone});
+  const purchaseColumn = (key:string,label:string,read:(p:Bucket)=>number,tone?:(p:Bucket)=>string):DapColumn => ({key,label,render:p=>purchasesLoaded?value(read(p)):"—",tone});
+  const deficitTone = (read:(p:Bucket)=>number) => (p:Bucket)=>cn("font-semibold",read(p)>0.000001?"text-rose-700":"text-emerald-700");
+  const demandColumn=numericColumn("demand","Demanda",p=>p.demand);
+  const stockColumn=numericColumn("stockAfter","Estoque residual",p=>p.stockAfter);
+  const centralColumn=numericColumn("centralAllocated","Armazém alocado",p=>p.warehouse+p.warehouseTransit+p.warehouseBought);
+  const transitColumn=numericColumn("transitAfter","Trânsito residual",p=>p.transitAfter);
+  const boughtColumn=purchaseColumn("boughtAfter","Compra residual",p=>p.boughtAfter);
+  const transferColumn=numericColumn("transferReceived","Remanejamento a receber",p=>p.transferIn+p.projectedIn);
+  const shortageColumn=numericColumn("shortage","Falta operacional",p=>p.shortage,deficitTone(p=>p.shortage));
+  const buyColumn=purchaseColumn("buyNeed","Compra potencial",p=>p.buyNeed,deficitTone(p=>p.buyNeed));
+  const statusColumn:DapColumn={key:"status",label:"Situação",render:p=><>{p.status}{level==="Material"&&<span className="block text-slate-500">{p.nucleusCount} núcleos · {p.pools.filter(pool=>pool.shortage>0.000001).length} com falta</span>}</>};
+  const riskColumn:DapColumn={key:"risk",label:"Prazo",render:p=><>{level==="Núcleo"?risk(p.pools[0]):p.pools.some(pool=>risk(pool)==="Primeira compra após início")?"Risco em algum núcleo":p.pools.some(pool=>risk(pool)!=="—")?"Prazo a validar":"—"}{level==="Núcleo"&&<span className="block text-slate-500">{p.pools[0].first||"Sem data"} / {p.pools[0].due||"Sem previsão"}</span>}</>};
+  const columnGroups:DapColumnGroup[]=[
+    {key:"planning",label:"Planejamento",summary:[demandColumn],detail:[numericColumn("planned","Planejado",p=>p.planned),numericColumn("applied","Aplicado",p=>p.applied),demandColumn,numericColumn("prior","Concorrente",p=>p.prior)]},
+    {key:"stock",label:"Estoque",summary:[stockColumn],detail:[numericColumn("stock","Estoque atual",p=>p.stock),stockColumn]},
+    {key:"central",label:"Armazém 0714",summary:[centralColumn],detail:[centralColumn,numericColumn("centralStock","Armazém físico alocado",p=>p.warehouse),numericColumn("centralTransit","Armazém trânsito alocado",p=>p.warehouseTransit),numericColumn("centralPurchase","Armazém compra alocada",p=>p.warehouseBought),...(level==="Material"&&showCentralTotals?[numericColumn("centralStockTotal","Armazém estoque total",p=>centralTotals(p.key)?.stock||0),numericColumn("centralTransitTotal","Armazém trânsito total",p=>centralTotals(p.key)?.transit||0),purchaseColumn("centralPurchaseTotal","Armazém comprado bruto",p=>centralTotals(p.key)?.bought||0),numericColumn("centralResidual","Armazém residual",p=>centralResidual(p.key))]:[])]},
+    {key:"transit",label:"Trânsito",summary:[transitColumn],detail:[numericColumn("transit","Trânsito atual",p=>p.transit),transitColumn]},
+    {key:"purchases",label:"Compras",summary:[boughtColumn],detail:[purchaseColumn("bought","Comprado a entregar (bruto)",p=>p.bought),boughtColumn]},
+    {key:"transfer",label:"Remanejamentos",summary:[transferColumn],detail:[numericColumn("physicalSurplus","Excedente físico",p=>p.physicalSurplus),numericColumn("surplus","Excedente projetado",p=>p.surplus),transferColumn,numericColumn("transferIn","Transferência física (receber)",p=>p.transferIn),numericColumn("projectedIn","Transferência futura (receber)",p=>p.projectedIn),{key:"transferOut",label:"Ceder (físico / futuro)",render:p=>value(p.transferOut)+" / "+value(p.projectedOut)}]},
+    {key:"result",label:"Resultado",summary:[shortageColumn,buyColumn,statusColumn],detail:[shortageColumn,numericColumn("net","Saldo líquido",p=>p.net,p=>cn("font-semibold",p.net<0?"text-rose-700":"text-emerald-700")),buyColumn,riskColumn,statusColumn]},
+  ];
+  const visibleColumnGroups=columnGroups.map(group=>({...group,expanded:expandedColumnGroups.includes(group.key),columns:expandedColumnGroups.includes(group.key)?group.detail:group.summary}));
+  const visibleColumns=visibleColumnGroups.flatMap(group=>group.columns);
+  const allColumnGroupsExpanded=columnGroups.every(group=>expandedColumnGroups.includes(group.key));
   return <div className="mt-6 space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-semibold">Provisionamento por DAP</h3><p className="text-xs text-slate-500">Janela relativa ao plantio de cada talhão. Volumes equivalentes ao material padrão.</p></div><button type="button" disabled={!shown.length || !valid} onClick={() => void exportDap()} className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">Exportar Excel</button></div>
     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
@@ -2325,24 +2356,29 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
       {!!drill.length && <button type="button" className="ml-2 rounded border border-slate-200 px-2 py-1" onClick={() => {setDrill(drill.slice(0,-1));setPage(1);}}>Voltar um nível</button>}
     </div>
     <p className="text-xs text-slate-500">{macro ? "Grupos e subgrupos: indicadores por quantidade de materiais, sem somar volumes de unidades diferentes." : "Consolidado por material padrão. Falta operacional é a soma das faltas locais; saldo líquido, excedentes e remanejamentos potenciais explicam a compra restante. Núcleos sem demanda podem aparecer como doadores."} Clique na linha para detalhar.</p>
+    {!macro&&<div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div><p className="text-sm font-semibold">Contextos das colunas</p><p className="text-xs text-slate-500">Use + para expandir um contexto e − para recolher. O resumo e os resultados permanecem visíveis.</p></div>
+        <div className="flex gap-2"><button type="button" disabled={allColumnGroupsExpanded} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-40" onClick={()=>setExpandedColumnGroups(columnGroups.map(group=>group.key))}>+ Expandir tudo</button><button type="button" disabled={!expandedColumnGroups.length} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold disabled:opacity-40" onClick={()=>setExpandedColumnGroups([])}>− Recolher tudo</button></div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-2">{visibleColumnGroups.map(group=><button type="button" key={group.key} aria-expanded={group.expanded} aria-label={(group.expanded?"Recolher ":"Expandir ")+group.label} className={cn("flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold",group.expanded?"border-emerald-600 bg-emerald-50 text-emerald-800":"border-slate-200 bg-white text-slate-700")} onClick={()=>toggleColumnGroup(group.key)}><span aria-hidden="true" className="inline-flex h-4 w-4 items-center justify-center rounded border border-current text-sm leading-none">{group.expanded?"−":"+"}</span>{group.label}</button>)}</div>
+    </div>}
     <div className="overflow-x-auto rounded-xl border border-slate-200">
-      <table className={cn("w-full text-left text-xs", macro ? "min-w-[680px]" : "min-w-[3100px]")}><thead className="bg-slate-50"><tr>{(macro ? [level,"Materiais","Núcleos","Atendidos","Dependentes de entregas","Sem cobertura",""] : [level,"Cultura","Planejado","Aplicado","Demanda","Concorrente","Estoque atual","Estoque residual","Armazém físico alocado","Armazém trânsito alocado","Armazém compra alocada",...(level==="Material"&&showCentralTotals?["Armazém estoque total","Armazém trânsito total","Armazém comprado bruto","Armazém residual"]:[]),"Trânsito atual","Trânsito residual","Comprado a entregar (bruto)","Compra residual","Falta operacional","Saldo líquido","Excedente físico","Excedente projetado","Transferência física (receber)","Transferência futura (receber)","Ceder (físico / futuro)","Compra potencial","Prazo","Situação",""]).map((h,i) => <th key={i} className="p-3">{h}</th>)}</tr></thead>
-      <tbody className="divide-y divide-slate-100">{visible.map((p) => <tr key={p.key} className="hover:bg-slate-50">
+      <table className="w-full text-left text-xs" style={{minWidth:macro?680:Math.max(1050,360+visibleColumns.length*116)}}>
+        <thead className="bg-slate-50">
+          {macro?<tr>{[level,"Materiais","Núcleos","Atendidos","Dependentes de entregas","Sem cobertura","Ações"].map((h,i)=><th key={i} scope="col" className="p-3">{h}</th>)}</tr>:<>
+            <tr className="bg-slate-100">
+              <th rowSpan={2} scope="col" className="border-b border-slate-200 p-3">{level}</th><th rowSpan={2} scope="col" className="border-b border-slate-200 p-3">Cultura</th>
+              {visibleColumnGroups.map(group=><th key={group.key} scope="colgroup" colSpan={group.columns.length} className="border-b border-l border-slate-200 p-2 text-center"><button type="button" aria-expanded={group.expanded} aria-label={(group.expanded?"Recolher ":"Expandir ")+group.label} onClick={()=>toggleColumnGroup(group.key)} className="inline-flex items-center justify-center gap-1.5 rounded px-2 py-1 font-semibold text-emerald-800 hover:bg-emerald-100"><span aria-hidden="true" className="rounded border border-current px-1 leading-tight">{group.expanded?"−":"+"}</span>{group.label}</button></th>)}
+              <th rowSpan={2} scope="col" className="border-b border-slate-200 p-3">Ações</th>
+            </tr><tr>{visibleColumns.map(column=><th scope="col" key={column.key} className="border-b border-l border-slate-200 p-3">{column.label}</th>)}</tr>
+          </>}
+        </thead>
+        <tbody className="divide-y divide-slate-100">{visible.map(p=><tr key={p.key} className="hover:bg-slate-50">
         <td className="p-3"><button type="button" className="text-left font-semibold text-emerald-800" onClick={() => openBucket(p)}>{p.label}<span className="block text-xs font-normal text-slate-500">{level === "Material" ? p.group+" · "+p.subgroup+" · "+p.active : level === "Subgrupo" ? p.group : level === "Núcleo" ? p.pools[0].row.standardMaterial : ""}</span></button></td>
-        {macro ? <><td className="p-3">{p.materialCount}</td><td className="p-3">{p.nucleusCount}</td><td className="p-3 text-emerald-700">{p.coveredCount}</td><td className="p-3 text-amber-700">{p.deliveryCount}</td><td className="p-3 font-semibold text-rose-700">{p.uncoveredCount}</td></> : <>
-          <td className="p-3">{p.cultures}</td>{[p.planned,p.applied,p.demand,p.prior,p.stock,p.stockAfter,p.warehouse,p.warehouseTransit,p.warehouseBought].map((v,i) => <td key={i} className="p-3 tabular-nums">{value(v)}</td>)}{level==="Material"&&showCentralTotals&&<><td className="p-3">{value(centralTotals(p.key)?.stock||0)}</td><td className="p-3">{value(centralTotals(p.key)?.transit||0)}</td><td className="p-3">{purchasesLoaded?value(centralTotals(p.key)?.bought||0):"—"}</td><td className="p-3">{value(centralResidual(p.key))}</td></>}{[p.transit,p.transitAfter].map((v,i)=><td key={"transit"+i} className="p-3 tabular-nums">{value(v)}</td>)}
-          <td className="p-3">{purchasesLoaded?value(p.bought):"—"}</td><td className="p-3">{purchasesLoaded?value(p.boughtAfter):"—"}</td>
-          <td className={cn("p-3 font-semibold",p.shortage>0.000001?"text-rose-700":"text-emerald-700")}>{value(p.shortage)}</td>
-          <td className={cn("p-3 font-semibold",p.net<0?"text-rose-700":"text-emerald-700")}>{value(p.net)}</td>
-          <td className="p-3">{value(p.physicalSurplus)}</td><td className="p-3">{value(p.surplus)}</td>
-          <td className="p-3">{value(p.transferIn)}</td><td className="p-3">{value(p.projectedIn)}</td>
-          <td className="p-3">{value(p.transferOut)} / {value(p.projectedOut)}</td>
-          <td className={cn("p-3 font-semibold",p.buyNeed>0.000001?"text-rose-700":"text-emerald-700")}>{purchasesLoaded?value(p.buyNeed):"—"}</td>
-          <td className="p-3">{level==="Núcleo"?risk(p.pools[0]):p.pools.some((pool)=>risk(pool)==="Primeira compra após início")?"Risco em algum núcleo":p.pools.some((pool)=>risk(pool)!=="—")?"Prazo a validar":"—"}{level==="Núcleo"&&<span className="block text-slate-500">{p.pools[0].first||"Sem data"} / {p.pools[0].due||"Sem previsão"}</span>}</td>
-          <td className="p-3">{p.status}{level==="Material"&&<span className="block text-slate-500">{p.nucleusCount} núcleos · {p.pools.filter(pool=>pool.shortage>0.000001).length} com falta</span>}</td>
-        </>}
+        {macro ? <><td className="p-3">{p.materialCount}</td><td className="p-3">{p.nucleusCount}</td><td className="p-3 text-emerald-700">{p.coveredCount}</td><td className="p-3 text-amber-700">{p.deliveryCount}</td><td className="p-3 font-semibold text-rose-700">{p.uncoveredCount}</td></> : <><td className="p-3">{p.cultures}</td>{visibleColumns.map(column=><td key={column.key} className={cn("border-l border-slate-100 p-3 tabular-nums",column.tone?.(p))}>{column.render(p)}</td>)}</>}
         <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button>{!macro && (p.transferIn+p.transferOut+p.projectedIn+p.projectedOut)>0.000001 && <button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setTransferMaterial(p.pools[0].row.canonicalKey)}>Remanejamentos</button>}</td>
-      </tr>)}{!visible.length&&<tr><td colSpan={macro?7:26+(level==="Material"&&showCentralTotals?4:0)} className="p-8 text-center text-slate-500">Nenhuma demanda neste filtro.</td></tr>}</tbody></table>
+      </tr>)}{!visible.length&&<tr><td colSpan={macro?7:visibleColumns.length+3} className="p-8 text-center text-slate-500">Nenhuma demanda neste filtro.</td></tr>}</tbody></table>
     </div>
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{buckets.length ? (currentPage-1)*size+1 : 0}–{Math.min(currentPage*size,buckets.length)} de {buckets.length} registros · Página {currentPage} de {pageCount}</span><div className="flex gap-2"><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage<=1} onClick={()=>setPage(currentPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage>=pageCount} onClick={()=>setPage(currentPage+1)}>Próxima</button></div></div>
     {transferMaterial && <div role="dialog" aria-modal="true" aria-label="Remanejamentos potenciais" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Remanejamentos potenciais · {visibleTransfers[0]?.material||transferMaterial}</h3><button type="button" className={inputClass} onClick={()=>setTransferMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Volumes equivalentes, não ordens de transferência. Conferir lote, disponibilidade física, validade e prazo antes da execução.</p><table className="w-full text-left text-sm"><thead className="bg-slate-50"><tr>{["Origem","Destino","Volume equivalente","Tipo"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleTransfers.map((t,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{t.origin}</td><td className="p-3">{t.destination}</td><td className="p-3 font-semibold">{value(t.amount)}</td><td className="p-3">{t.type}</td></tr>)}</tbody></table></div></div>}
