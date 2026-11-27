@@ -1208,6 +1208,42 @@ function formatCurrency(value: number, currency: CommercialCurrency) {
       }).format(value || 0)
     : `${formatNumber(value)} · moeda pendente`;
 }
+function commercialClosingText(closing: CommercialClosing) {
+  const unit = closing.unit?.trim().toUpperCase() || "";
+  const quantity = new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 8 });
+  const volume = (amount: number) => [quantity.format(amount), unit].filter(Boolean).join(" ");
+  const farmDeliveries = commercialFarmDeliveries(closing);
+  const destination = [closing.destination, closing.deliveryLocation].filter(Boolean).join(" · ") || "Destino não informado";
+  const deliveries = farmDeliveries.length ? [...farmDeliveries] : Object.entries(closing.distribution)
+    .filter(([, amount]) => amount > 0)
+    .map(([month, amount]) => ({ farm: destination, month, volume: amount }));
+  deliveries.sort((left, right) => left.month.localeCompare(right.month) || left.farm.localeCompare(right.farm, "pt-BR"));
+  const paymentDue = /^\d{4}-\d{2}-\d{2}$/.test(closing.paymentDue)
+    ? closing.paymentDue.split("-").reverse().join("/")
+    : closing.paymentDue;
+  const formattedPrice = formatCurrency(closing.unitPrice, closing.currency);
+  const price = closing.currency ? formattedPrice.replace(/\s+/g, "") : formattedPrice;
+  const packaging = /^\d+(?:[,.]\d+)?$/.test(closing.packaging?.trim()) && unit
+    ? `${closing.packaging.trim()} ${unit}`
+    : closing.packaging;
+
+  const lines = [
+    `*FECHAMENTO DE NEGÓCIO${closing.supplier ? ` ${closing.supplier}` : ""}*`,
+    "",
+    `Produto: ${closing.product}`,
+    paymentDue && `*Pagamento:* ${paymentDue}`,
+    closing.deliveryLocation && `*Local de entrega:* ${closing.deliveryLocation}`,
+    closing.culture && `*Cultura:* ${closing.culture}`,
+    packaging && `*Embalagem:* ${packaging}`,
+  ].filter((line): line is string => typeof line === "string");
+  const summary = `${volume(closing.totalVolume)} ${price}${unit ? `/${unit}` : ""}`;
+  lines.push("", `*${summary}*`);
+  if (deliveries.length) {
+    lines.push("(Destino – mês – volume)", "", ...deliveries.map((delivery) =>
+      `- ${delivery.farm} · ${formatMonth(delivery.month)} · ${volume(delivery.volume)}`));
+  }
+  return lines.join("\n");
+}
 function formatDose(value: number | null) {
   return value === null
     ? "n.a."
@@ -3542,6 +3578,8 @@ export default function Home() {
     useState<ClosingCalendarPeriod>();
   const [closingQuery, setClosingQuery] = useState("");
   const [closingMessage, setClosingMessage] = useState("");
+  const [savedClosingId, setSavedClosingId] = useState("");
+  const [closingCopyFeedback, setClosingCopyFeedback] = useState<{ id: string; manualText?: string } | null>(null);
   const [logisticsTab, setLogisticsTab] = useState<
     "emissao" | "viagens" | "rodoviaria"
   >("emissao");
@@ -9203,8 +9241,19 @@ export default function Home() {
         ? "Fechamento atualizado e conciliado com a distribuição."
         : "Fechamento comercial salvo com a distribuição mensal.",
     );
+    setSavedClosingId(item.id);
+    setClosingCopyFeedback(null);
     resetClosingDraft();
     setClosingTab("distribuicoes");
+  }
+  async function copyCommercialClosing(closing: CommercialClosing) {
+    const text = commercialClosingText(closing);
+    try {
+      await navigator.clipboard.writeText(text);
+      setClosingCopyFeedback({ id: closing.id });
+    } catch {
+      setClosingCopyFeedback({ id: closing.id, manualText: text });
+    }
   }
   function editCommercialClosing(closing: CommercialClosing) {
     resetClosingDraft();
@@ -11465,6 +11514,10 @@ export default function Home() {
         orderProduct.canonicalKey === draftProduct.canonicalKey
       );
     });
+    const savedClosing = commercialClosings.closings.find((closing) => closing.id === savedClosingId);
+    const copyLabel = (id: string) => closingCopyFeedback?.id === id && !closingCopyFeedback.manualText
+      ? "Copiado"
+      : "Copiar fechamento";
     const draftDistributed = distributeByFarm
       ? closingDeliveries.reduce((sum, line) => sum + (closingDraftNumber(line.volume) ?? 0), 0)
       : Object.values(closingDistributionDraft).reduce((sum, amount) => sum + amount, 0);
@@ -12068,7 +12121,26 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-                <div className="mt-5 flex justify-end">
+                {closingCopyFeedback?.id === savedClosing?.id && closingCopyFeedback?.manualText && (
+                  <label className="mt-4 grid gap-2 text-sm text-slate-700">
+                    Selecione e copie o texto do fechamento
+                    <textarea
+                      className="rounded-xl border border-slate-300 p-3"
+                      onFocus={(event) => event.currentTarget.select()}
+                      readOnly
+                      rows={8}
+                      value={closingCopyFeedback.manualText}
+                    />
+                  </label>
+                )}
+                <div className="mt-5 flex flex-wrap justify-end gap-2">
+                  {savedClosing && !editingClosingId && (
+                    <button className="rounded-xl border border-emerald-700 px-4 py-2.5 text-sm font-bold text-emerald-700"
+                      onClick={() => void copyCommercialClosing(savedClosing)}
+                      type="button">
+                      {copyLabel(savedClosing.id)}
+                    </button>
+                  )}
                   <button
                     className="rounded-xl bg-emerald-700 px-4 py-2.5 text-sm font-bold text-white"
                     onClick={saveCommercialClosing}
@@ -12245,6 +12317,13 @@ export default function Home() {
                                         Editar
                                       </button>
                                       <button
+                                        className="text-xs font-bold text-emerald-700"
+                                        onClick={() => void copyCommercialClosing(closing)}
+                                        type="button"
+                                      >
+                                        {copyLabel(closing.id)}
+                                      </button>
+                                      <button
                                         className="text-xs font-bold text-rose-700"
                                         onClick={() =>
                                           removeCommercialClosing(closing)
@@ -12254,6 +12333,16 @@ export default function Home() {
                                         Excluir
                                       </button>
                                     </div>
+                                    {closingCopyFeedback?.id === closing.id && closingCopyFeedback.manualText && (
+                                      <textarea
+                                        aria-label="Texto do fechamento para copiar"
+                                        className="mt-2 w-full rounded-lg border border-slate-300 p-2 text-xs"
+                                        onFocus={(event) => event.currentTarget.select()}
+                                        readOnly
+                                        rows={5}
+                                        value={closingCopyFeedback.manualText}
+                                      />
+                                    )}
                                   </td>
                                 </tr>
                               );
