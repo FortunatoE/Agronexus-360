@@ -1984,6 +1984,11 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
   const [detailId, setDetailId] = useState("");
   const [byField, setByField] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [grain, setGrain] = useState<"Grupo" | "Subgrupo" | "Material">("Material");
+  const [drill, setDrill] = useState<{ level: "Grupo" | "Subgrupo" | "Material"; key: string; label: string }[]>([]);
+  const [pageSize, setPageSize] = useState("20");
+  const [page, setPage] = useState(1);
+  const [detailPage, setDetailPage] = useState(1);
   const lo = Number(initial), hi = Number(final);
   const valid = initial.trim() !== "" && final.trim() !== "" && Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi;
   const base = useMemo(() => {
@@ -2114,7 +2119,56 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
       missingDap: base.lines.filter((line) => eligible(line) && scoped(line) && line.dap === null).length,
       missingDate: selected.filter((line) => scoped(line) && !line.date).length };
   }, [base, cycle, culture, valid, lo, hi, ledger, operatorNucleus, nucleus, purchasesLoaded]);
-  const shown = report.rows.filter((p) => !search.trim() || headerKey([p.row.standardMaterial,p.row.active,p.row.nucleus,...p.lines.map((line) => line.culture)].join(" ")).includes(headerKey(search)));
+  type Pool = typeof report.rows[number];
+  type Level = "Grupo" | "Subgrupo" | "Material" | "Núcleo";
+  const groupKey = (p: Pool) => p.row.merchandiseGroup || "Sem grupo";
+  const subgroupKey = (p: Pool) => JSON.stringify([groupKey(p), p.row.subgroup || "Sem subgrupo"]);
+  const keyFor = (p: Pool, level: Level) => level === "Grupo" ? groupKey(p) : level === "Subgrupo" ? subgroupKey(p) : level === "Material" ? p.row.canonicalKey : p.row.id;
+  const labelFor = (p: Pool, level: Level) => level === "Grupo" ? groupKey(p) : level === "Subgrupo" ? p.row.subgroup || "Sem subgrupo" : level === "Material" ? p.row.standardMaterial : p.row.nucleus;
+  const shown = report.rows.filter((p) => !search.trim() || headerKey([p.row.standardMaterial,p.row.active,p.row.nucleus,groupKey(p),p.row.subgroup,...p.lines.map((line) => line.culture)].join(" ")).includes(headerKey(search)));
+  const scopedRows = shown.filter((p) => drill.every((step) => keyFor(p, step.level) === step.key));
+  const lastLevel = drill[drill.length - 1]?.level;
+  const level: Level = !lastLevel ? grain : lastLevel === "Grupo" ? "Subgrupo" : lastLevel === "Subgrupo" ? "Material" : "Núcleo";
+  function bucketRows(rows: Pool[], bucketLevel: Level) {
+    const map = new Map<string, Pool[]>();
+    for (const p of rows) {
+      const key = keyFor(p, bucketLevel);
+      const entries = map.get(key) || [];
+      entries.push(p); map.set(key, entries);
+    }
+    return [...map].map(([key, pools]) => {
+      const first = pools[0];
+      const sum = (field: "planned" | "applied" | "demand" | "prior" | "stock" | "stockAfter" | "warehouse" | "transit" | "transitAfter" | "bought" | "boughtAfter" | "shortage") => pools.reduce((total,p) => total + p[field], 0);
+      const materials = new Set(pools.map((p) => p.row.canonicalKey));
+      const uncovered = new Set(pools.filter((p) => p.shortage > 0.000001).map((p) => p.row.canonicalKey));
+      const delivery = new Set(pools.filter((p) => p.status.startsWith("Dependente")).map((p) => p.row.canonicalKey));
+      const covered = [...materials].filter((key) => !uncovered.has(key) && !delivery.has(key)).length;
+      const lack = sum("shortage");
+      return { key, label: labelFor(first, bucketLevel), pools, group: groupKey(first), subgroup: first.row.subgroup, active: first.row.active,
+        cultures: [...new Set(pools.flatMap((p) => p.lines.map((line) => line.culture)))].sort().join(", "),
+        materialCount: materials.size, nucleusCount: new Set(pools.map((p) => p.row.nucleus)).size,
+        uncoveredCount: uncovered.size, deliveryCount: [...delivery].filter((key) => !uncovered.has(key)).length, coveredCount: covered,
+        shortage: lack, planned: sum("planned"), applied: sum("applied"), demand: sum("demand"), prior: sum("prior"), stock: sum("stock"), stockAfter: sum("stockAfter"), warehouse: sum("warehouse"), transit: sum("transit"), transitAfter: sum("transitAfter"), bought: sum("bought"), boughtAfter: sum("boughtAfter"),
+        status: lack > 0.000001 ? (purchasesLoaded ? "Falta cobertura identificada" : "Compras não importadas") : pools.some((p) => p.status === "Dependente de fornecedor") ? "Dependente de fornecedor" : pools.some((p) => p.status === "Dependente de trânsito") ? "Dependente de trânsito" : pools.every((p) => p.status === "Aplicado") ? "Aplicado" : "Atendido com estoque",
+      };
+    }).sort((a,b) => (bucketLevel === "Grupo" || bucketLevel === "Subgrupo" ? b.uncoveredCount - a.uncoveredCount : Number(b.shortage > 0.000001) - Number(a.shortage > 0.000001)) || a.label.localeCompare(b.label,"pt-BR"));
+  }
+  const buckets = bucketRows(scopedRows, level);
+  const materialBuckets = bucketRows(shown, "Material");
+  const groupBuckets = bucketRows(shown, "Grupo");
+  const subgroupBuckets = bucketRows(shown, "Subgrupo");
+  const macro = level === "Grupo" || level === "Subgrupo";
+  const size = pageSize === "Todos" ? Math.max(1,buckets.length) : Number(pageSize);
+  const pageCount = Math.max(1, Math.ceil(buckets.length / size));
+  const currentPage = Math.min(page,pageCount);
+  const visible = buckets.slice((currentPage-1)*size,currentPage*size);
+  useEffect(() => { setPage(1); setDrill([]); setDetailId(""); }, [cycle,culture,initial,final,nucleus,search,grain]);
+  useEffect(() => { setPage(1); setDetailPage(1); }, [pageSize]);
+  useEffect(() => { setDetailPage(1); }, [detailId,byField]);
+  function openBucket(bucket: typeof buckets[number]) {
+    if (level === "Núcleo") { setDetailId(bucket.pools[0].row.id); setByField(true); }
+    else { setDrill((previous) => [...previous,{ level, key:bucket.key,label:bucket.label }]); setPage(1); }
+  }
   const selected = shown.find((p) => p.row.id === detailId);
   const detail = (p: typeof report.rows[number]) => p.lines.map((line) => {
     const field = calendarFarmField(line.row);
@@ -2128,15 +2182,24 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
     if (current) { current["Planejado equivalente"] += line["Planejado equivalente"]; current["Aplicado conciliado"] += line["Aplicado conciliado"]; current["Demanda remanescente"] += line["Demanda remanescente"]; }
     else summaryDetails.set(key, { ...line });
   }
+  const detailEntries = [...summaryDetails.entries()];
+  const detailSize = pageSize === "Todos" ? Math.max(1, detailEntries.length) : Number(pageSize);
+  const detailPageCount = Math.max(1, Math.ceil(detailEntries.length/detailSize));
+  const currentDetailPage = Math.min(detailPage,detailPageCount);
+  const visibleDetails = detailEntries.slice((currentDetailPage-1)*detailSize,currentDetailPage*detailSize);
   const risk = (p: typeof report.rows[number]) => p.demand <= p.stockAfter + p.warehouse + 0.000001 ? "—" : p.first && p.due && !p.missingDue && p.due > p.first && p.demand > p.stockAfter + p.warehouse + p.transitAfter ? "Primeira compra após início" : "Prazo a validar";
   async function exportDap() {
     setExportError("");
     try {
       const XLSX = await loadXlsx();
       const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Demanda concorrente":p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Apoio armazém":p.warehouse, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Resumo");
+      const exportMacro = (entries: typeof buckets) => entries.map((p) => ({ Classificação:p.label, Grupo:p.group, Materiais:p.materialCount, Núcleos:p.nucleusCount, "Atendidos":p.coveredCount, "Dependentes de entregas":p.deliveryCount, "Sem cobertura":p.uncoveredCount }));
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(materialBuckets.map((p) => ({ "Material padrão":p.label, Grupo:p.group, Subgrupo:p.subgroup, "Princípio ativo":p.active, Núcleos:p.nucleusCount, Planejado:p.planned, Aplicado:p.applied, Demanda:p.demand, Concorrente:p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Apoio armazém":p.warehouse, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado a entregar":purchasesLoaded?p.bought:null, "Compra residual":purchasesLoaded?p.boughtAfter:null, "Falta cobertura por núcleo somada":p.shortage, Situação:p.status }))), "Materiais");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportMacro(groupBuckets)), "Grupos");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportMacro(subgroupBuckets)), "Subgrupos");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, Grupo:p.row.merchandiseGroup, Subgrupo:p.row.subgroup, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Demanda concorrente":p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Apoio armazém":p.warehouse, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Núcleos");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.flatMap(detail)), "Talhões");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Não garante chegada; compras centralizadas sem destino operacional não rateadas." }]), "Premissas");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Exportação de todos os registros dos filtros, independente da página ou expansão. Grupo e subgrupo exibem contagem de materiais, sem somar unidades diferentes. Falta consolidada soma faltas por núcleo, não compensa com sobras de outra unidade. Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Não garante chegada; compras centralizadas sem destino operacional não rateadas." }]), "Premissas");
       XLSX.writeFile(workbook, "provisionamento_DAP_" + cycle + "_" + lo + "_" + hi + ".xlsx");
     } catch (error) { setExportError(error instanceof Error ? error.message : "Falha ao exportar."); }
   }
@@ -2153,15 +2216,43 @@ function DapProvision({ plans, consumption, ledger, orders, dimensions, farmToNu
       <label className="grid gap-1 text-xs font-semibold">Buscar material<input className={inputClass} value={search} onChange={(e) => setSearch(e.target.value)} /></label>
     </div>
     {!valid && <p className="text-sm text-rose-700">Informe DAPs inteiros, com início menor ou igual ao fim.</p>}
-    <div className="grid gap-2 sm:grid-cols-4">{[["Materiais / núcleos",shown.length],["Atendidos com estoque",shown.filter((p) => p.status === "Atendido com estoque" || p.status === "Aplicado").length],["Dependentes de entregas",shown.filter((p) => p.status.startsWith("Dependente")).length],["Sem cobertura identificada",shown.filter((p) => p.shortage > 0.000001).length]].map(([label,count]) => <div key={label} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-2xl font-semibold">{count}</p></div>)}</div>
+    <div className="grid gap-2 sm:grid-cols-4">{[["Materiais",materialBuckets.length],["Atendidos com estoque",materialBuckets.filter((p) => p.status === "Atendido com estoque" || p.status === "Aplicado").length],["Dependentes de entregas",materialBuckets.filter((p) => p.status.startsWith("Dependente")).length],["Sem cobertura identificada",materialBuckets.filter((p) => p.shortage > 0.000001).length]].map(([label,count]) => <div key={label} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-2xl font-semibold">{count}</p></div>)}</div>
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
       <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo de fornecedor líquido estimado desconta trânsito potencialmente sobreposto; pedidos internos não são compras.</p>
       <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data não reservados. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : base.unlinked + " pedidos sem material/destino/unidade conciliados; compras centralizadas sem destino operacional não rateadas."}</p>
       <p>Falta cobertura é indicativa, não autorização de compra. Datas de vencimento não garantem chegada; transferência interna e chegada física não confirmadas.</p>
     </div>
     {exportError && <p className="text-sm text-rose-700">{exportError}</p>}
-    <div className="overflow-x-auto rounded-xl border border-slate-200"><table className="w-full min-w-[1650px] text-left text-xs"><thead className="bg-slate-50"><tr>{["Núcleo","Material padrão","Cultura","Planejado","Aplicado","Demanda","Concorrente","Estoque atual","Estoque residual","Armazém","Trânsito atual","Trânsito residual","Comprado a entregar (bruto)","Compra residual","Falta cobertura","Prazo","Situação",""].map((h) => <th key={h} className="p-3">{h}</th>)}</tr></thead><tbody className="divide-y divide-slate-100">{shown.map((p) => <tr key={p.row.id}><td className="p-3">{p.row.nucleus}</td><td className="p-3 font-semibold">{p.row.standardMaterial}<span className="block text-slate-500">{p.row.active}</span></td><td className="p-3">{[...new Set(p.lines.map((line) => line.culture))].join(", ")}</td>{[p.planned,p.applied,p.demand,p.prior,p.stock,p.stockAfter,p.warehouse,p.transit,p.transitAfter].map((v,i) => <td key={i} className="p-3 tabular-nums">{value(v)}</td>)}<td className="p-3">{purchasesLoaded ? value(p.bought) : "—"}</td><td className="p-3">{purchasesLoaded ? value(p.boughtAfter) : "—"}</td><td className={"p-3 font-semibold " + (p.shortage > 0.000001 ? "text-rose-700" : "text-emerald-700")}>{value(p.shortage)}</td><td className="p-3">{risk(p)}<span className="block text-slate-500">{p.first || "Sem data"} / {p.due || "Sem previsão"}</span></td><td className="p-3">{p.status}</td><td className="p-3"><button type="button" className="font-semibold text-emerald-700" onClick={() => { setDetailId(p.row.id); setByField(false); }}>Detalhes</button></td></tr>)}{!shown.length && <tr><td colSpan={18} className="p-8 text-center text-slate-500">Nenhuma demanda na janela de DAP selecionada.</td></tr>}</tbody></table></div>
-    {selected && <div role="dialog" aria-modal="true" aria-label="Detalhamento do provisionamento" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex flex-wrap justify-between gap-2"><h3 className="font-semibold">{selected.row.standardMaterial} · {selected.row.nucleus}</h3><div className="flex gap-2"><button type="button" className={inputClass} onClick={() => setByField(!byField)}>{byField ? "Resumo por fazenda" : "Ver por talhão"}</button><button type="button" className={inputClass} onClick={() => setDetailId("")}>Fechar</button></div></div><div className="mt-3 overflow-auto"><table className="w-full min-w-[850px] text-xs"><thead className="bg-slate-50"><tr>{["Fazenda",...(byField?["Talhão"]:[]),"Cultura","Atividade","Material","DAP","Data","Planejado equiv.","Aplicado","Demanda"].map((h) => <th key={h} className="p-2 text-left">{h}</th>)}</tr></thead><tbody>{[...summaryDetails.entries()].map(([key,line]) => <tr key={key} className="border-b border-slate-100"><td className="p-2">{line.Fazenda}</td>{byField && <td className="p-2">{line.Talhão}</td>}<td className="p-2">{line.Cultura}</td><td className="p-2">{line.Atividade}</td><td className="p-2">{line.Material}</td><td className="p-2">{line.DAP}</td><td className="p-2">{line["Data prevista"] || "—"}</td><td className="p-2">{value(line["Planejado equivalente"])}</td><td className="p-2">{value(line["Aplicado conciliado"])}</td><td className="p-2">{value(line["Demanda remanescente"])}</td></tr>)}</tbody></table></div></div></div>}
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-semibold text-slate-600">Segmentar por</span>
+        {(["Grupo","Subgrupo","Material"] as const).map((item) => <button key={item} type="button" aria-pressed={grain===item} className={cn("rounded-lg border px-3 py-2 text-xs font-semibold",grain===item?"border-emerald-700 bg-emerald-700 text-white":"border-slate-200")} onClick={() => { setGrain(item); setDrill([]); setPage(1); setDetailId(""); }}>{item}</button>)}
+      </div>
+      <label className="flex items-center gap-2 text-xs font-semibold">Linhas por página<select className={inputClass} value={pageSize} onChange={(e) => setPageSize(e.target.value)}>{["20","50","100","Todos"].map((v) => <option key={v}>{v}</option>)}</select></label>
+    </div>
+    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600" aria-label="Hierarquia do provisionamento">
+      <button type="button" className="font-semibold text-emerald-700" onClick={() => {setDrill([]);setPage(1);}}>{grain}</button>
+      {drill.map((step,index) => <span key={step.level+step.key} className="flex items-center gap-2"><span>/</span><button type="button" className="font-semibold text-emerald-700" onClick={() => {setDrill(drill.slice(0,index+1));setPage(1);}}>{step.label}</button></span>)}
+      <span>/ {level}</span>
+      {!!drill.length && <button type="button" className="ml-2 rounded border border-slate-200 px-2 py-1" onClick={() => {setDrill(drill.slice(0,-1));setPage(1);}}>Voltar um nível</button>}
+    </div>
+    <p className="text-xs text-slate-500">{macro ? "Grupos e subgrupos: indicadores por quantidade de materiais, sem somar volumes de unidades diferentes." : "Consolidado de cada material padrão. A falta é a soma das faltas por núcleo, sem compensar automaticamente sobras de outras unidades."} Clique na linha para detalhar.</p>
+    <div className="overflow-x-auto rounded-xl border border-slate-200">
+      <table className={cn("w-full text-left text-xs", macro ? "min-w-[680px]" : "min-w-[1700px]")}><thead className="bg-slate-50"><tr>{(macro ? [level,"Materiais","Núcleos","Atendidos","Dependentes de entregas","Sem cobertura",""] : [level,"Cultura","Planejado","Aplicado","Demanda","Concorrente","Estoque atual","Estoque residual","Armazém","Trânsito atual","Trânsito residual","Comprado a entregar (bruto)","Compra residual","Falta cobertura","Prazo","Situação",""]).map((h,i) => <th key={i} className="p-3">{h}</th>)}</tr></thead>
+      <tbody className="divide-y divide-slate-100">{visible.map((p) => <tr key={p.key} className="hover:bg-slate-50">
+        <td className="p-3"><button type="button" className="text-left font-semibold text-emerald-800" onClick={() => openBucket(p)}>{p.label}<span className="block text-xs font-normal text-slate-500">{level === "Material" ? p.group+" · "+p.subgroup+" · "+p.active : level === "Subgrupo" ? p.group : level === "Núcleo" ? p.pools[0].row.standardMaterial : ""}</span></button></td>
+        {macro ? <><td className="p-3">{p.materialCount}</td><td className="p-3">{p.nucleusCount}</td><td className="p-3 text-emerald-700">{p.coveredCount}</td><td className="p-3 text-amber-700">{p.deliveryCount}</td><td className="p-3 font-semibold text-rose-700">{p.uncoveredCount}</td></> : <>
+          <td className="p-3">{p.cultures}</td>{[p.planned,p.applied,p.demand,p.prior,p.stock,p.stockAfter,p.warehouse,p.transit,p.transitAfter].map((v,i) => <td key={i} className="p-3 tabular-nums">{value(v)}</td>)}
+          <td className="p-3">{purchasesLoaded?value(p.bought):"—"}</td><td className="p-3">{purchasesLoaded?value(p.boughtAfter):"—"}</td>
+          <td className={cn("p-3 font-semibold",p.shortage>0.000001?"text-rose-700":"text-emerald-700")}>{value(p.shortage)}</td>
+          <td className="p-3">{level==="Núcleo"?risk(p.pools[0]):p.pools.some((pool)=>risk(pool)==="Primeira compra após início")?"Risco em algum núcleo":p.pools.some((pool)=>risk(pool)!=="—")?"Prazo a validar":"—"}{level==="Núcleo"&&<span className="block text-slate-500">{p.pools[0].first||"Sem data"} / {p.pools[0].due||"Sem previsão"}</span>}</td>
+          <td className="p-3">{p.status}{level==="Material"&&<span className="block text-slate-500">{p.nucleusCount} núcleos · {p.pools.filter(pool=>pool.shortage>0.000001).length} com falta</span>}</td>
+        </>}
+        <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button></td>
+      </tr>)}{!visible.length&&<tr><td colSpan={macro?7:17} className="p-8 text-center text-slate-500">Nenhuma demanda neste filtro.</td></tr>}</tbody></table>
+    </div>
+    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{buckets.length ? (currentPage-1)*size+1 : 0}–{Math.min(currentPage*size,buckets.length)} de {buckets.length} registros · Página {currentPage} de {pageCount}</span><div className="flex gap-2"><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage<=1} onClick={()=>setPage(currentPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage>=pageCount} onClick={()=>setPage(currentPage+1)}>Próxima</button></div></div>
+    {selected && <div role="dialog" aria-modal="true" aria-label="Detalhamento do provisionamento" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex flex-wrap justify-between gap-2"><h3 className="font-semibold">{selected.row.standardMaterial} · {selected.row.nucleus}</h3><div className="flex gap-2"><button type="button" className={inputClass} onClick={() => setByField(!byField)}>{byField ? "Resumo por fazenda" : "Ver por talhão"}</button><button type="button" className={inputClass} onClick={() => setDetailId("")}>Fechar</button></div></div><div className="mt-3 overflow-auto"><table className="w-full min-w-[850px] text-xs"><thead className="bg-slate-50"><tr>{["Fazenda",...(byField?["Talhão"]:[]),"Cultura","Atividade","Material","DAP","Data","Planejado equiv.","Aplicado","Demanda"].map((h) => <th key={h} className="p-2 text-left">{h}</th>)}</tr></thead><tbody>{visibleDetails.map(([key,line]) => <tr key={key} className="border-b border-slate-100"><td className="p-2">{line.Fazenda}</td>{byField && <td className="p-2">{line.Talhão}</td>}<td className="p-2">{line.Cultura}</td><td className="p-2">{line.Atividade}</td><td className="p-2">{line.Material}</td><td className="p-2">{line.DAP}</td><td className="p-2">{line["Data prevista"] || "—"}</td><td className="p-2">{value(line["Planejado equivalente"])}</td><td className="p-2">{value(line["Aplicado conciliado"])}</td><td className="p-2">{value(line["Demanda remanescente"])}</td></tr>)}</tbody></table></div><div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{detailEntries.length} registros · Página {currentDetailPage} de {detailPageCount}</span><div className="flex items-center gap-2"><select aria-label="Linhas por página no detalhe" className={inputClass} value={pageSize} onChange={e=>setPageSize(e.target.value)}>{["20","50","100","Todos"].map(v=><option key={v}>{v}</option>)}</select><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage<=1} onClick={()=>setDetailPage(currentDetailPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage>=detailPageCount} onClick={()=>setDetailPage(currentDetailPage+1)}>Próxima</button></div></div></div></div>}
   </div>;
 }
 
