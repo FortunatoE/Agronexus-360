@@ -9164,7 +9164,7 @@ export default function Home() {
       supplier,
       paymentDue: closingDraft.paymentDue,
       paymentMethod,
-      destination: closingDraft.destination.trim(),
+      destination: distributeByFarm ? previous?.destination || "" : closingDraft.destination.trim(),
       deliveryLocation: closingDraft.deliveryLocation.trim(),
       cycle: closingDraft.cycle,
       culture: closingDraft.culture.trim(),
@@ -11587,6 +11587,7 @@ export default function Home() {
                         closings: closings.map(
                           ({ closing, active, physicalProduct }) => ({
                             ...closing,
+                            destination: commercialFarmDeliveries(closing).length ? "" : closing.destination,
                             active,
                             product: physicalProduct,
                           }),
@@ -11729,26 +11730,28 @@ export default function Home() {
                       value={closingDraft.paymentMethod}
                     />
                   </label>
-                  <label className="grid gap-1 text-xs font-semibold text-slate-600">
-                    Centro / filial
-                    <input
-                      className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
-                      list="commercial-destinations"
-                      onChange={(event) =>
-                        setClosingDraft((current) => ({
-                          ...current,
-                          destination: event.target.value,
-                        }))
-                      }
-                      placeholder="Ex.: 0714 ou núcleo"
-                      value={closingDraft.destination}
-                    />
-                    <datalist id="commercial-destinations">
-                      {commercialDestinationOptions.map((destination) => (
-                        <option key={destination} value={destination} />
-                      ))}
-                    </datalist>
-                  </label>
+                  {!distributeByFarm && (
+                    <label className="grid gap-1 text-xs font-semibold text-slate-600">
+                      Centro / filial
+                      <input
+                        className="rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-normal"
+                        list="commercial-destinations"
+                        onChange={(event) =>
+                          setClosingDraft((current) => ({
+                            ...current,
+                            destination: event.target.value,
+                          }))
+                        }
+                        placeholder="Ex.: 0714 ou núcleo"
+                        value={closingDraft.destination}
+                      />
+                    </label>
+                  )}
+                  <datalist id="commercial-destinations">
+                    {commercialDestinationOptions.map((destination) => (
+                      <option key={destination} value={destination} />
+                    ))}
+                  </datalist>
                   <label className="grid gap-1 text-xs font-semibold text-slate-600">
                     Local de entrega
                     <input
@@ -12194,8 +12197,9 @@ export default function Home() {
                                       : "—"}
                                   </td>
                                   <td className="px-3 py-3">
-                                    {closing.destination || "—"}
-                                    <br />
+                                    {farmDeliveries.length === 0 && (
+                                      <>{closing.destination || "—"}<br /></>
+                                    )}
                                     <span className="text-xs text-slate-500">
                                       {closing.deliveryLocation || "—"}
                                     </span>
