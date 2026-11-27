@@ -6,6 +6,8 @@ type ClosingRecord = {
   cycle: string;
   culture: string;
   destination: string;
+  groupName?: string;
+  groupFarms?: { name: string }[];
   orderKey: string;
   orderNumber: string;
   product: string;
@@ -212,6 +214,7 @@ export function matchesCommercialClosing(entry: ResolvedClosing<ClosingRecord>, 
   const { closing, active, physicalProduct, standardProduct } = entry;
   return !normalizedQuery || [
     active, closing.active, closing.product, physicalProduct, standardProduct, closing.supplier, closing.destination, closing.orderNumber,
+    closing.groupName || "", ...(closing.groupFarms || []).map((farm) => farm.name),
   ].some((value) => normalizeMaterial(value).includes(normalizedQuery));
 }
 
