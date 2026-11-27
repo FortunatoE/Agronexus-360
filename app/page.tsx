@@ -4318,7 +4318,7 @@ export default function Home() {
       const cycle = cycleFor(row, dimensions);
       const culture = cultureFor(row);
       const key = commercialPlanningKey(product.canonicalKey, cycle, culture);
-      const current = values.get(key) || {
+      const current: PlanningSchedule = values.get(key) || {
         active: product.active,
         cycle,
         culture,
