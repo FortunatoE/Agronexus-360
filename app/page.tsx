@@ -1955,7 +1955,12 @@ function PlanningApplicationCalendar({
 }
 
 
-type DapPurchase = { key: string; product: string; balance: number; center: string; dueDate: string; unit: string };
+type DapPurchase = { key: string; product: string; balance: number; center: string; dueDate: string; unit: string; canonicalProduct?: string; source?: string; document?: string };
+function commercialDestinationNucleus(destination: string, dimensions: DimensionBundle, farmToNucleus: Record<string,string>) {
+  const key=normalizeMaterial(destination);
+  if (/^0*714$/.test(key) || key==="ARMAZEM") return "ARMAZÉM";
+  return dimensions.centerToNucleus[key] || farmToNucleus[key] || (/^NC-/i.test(destination.trim()) ? destination.trim().toUpperCase().replace("NC-VER","NC-AGV") : "");
+}
 type DapPlanLine = { row: Row; id: string; nucleus: string; cycle: string; culture: string; dap: number | null; date: string; amount: number; applied: number; match: string };
 function plannedDap(row: Row) {
   const explicit = calendarNumeric(calendarSourceValue(row, "dap", "DAP planejado", "DAP", "Dias após plantio", "Dias apos plantio", "Dias"));
@@ -1971,8 +1976,8 @@ function dapOperationMatch(row: Row, canonical: string) {
   const operation = headerKey(readText(row, "Tar.", "Operação", "Operacao"));
   return wbs && diagram && operation ? JSON.stringify([wbs, diagram, operation, canonical]) : "";
 }
-function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensions, farmToNucleus, operatorNucleus, purchasesLoaded, stockLoaded, transitLoaded, consumptionLoaded }: {
-  plans: Row[]; consumption: Row[]; ledger: ReconciliationRow[]; transitRows: Row[]; orders: DapPurchase[]; dimensions: DimensionBundle;
+function DapProvision({ plans, consumption, ledger, transitRows, orders, commercialAmbiguous, dimensions, farmToNucleus, operatorNucleus, purchasesLoaded, stockLoaded, transitLoaded, consumptionLoaded }: {
+  plans: Row[]; consumption: Row[]; ledger: ReconciliationRow[]; transitRows: Row[]; orders: DapPurchase[]; commercialAmbiguous: number; dimensions: DimensionBundle;
   farmToNucleus: Record<string, string>; operatorNucleus: string; purchasesLoaded: boolean; stockLoaded: boolean; transitLoaded: boolean; consumptionLoaded: boolean;
 }) {
   const [cycle, setCycle] = useState("Safrinha");
@@ -1985,6 +1990,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
   const [byField, setByField] = useState(false);
   const [exportError, setExportError] = useState("");
   const [transferMaterial, setTransferMaterial] = useState("");
+  const [commercialMaterial, setCommercialMaterial] = useState("");
   const [grain, setGrain] = useState<"Grupo" | "Subgrupo" | "Material">("Material");
   const [drill, setDrill] = useState<{ level: "Grupo" | "Subgrupo" | "Material"; key: string; label: string }[]>([]);
   const [pageSize, setPageSize] = useState("20");
@@ -2027,22 +2033,27 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
     }
     const purchase = new Map<string, { amount: number; dates: string[]; missing: number }>();
     const seen = new Set<string>();
+    const purchaseDetails: {material:string;canonical:string;physical:string;nucleus:string;balance:number;equivalent:number;unit:string;document:string;source:string;dueDate:string}[]=[];
     let unlinked = 0;
     for (const order of orders) {
       if (seen.has(order.key) || !(order.balance > 0)) continue;
       seen.add(order.key);
-      const p = productFor({ Produto: order.product }, "planning", dimensions);
-      const center = normalizeMaterial(order.center);
-      const unit = /^0*714$/.test(center) ? "ARMAZÉM" : dimensions.centerToNucleus[center] || farmToNucleus[center];
-      if (!unit || !p.resolvedByDimension || !order.unit || order.unit === "—") { unlinked += 1; continue; }
+      const physical = productFor({ Produto: order.product }, "planning", dimensions);
+      const target = order.canonicalProduct || physical.canonicalName;
+      const p = { ...physical, canonicalName: target, canonicalKey: normalizeMaterial(target) };
+      const unit = commercialDestinationNucleus(order.center,dimensions,farmToNucleus);
+      const registered = dimensions.conversions[p.canonicalKey+"|"+normalizeMaterial(p.rawName)];
+      if (!unit || p.rawName==="Sem descrição" || (!physical.resolvedByDimension && !(registered>0) && normalizeMaterial(p.rawName)!==p.canonicalKey) || !order.unit || order.unit==="—") { unlinked += 1; continue; }
       const id = p.canonicalKey + "|" + normalizeMaterial(unit);
       const current = purchase.get(id) || { amount: 0, dates: [], missing: 0 };
-      current.amount += standardAmount(order.balance, p, dimensions);
+      const equivalent=standardAmount(order.balance,p,dimensions);
+      current.amount += equivalent;
+      purchaseDetails.push({material:p.canonicalName,canonical:p.canonicalKey,physical:p.rawName,nucleus:unit,balance:order.balance,equivalent,unit:order.unit,document:order.document||"",source:order.source||"Pedido SAP",dueDate:order.dueDate});
       const due = plannedApplicationDate({ DT_Aplicacao: order.dueDate });
       if (due) current.dates.push(dateKey(due)); else current.missing += 1;
       purchase.set(id, current);
     }
-    return { lines, purchase, unmatched, unlinked, nuclei: [...new Set(lines.map((line) => line.nucleus))].sort() };
+    return { lines, purchase, purchaseDetails, unmatched, unlinked, nuclei: [...new Set(lines.map((line) => line.nucleus))].sort() };
   }, [plans, consumption, orders, dimensions, farmToNucleus]);
   const report = useMemo(() => {
     const eligible = (line: DapPlanLine) => line.cycle === cycle && (culture === "Todas" || line.culture === culture);
@@ -2242,6 +2253,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
   const subgroupBuckets = bucketRows(shown, "Subgrupo");
   const macro = level === "Grupo" || level === "Subgrupo";
   const showCentralTotals = !operatorNucleus && nucleus === "Todos";
+  const commercialRows=base.purchaseDetails.filter(row=>showCentralTotals || (row.nucleus===(operatorNucleus||nucleus)));
   const centralTotals = (key: string) => report.central.get(key);
   const centralResidual = (key: string) => { const item=centralTotals(key); return item ? item.stockLeft+item.transitLeft+item.boughtLeft : 0; };
   const size = pageSize === "Todos" ? Math.max(1,buckets.length) : Number(pageSize);
@@ -2264,6 +2276,7 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
   const shownMaterials = new Set(shown.map(p=>p.row.canonicalKey));
   const transferRows = report.transfers.filter(t=>shownMaterials.has(t.canonical));
   const visibleTransfers = transferRows.filter(t=>t.canonical===transferMaterial);
+  const visibleCommercial= commercialRows.filter(row=>row.canonical===commercialMaterial);
   const summaryDetails = new Map<string, typeof details[number]>();
   for (const line of details) {
     const key = JSON.stringify([line.Fazenda, line.Ciclo, line.Cultura, line.Atividade, line.Material, line.DAP, line["Data prevista"], byField ? line.Talhão : ""]);
@@ -2289,8 +2302,9 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(exportMacro(subgroupBuckets)), "Subgrupos");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.map((p) => ({ Núcleo:p.row.nucleus, Grupo:p.row.merchandiseGroup, Subgrupo:p.row.subgroup, "Material padrão":p.row.standardMaterial, "Princípio ativo":p.row.active, Planejado:p.planned, "Aplicado conciliado":p.applied, Demanda:p.demand, "Demanda concorrente":p.prior, "Estoque atual":p.stock, "Estoque residual":p.stockAfter, "Armazém físico alocado":p.warehouse, "Armazém trânsito alocado":p.warehouseTransit, "Armazém compra alocada":p.warehouseBought, "Trânsito atual":p.transit, "Trânsito residual":p.transitAfter, "Comprado saldo fornecedor":purchasesLoaded ? p.bought : null, "Dedução conservadora de trânsito":p.overlap, "Compra residual":p.boughtAfter, "Falta cobertura identificada":p.shortage, "Saldo líquido":p.net, "Excedente físico":p.physicalSurplus, "Excedente projetado":p.surplus, "Receber estoque físico":p.transferIn, "Ceder estoque físico":p.transferOut, "Receber após entrega":p.projectedIn, "Ceder após entrega":p.projectedOut, "Compra potencial após remanejamento":purchasesLoaded?p.buyNeed:null, "Primeira aplicação":p.first, "Primeiro vencimento fornecedor":p.due, "Risco indicativo":risk(p), Situação:p.status }))), "Núcleos");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(shown.flatMap(detail)), "Talhões");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(commercialRows.filter(row=>shownMaterials.has(row.canonical)).map(row=>({"Material padrão":row.material,"Material físico":row.physical,"Destino":row.nucleus,"Pedido":row.document,"Fonte":row.source,"Saldo físico":row.balance,"Unidade física":row.unit,"Saldo equivalente":row.equivalent,"Vencimento":row.dueDate}))),"Saldo comercial");
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(transferRows.map(t=>({Material:t.material,Origem:t.origin,Destino:t.destination,"Volume equivalente":t.amount,Tipo:t.type}))), "Remanejamentos");
-      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Exportação de todos os registros dos filtros, independente da página ou expansão. Grupo e subgrupo exibem contagem de materiais, sem somar unidades diferentes. Falta operacional soma faltas por núcleo. Remanejamento potencial usa excedente físico primeiro e excedente projetado depois, somente dentro do escopo selecionado; compra potencial é a falta restante. Não confirma viabilidade logística, validade ou chegada. Demandas sem data são reservadas conservadoramente. Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Não garante chegada; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados." }]), "Premissas");
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet([{ Ciclo:cycle,Cultura:culture,"DAP inicial":lo,"DAP final":hi,Núcleo:nucleus,"Início calendário":report.first,"Fim calendário":report.horizon, "Sem DAP":report.missingDap,"Sem data":report.missingDate,"Compras importadas":purchasesLoaded,"Estoque importado":stockLoaded,"Trânsito importado":transitLoaded,"Consumo importado":consumptionLoaded,Nota:"Exportação de todos os registros dos filtros, independente da página ou expansão. Grupo e subgrupo exibem contagem de materiais, sem somar unidades diferentes. Falta operacional soma faltas por núcleo. Remanejamento potencial usa excedente físico primeiro e excedente projetado depois, somente dentro do escopo selecionado; compra potencial é a falta restante. Não confirma viabilidade logística, validade ou chegada. Demandas sem data são reservadas conservadoramente. Projeção conservadora; demanda concorrente até o fim da janela, consumo conciliado somente por WBS/diagrama/operação/material; dedução de trânsito potencialmente sobreposto ao saldo fornecedor. Saldo comercial compartilhado com Acompanhamento: fechamento vinculado substitui o pedido original, com conversão para material padrão no DAP. Não garante chegada; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados." }]), "Premissas");
       XLSX.writeFile(workbook, "provisionamento_DAP_" + cycle + "_" + lo + "_" + hi + ".xlsx");
     } catch (error) { setExportError(error instanceof Error ? error.message : "Falha ao exportar."); }
   }
@@ -2337,8 +2351,8 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
     {!valid && <p className="text-sm text-rose-700">Informe DAPs inteiros, com início menor ou igual ao fim.</p>}
     <div className="grid gap-2 sm:grid-cols-4">{[["Materiais",materialBuckets.length],["Atendidos com estoque",materialBuckets.filter((p) => p.status === "Atendido com estoque" || p.status === "Aplicado").length],["Dependentes de entregas",materialBuckets.filter((p) => p.status.startsWith("Dependente")).length],["Com compra potencial",materialBuckets.filter((p) => p.buyNeed > 0.000001).length]].map(([label,count]) => <div key={label} className="rounded-xl border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-2xl font-semibold">{count}</p></div>)}</div>
     <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 space-y-1">
-      <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo de fornecedor líquido estimado desconta trânsito potencialmente sobreposto; pedidos internos não são compras. O armazém compartilha estoque físico, trânsito receptor 0714 e compras com destino 0714; primeiro atende concorrentes, depois faltas após a cobertura local.</p>
-      <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data reservados conservadoramente. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : base.unlinked + " pedidos sem material/destino/unidade conciliados; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados."}</p>
+      <p>Datas de aplicação no filtro: {report.first || "sem data"} a {report.horizon || "sem data"}. Reserva conservadora para demais demandas com data até o fim da janela, incluindo Safra. Saldo comercial utiliza o destino dos fechamentos vinculados, com pedido SAP não vinculado como alternativa. A faturar é volume físico; no DAP o saldo é convertido para material padrão e desconta trânsito potencialmente sobreposto. Pedidos internos não são compras. O armazém compartilha estoque físico, trânsito receptor 0714 e compras com destino 0714; primeiro atende concorrentes, depois faltas após a cobertura local.</p>
+      <p>{report.missingDap} registros no filtro sem DAP excluídos; {report.missingDate} selecionados sem data. {operatorNucleus ? "" : report.undated + " registros concorrentes sem data reservados conservadoramente. "}{consumptionLoaded ? "Consumo abatido somente por vínculo único WBS/diagrama/operação/material." : "CN52 não importada."} {stockLoaded ? "" : "Estoque não importado. "}{transitLoaded ? "" : "MB5T não importada. "}{purchasesLoaded ? "" : "Pedidos de compra não importados: falta comprar não pode ser concluída. "}{operatorNucleus ? "" : (base.unlinked + commercialAmbiguous) + " registros comerciais sem vínculo/material/destino/unidade conciliados; compras destinadas ao 0714 rateadas em pool compartilhado; saldos sem centro reconhecido não rateados."}</p>
       <p>Falta operacional não é necessariamente compra. Remanejamentos são sugestões dentro do escopo selecionado: estoque físico primeiro, depois excedente dependente de entrega. Compra potencial restante pressupõe inclusive os remanejamentos futuros indicados; sem eles, some a transferência futura à compra potencial. O filtro de núcleo restringe o remanejamento ao escopo selecionado. A compra depende de validação dos dados, logística e prazos; não cria transferência nem reserva no SAP.</p>
     </div>
     {exportError && <p className="text-sm text-rose-700">{exportError}</p>}
@@ -2377,10 +2391,11 @@ function DapProvision({ plans, consumption, ledger, transitRows, orders, dimensi
         <tbody className="divide-y divide-slate-100">{visible.map(p=><tr key={p.key} className="hover:bg-slate-50">
         <td className="p-3"><button type="button" className="text-left font-semibold text-emerald-800" onClick={() => openBucket(p)}>{p.label}<span className="block text-xs font-normal text-slate-500">{level === "Material" ? p.group+" · "+p.subgroup+" · "+p.active : level === "Subgrupo" ? p.group : level === "Núcleo" ? p.pools[0].row.standardMaterial : ""}</span></button></td>
         {macro ? <><td className="p-3">{p.materialCount}</td><td className="p-3">{p.nucleusCount}</td><td className="p-3 text-emerald-700">{p.coveredCount}</td><td className="p-3 text-amber-700">{p.deliveryCount}</td><td className="p-3 font-semibold text-rose-700">{p.uncoveredCount}</td></> : <><td className="p-3">{p.cultures}</td>{visibleColumns.map(column=><td key={column.key} className={cn("border-l border-slate-100 p-3 tabular-nums",column.tone?.(p))}>{column.render(p)}</td>)}</>}
-        <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button>{!macro && (p.transferIn+p.transferOut+p.projectedIn+p.projectedOut)>0.000001 && <button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setTransferMaterial(p.pools[0].row.canonicalKey)}>Remanejamentos</button>}</td>
+        <td className="p-3"><button type="button" className="whitespace-nowrap font-semibold text-emerald-700" onClick={() => openBucket(p)}>{level==="Grupo"?"Ver subgrupos":level==="Subgrupo"?"Ver materiais":level==="Material"?"Ver núcleos":"Ver talhões"}</button>{!macro && (p.transferIn+p.transferOut+p.projectedIn+p.projectedOut)>0.000001 && <button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setTransferMaterial(p.pools[0].row.canonicalKey)}>Remanejamentos</button>}{!macro&&level==="Material"&&commercialRows.some(row=>row.canonical===p.key)&&<button type="button" className="mt-2 block whitespace-nowrap text-emerald-700 underline" onClick={()=>setCommercialMaterial(p.key)}>Saldo comercial</button>}</td>
       </tr>)}{!visible.length&&<tr><td colSpan={macro?7:visibleColumns.length+3} className="p-8 text-center text-slate-500">Nenhuma demanda neste filtro.</td></tr>}</tbody></table>
     </div>
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{buckets.length ? (currentPage-1)*size+1 : 0}–{Math.min(currentPage*size,buckets.length)} de {buckets.length} registros · Página {currentPage} de {pageCount}</span><div className="flex gap-2"><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage<=1} onClick={()=>setPage(currentPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentPage>=pageCount} onClick={()=>setPage(currentPage+1)}>Próxima</button></div></div>
+    {commercialMaterial && <div role="dialog" aria-modal="true" aria-label="Origem do saldo comercial" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Saldo comercial · {visibleCommercial[0]?.material||commercialMaterial}</h3><button type="button" className={inputClass} onClick={()=>setCommercialMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Saldo bruto antes de reservar demandas concorrentes e descontar possível sobreposição com trânsito. Destino do fechamento tem prioridade sobre o centro do pedido.</p><div className="overflow-auto"><table className="w-full min-w-[850px] text-left text-xs"><thead className="bg-slate-50"><tr>{["Pedido","Material físico","Destino","Fonte","Saldo físico","Saldo equivalente","Vencimento"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleCommercial.map((row,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{row.document||"—"}</td><td className="p-3">{row.physical}</td><td className="p-3">{row.nucleus}</td><td className="p-3">{row.source}</td><td className="p-3">{value(row.balance)} {row.unit}</td><td className="p-3 font-semibold">{value(row.equivalent)}</td><td className="p-3">{row.dueDate||"Sem data"}</td></tr>)}</tbody></table></div></div></div>}
     {transferMaterial && <div role="dialog" aria-modal="true" aria-label="Remanejamentos potenciais" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl bg-white p-5"><div className="flex justify-between gap-2"><h3 className="font-semibold">Remanejamentos potenciais · {visibleTransfers[0]?.material||transferMaterial}</h3><button type="button" className={inputClass} onClick={()=>setTransferMaterial("")}>Fechar</button></div><p className="my-3 text-xs text-slate-500">Volumes equivalentes, não ordens de transferência. Conferir lote, disponibilidade física, validade e prazo antes da execução.</p><table className="w-full text-left text-sm"><thead className="bg-slate-50"><tr>{["Origem","Destino","Volume equivalente","Tipo"].map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{visibleTransfers.map((t,i)=><tr key={i} className="border-b border-slate-100"><td className="p-3">{t.origin}</td><td className="p-3">{t.destination}</td><td className="p-3 font-semibold">{value(t.amount)}</td><td className="p-3">{t.type}</td></tr>)}</tbody></table></div></div>}
     {selected && <div role="dialog" aria-modal="true" aria-label="Detalhamento do provisionamento" className="fixed inset-0 z-50 grid place-items-center bg-slate-950/40 p-4"><div className="max-h-[90vh] w-full max-w-6xl overflow-auto rounded-2xl bg-white p-5"><div className="flex flex-wrap justify-between gap-2"><h3 className="font-semibold">{selected.row.standardMaterial} · {selected.row.nucleus}</h3><div className="flex gap-2"><button type="button" className={inputClass} onClick={() => setByField(!byField)}>{byField ? "Resumo por fazenda" : "Ver por talhão"}</button><button type="button" className={inputClass} onClick={() => setDetailId("")}>Fechar</button></div></div><div className="mt-3 overflow-auto"><table className="w-full min-w-[850px] text-xs"><thead className="bg-slate-50"><tr>{["Fazenda",...(byField?["Talhão"]:[]),"Cultura","Atividade","Material","DAP","Data","Planejado equiv.","Aplicado","Demanda"].map((h) => <th key={h} className="p-2 text-left">{h}</th>)}</tr></thead><tbody>{visibleDetails.map(([key,line]) => <tr key={key} className="border-b border-slate-100"><td className="p-2">{line.Fazenda}</td>{byField && <td className="p-2">{line.Talhão}</td>}<td className="p-2">{line.Cultura}</td><td className="p-2">{line.Atividade}</td><td className="p-2">{line.Material}</td><td className="p-2">{line.DAP}</td><td className="p-2">{line["Data prevista"] || "—"}</td><td className="p-2">{value(line["Planejado equivalente"])}</td><td className="p-2">{value(line["Aplicado conciliado"])}</td><td className="p-2">{value(line["Demanda remanescente"])}</td></tr>)}</tbody></table></div><div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"><span>{detailEntries.length} registros · Página {currentDetailPage} de {detailPageCount}</span><div className="flex items-center gap-2"><select aria-label="Linhas por página no detalhe" className={inputClass} value={pageSize} onChange={e=>setPageSize(e.target.value)}>{["20","50","100","Todos"].map(v=><option key={v}>{v}</option>)}</select><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage<=1} onClick={()=>setDetailPage(currentDetailPage-1)}>Anterior</button><button type="button" className={inputClass+" disabled:opacity-40"} disabled={currentDetailPage>=detailPageCount} onClick={()=>setDetailPage(currentDetailPage+1)}>Próxima</button></div></div></div></div>}
   </div>;
@@ -4354,52 +4369,66 @@ export default function Home() {
     };
     return orderForClosing;
   }, [commercialOrders]);
-  const commercialToInvoiceByMonitoringKey = useMemo(() => {
+  // Shared commercial allocations. A linked SAP balance is split once between
+  // its closings, using the commercial destination rather than the PO center.
+  const commercialOpenAllocations = useMemo(() => {
     const orderForClosing = commercialOrderForClosing;
     const linkedVolumeByOrder = new Map<string, number>();
-    resolvedCommercialClosings.forEach((entry) => {
-      const order = orderForClosing(entry);
-      if (!order) return;
-      linkedVolumeByOrder.set(
-        order.key,
-        (linkedVolumeByOrder.get(order.key) || 0) +
-          entry.closing.totalVolume,
-      );
+    const linkedKeys = new Set<string>();
+    const ordersByDocument = new Set(commercialOrders.map(order=>String(order.orderNumber||"").replace(/[^0-9]/g,"")).filter(Boolean));
+    const seenClosings = new Set<string>();
+    const entries = resolvedCommercialClosings.filter(entry=>{
+      if (seenClosings.has(entry.closing.id)) return false;
+      seenClosings.add(entry.closing.id); return true;
     });
-    const values = new Map<string, number>();
-    resolvedCommercialClosings.forEach((entry) => {
-      const order = orderForClosing(entry);
-      const remainingToInvoice = order
-        ? order.balance
-        : typeof entry.closing.invoicedVolume === "number"
-          ? Math.max(
-              0,
-              entry.closing.totalVolume - entry.closing.invoicedVolume,
-            )
-          : 0;
-      if (!entry.plannedKey || remainingToInvoice <= 0) return;
-      const destinationKey = normalizeMaterial(entry.closing.destination);
-      const nucleus =
-        destinationKey === "0714"
-          ? "ARMAZÉM"
-          : dimensions.centerToNucleus[destinationKey] ||
-            farmToNucleus[destinationKey] ||
-            entry.closing.destination;
-      if (!nucleus) return;
-      const totalLinked = order
-        ? linkedVolumeByOrder.get(order.key) || 0
-        : 0;
-      // Saldo Forn é físico/comercial. Não aplicar conversão de dose: a
-      // coluna A faturar deve espelhar o volume pendente no pedido de compra.
-      const share = order && totalLinked
-        ? (remainingToInvoice * entry.closing.totalVolume) /
-          totalLinked
-        : remainingToInvoice;
-      const key = `${entry.plannedKey}|${normalizeMaterial(nucleus)}`;
-      values.set(key, (values.get(key) || 0) + share);
-    });
+    for (const entry of entries) {
+      const order=orderForClosing(entry);
+      if (!order) continue;
+      const volume=Math.max(0,Number(entry.closing.totalVolume)||0);
+      if (!volume) continue;
+      linkedKeys.add(order.key);
+      linkedVolumeByOrder.set(order.key,(linkedVolumeByOrder.get(order.key)||0)+volume);
+    }
+    const rows: (DapPurchase & { plannedKey: string | null; monitoringNucleus: string })[]=[];
+    let ambiguous=0;
+    for (const entry of entries) {
+      const order=orderForClosing(entry);
+      const volume=Math.max(0,Number(entry.closing.totalVolume)||0);
+      if (!volume) continue;
+      // If a SAP document exists but the material/item cannot be linked, do not
+      // add a manual balance on top of the same document's SAP balance.
+      if (!order && (entry.closing.orderKey && commercialOrders.some(o=>o.key===entry.closing.orderKey) || ordersByDocument.has(String(entry.closing.orderNumber||"").replace(/[^0-9]/g,"")))) { ambiguous++; continue; }
+      const remaining=order ? Math.max(0,order.balance) : typeof entry.closing.invoicedVolume==="number" && Number.isFinite(entry.closing.invoicedVolume) ? Math.max(0,volume-entry.closing.invoicedVolume) : 0;
+      if (!(remaining>0)) continue;
+      const linked=order ? linkedVolumeByOrder.get(order.key)||0 : 0;
+      const balance=order ? (linked>0?remaining*volume/linked:0) : remaining;
+      if (!(balance>0)) continue;
+      const center=entry.closing.destination || order?.center || "";
+      const monitoringNucleus=commercialDestinationNucleus(center,dimensions,farmToNucleus)||center;
+      rows.push({key:"closing:"+entry.closing.id, product:order?.product||entry.physicalProduct, canonicalProduct:entry.standardProduct, balance, center, dueDate:order?.dueDate||"", unit:order?.unit||entry.closing.unit, source:order?"Fechamento vinculado ao SAP":"Fechamento com faturamento informado",document:order?.orderNumber||entry.closing.orderNumber,plannedKey:entry.plannedKey,monitoringNucleus});
+    }
+    return {rows,linkedKeys,ambiguous};
+  },[commercialOrderForClosing,commercialOrders,resolvedCommercialClosings,dimensions,farmToNucleus]);
+  const commercialToInvoiceByMonitoringKey = useMemo(() => {
+    const values=new Map<string,number>();
+    for (const entry of commercialOpenAllocations.rows) {
+      if (!entry.plannedKey || !entry.monitoringNucleus) continue;
+      const key=entry.plannedKey+"|"+normalizeMaterial(entry.monitoringNucleus);
+      // A faturar remains the physical/commercial quantity, without dose conversion.
+      values.set(key,(values.get(key)||0)+entry.balance);
+    }
     return values;
-  }, [commercialOrderForClosing, dimensions.centerToNucleus, farmToNucleus, resolvedCommercialClosings]);
+  },[commercialOpenAllocations]);
+  const dapCommercialOrders = useMemo<DapPurchase[]>(() => {
+    // Unlinked orders keep their SAP destination; linked orders are replaced,
+    // never added again, by their commercial allocation rows.
+    const seen=new Set<string>();
+    const direct=commercialOrders.filter(order=>{
+      if (commercialOpenAllocations.linkedKeys.has(order.key)||seen.has(order.key)) return false;
+      seen.add(order.key); return order.balance>0;
+    }).map(order=>({...order,source:"Pedido SAP sem fechamento vinculado",document:order.orderNumber}));
+    return [...commercialOpenAllocations.rows,...direct];
+  },[commercialOpenAllocations,commercialOrders]);
   const commercialDeliveryTracking = useMemo(() => {
     const now = new Date();
     const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
@@ -10026,7 +10055,7 @@ export default function Home() {
           <button type="button" onClick={() => setShowProvision(true)} disabled={!plans.length} className="rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold disabled:opacity-50">Provisionamento por data</button>
           <button type="button" onClick={() => setCalendarMode("dap")} className={cn("rounded-lg px-4 py-2 text-sm font-semibold", calendarMode === "dap" ? "bg-emerald-700 text-white" : "border border-slate-200")}>Provisionamento por DAP</button>
         </div>
-        {calendarMode === "calendar" ? <PlanningApplicationCalendar rows={plans} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} /> : <DapProvision plans={plans} consumption={datasets.consumo} ledger={ledger} transitRows={datasets.transito} orders={commercialOrders} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} purchasesLoaded={!!imports.pedidosCompra} stockLoaded={!!imports.estoque || !!imports.estoqueMb52} transitLoaded={!!imports.transito} consumptionLoaded={!!imports.consumo} />}
+        {calendarMode === "calendar" ? <PlanningApplicationCalendar rows={plans} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} /> : <DapProvision plans={plans} consumption={datasets.consumo} ledger={ledger} transitRows={datasets.transito} orders={dapCommercialOrders} commercialAmbiguous={commercialOpenAllocations.ambiguous} dimensions={dimensions} farmToNucleus={farmToNucleus} operatorNucleus={operatorNucleus} purchasesLoaded={!!imports.pedidosCompra} stockLoaded={!!imports.estoque || !!imports.estoqueMb52} transitLoaded={!!imports.transito} consumptionLoaded={!!imports.consumo} />}
       </section>
     );
   } else if (active === "Acompanhamento") {
